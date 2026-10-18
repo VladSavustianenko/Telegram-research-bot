@@ -1,0 +1,17 @@
+// Application schema. Prisma owns the `public` schema; pg-boss owns its own
+// `pgboss` schema (added in TRB-060) and is never managed by Prisma migrations.
+// Business models are introduced by later backlog items.
+
+// moduleFormat and importFileExtension are explicit so that generation does not
+// depend on whether tsconfig.json is present (e.g. during `npm ci` in Docker).
+generator client {
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
+  moduleFormat        = "cjs"
+  importFileExtension = "js"
+  runtime             = "nodejs"
+}
+
+datasource db {
+  provider = "postgresql"
+}
