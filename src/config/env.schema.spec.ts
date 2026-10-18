@@ -16,7 +16,17 @@ function problemsOf(env: NodeJS.ProcessEnv): readonly string[] {
 describe('parseEnv', () => {
   it('accepts the minimal foundation configuration and applies defaults', () => {
     const env = parseEnv(base);
-    expect(env).toMatchObject({ NODE_ENV: 'development', PORT: 3000, LOG_LEVEL: 'log' });
+    expect(env).toMatchObject({
+      NODE_ENV: 'development',
+      PORT: 3000,
+      LOG_LEVEL: 'log',
+      DATABASE_CONNECT_TIMEOUT_MS: 5_000,
+      DATABASE_STATEMENT_TIMEOUT_MS: 30_000,
+      DATABASE_SHUTDOWN_TIMEOUT_MS: 5_000,
+    });
+    expect(problemsOf({ ...base, DATABASE_CONNECT_TIMEOUT_MS: '0' })).toEqual([
+      'DATABASE_CONNECT_TIMEOUT_MS must be a positive integer',
+    ]);
     expect(env.OPENAI_MODEL).toBeUndefined();
   });
 

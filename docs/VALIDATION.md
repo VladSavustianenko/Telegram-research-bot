@@ -55,6 +55,24 @@ All observations are local; no OpenAI or Telegram call was made. CI workflow was
 | Invalid config | `node dist/main.js` with missing/invalid variables | Exit 1, lists variable names; secret values not printed |
 | Docker image | `docker build` then run with `PORT=8080` | Pass; JSON logs in production; health 200; `docker stop` (SIGTERM) exit 0 in < 1 s; image contains no `.env` |
 
+### TRB-010 review fixes (2026-10-18, reviewed commit 5ec68d1)
+
+Finding 1 (test database guard bypass) and Finding 2 (readiness timeout left database work running). Local Windows 11, Node 24.19.0, Docker 29.7.2; no OpenAI or Telegram calls.
+
+| Check | Command | Result |
+|---|---|---|
+| Reproduction before fix | ad-hoc script: built app (commit 5ec68d1) against a loopback TCP server that accepts but never answers | 3 sequential probes: each "down" after ~2 s, open server sockets 1 → 2 → 3; `app.close()` not finished after 8 s |
+| Same script after fix | as above, new build | open sockets never above 1, released at the 5 s connect timeout; `app.close()` 3 ms |
+| Driver semantics | ad-hoc script: plain `pg.Pool` with `connectionTimeoutMillis: 300` against the same server | Query fails after ~300 ms and the server observes the socket closed (pool total 0, open sockets 0) |
+| Guard regression tests | `npx vitest run --config vitest.config.mts test/support` | 32 passed: `host`/`port`/`hostaddr` overrides (incl. upper-case and percent-encoded keys) rejected; loopback aliases (127.0.0.1, 127.0.0.2, ::1, 127.1, ::ffff:127.0.0.1, LOCALHOST., percent-encoded) on the same port refused; omitted port normalised to 5432 and PGPORT considered for DATABASE_URL; same override policy for DATABASE_URL; non-local opt-in keeps the app-server exclusion; no credentials in errors; endpoint agrees with `pg-connection-string`; separate dev 5434 / test 5433 accepted. No connections opened |
+| Stalled-endpoint regression tests | `npm test` (`src/health/health.stall.spec.ts`) | 10 sequential/concurrent probes open exactly 1 connection; it is closed at the connect timeout (server-side socket count 0, pool total 0); shutdown drains in < 2 s; with a 60 s connect timeout shutdown returns after the 300 ms shutdown timeout |
+| Unit tests | `npm test` | 52 passed |
+| Real PostgreSQL | `npm run test:integration` | 6 passed: readiness recovers 503 → 200 after the stalled endpoint starts forwarding to PostgreSQL (stalled socket closed, 1 pooled connection left); `SELECT pg_sleep(5)` cancelled by a 300 ms statement timeout and readiness stays 200; shutdown during a running statement returns in < 1 s and the statement is then cancelled server-side. 0 disposable databases left |
+| Static checks / build | `npm run format:check`, `npm run lint`, `npm run typecheck`, `npm run build` | Pass |
+| Docker smoke | `docker build`, run with `PORT=8080` | live 200; ready 200 → 503 with dev DB stopped → 200 after restart; `docker stop` exit 0 in 0.7 s; logs contain error names/codes only |
+
+Limitations: a server that completes the handshake and then stops responding is bounded by the client-side read timeout (statement timeout + 5 s), not by the connect timeout. Different DNS names for the same remote server are not detected by the test guard.
+
 ## Release checklist
 
 - Exact model/tool compatibility verified in official docs and an authorized sample.

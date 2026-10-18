@@ -10,7 +10,7 @@ Create NestJS/TypeScript project, compatible pinned dependencies, Prisma setup, 
 
 Acceptance: clean install/build succeeds; documented local startup works; invalid required configuration fails clearly; production secrets are absent; unit and integration test DBs are isolated.
 
-Status: DONE (2026-10-18). Awaiting owner acceptance. Evidence: docs/VALIDATION.md, "TRB-010 evidence".
+Status: READY FOR REVIEW (2026-10-18; review fixes applied). Awaiting owner acceptance. Evidence: docs/VALIDATION.md, "TRB-010 evidence" and "TRB-010 review fixes".
 
 ## TRB-020 — First research-to-Telegram slice
 

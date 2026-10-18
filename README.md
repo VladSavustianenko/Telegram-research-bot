@@ -44,13 +44,15 @@ curl localhost:3000/health/ready   # 200 when the database is reachable, otherwi
 
 Invalid or missing required configuration stops startup with a list of the offending variable names (values are never printed). Only `DATABASE_URL` is required for the foundation; Telegram, OpenAI and budget variables become required in the backlog items that use them.
 
+Database operations are bounded by `DATABASE_CONNECT_TIMEOUT_MS` (connection and pool acquisition, default 5000), `DATABASE_STATEMENT_TIMEOUT_MS` (server-side statement timeout, default 30000; a client-side read timeout 5 s longer is the backstop) and `DATABASE_SHUTDOWN_TIMEOUT_MS` (maximum wait for in-flight work on shutdown, default 5000). Readiness shares one in-flight database probe and answers within 2 s.
+
 Checks:
 
 | Command | Purpose |
 |---|---|
 | `npm run lint` / `npm run typecheck` / `npm run format:check` | Static checks |
-| `npm test` | Unit tests; no database or network, `DATABASE_URL` is removed from the test environment |
-| `npm run test:integration` | Creates a uniquely named database on the `TEST_DATABASE_URL` server, applies migrations, runs tests, drops it. Refuses non-loopback hosts (unless `TEST_DATABASE_ALLOW_NON_LOCAL=true`) and the server used by `DATABASE_URL` |
+| `npm test` | Unit tests; no database and no external network (stalled-database tests use a loopback TCP fixture), `DATABASE_URL` is removed from the test environment |
+| `npm run test:integration` | Creates a uniquely named database on the `TEST_DATABASE_URL` server, applies migrations, runs tests, drops it. Refuses non-loopback hosts (unless `TEST_DATABASE_ALLOW_NON_LOCAL=true`), endpoint-overriding query parameters (`host`, `hostaddr`, `port`, `service`, `servicefile`) in either URL, and any server that may be the one used by `DATABASE_URL` (same port and same host or both loopback aliases) |
 | `npm run build` | Compiles to `dist/` |
 | `docker build -t telegram-research-bot .` | Production image; `node dist/main.js` as non-root user |
 

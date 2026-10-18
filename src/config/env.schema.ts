@@ -22,6 +22,11 @@ const positiveInt = z
   .transform(Number)
   .refine(Number.isSafeInteger, 'is too large');
 
+const positiveIntWithDefault = (fallback: number) =>
+  z
+    .preprocess((value) => (value === '' ? undefined : value), positiveInt.optional())
+    .default(fallback);
+
 /** Decimal USD amount with at most 6 fraction digits, converted to integer micro-USD. */
 const usdAmount = z
   .string()
@@ -65,6 +70,10 @@ export const envSchema = z
       .refine((port) => port <= 65_535, 'must be a valid TCP port'),
     LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'log', 'debug', 'verbose']).default('log'),
     DATABASE_URL: postgresUrl,
+    // Bounds for every database operation (connection, pool acquisition, statements, shutdown drain).
+    DATABASE_CONNECT_TIMEOUT_MS: positiveIntWithDefault(5_000),
+    DATABASE_STATEMENT_TIMEOUT_MS: positiveIntWithDefault(30_000),
+    DATABASE_SHUTDOWN_TIMEOUT_MS: positiveIntWithDefault(5_000),
 
     // Telegram (required from TRB-020).
     TELEGRAM_BOT_TOKEN: optional(secret),

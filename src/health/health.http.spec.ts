@@ -70,4 +70,18 @@ describe('health endpoints', () => {
       vi.useRealTimers();
     }
   });
+
+  it('shares one database probe between concurrent readiness requests', async () => {
+    const prisma = new FakePrisma();
+    let answer: (value: unknown) => void = () => undefined;
+    prisma.queryRaw.mockReturnValueOnce(new Promise((resolve) => (answer = resolve)));
+    const server = httpServer(await start(prisma));
+
+    const responses = Promise.all([1, 2, 3].map(() => request(server).get('/health/ready')));
+    await vi.waitFor(() => expect(prisma.queryRaw).toHaveBeenCalled());
+    answer([{ '?column?': 1 }]);
+
+    expect((await responses).map((response) => response.status)).toEqual([200, 200, 200]);
+    expect(prisma.queryRaw).toHaveBeenCalledTimes(1);
+  });
 });
