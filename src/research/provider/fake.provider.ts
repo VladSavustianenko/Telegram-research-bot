@@ -10,31 +10,31 @@ import {
 /**
  * Simulated provider for RESEARCH_MODE=fake. No network. Mimics the background
  * lifecycle (queued, then completed on the first poll) and echoes the bounds.
- * The fixture key is encoded in the response ID so polling survives restarts.
- * Every snapshot is marked `simulated`.
+ * The fixture key and the requested bounds are encoded in the response ID, so
+ * polling after a restart still sees the echoed bounds (like a real provider,
+ * which stores them with the response). Every snapshot is marked `simulated`.
  */
 export class FakeResearchProvider implements ResearchProvider {
   readonly kind = 'fake' as const;
-  private readonly requests = new Map<string, ResearchRequest>();
 
   submit(request: ResearchRequest): Promise<ProviderSnapshot> {
-    const id = `fake_${fixtureFor(request.input)}_${randomUUID()}`;
-    this.requests.set(id, request);
-    return Promise.resolve(this.snapshot(id, 'queued'));
+    const key = fixtureFor(request.input);
+    const id = `fake_${key}_${request.maxOutputTokens}_${request.maxToolCalls}_${randomUUID()}`;
+    return Promise.resolve().then(() => this.snapshot(id, 'queued'));
   }
 
   retrieve(responseId: string): Promise<ProviderSnapshot> {
-    return Promise.resolve(this.snapshot(responseId, 'completed'));
+    return Promise.resolve().then(() => this.snapshot(responseId, 'completed'));
   }
 
   cancel(responseId: string): Promise<ProviderSnapshot> {
-    return Promise.resolve(this.snapshot(responseId, 'cancelled'));
+    return Promise.resolve().then(() => this.snapshot(responseId, 'cancelled'));
   }
 
   private snapshot(id: string, status: ProviderSnapshot['status']): ProviderSnapshot {
-    const key = /^fake_(football|shopping|news|generic)_/.exec(id)?.[1] as FixtureKey | undefined;
-    if (!key) throw new ProviderError('FAKE_UNKNOWN_RESPONSE', 'not_accepted', true);
-    const request = this.requests.get(id);
+    const match = /^fake_(football|shopping|news|generic)_(\d+)_(\d+)_/.exec(id);
+    if (!match) throw new ProviderError('FAKE_UNKNOWN_RESPONSE', 'not_accepted', true);
+    const key = match[1] as FixtureKey;
     const fixture = FAKE_FIXTURES[key];
     const completed = status === 'completed';
     return {
@@ -56,8 +56,8 @@ export class FakeResearchProvider implements ResearchProvider {
       incompleteReason: null,
       errorCode: null,
       bounds: {
-        maxOutputTokens: request?.maxOutputTokens ?? null,
-        maxToolCalls: request?.maxToolCalls ?? null,
+        maxOutputTokens: Number(match[2]),
+        maxToolCalls: Number(match[3]),
         toolChoice: 'required',
         webSearchTool: true,
       },

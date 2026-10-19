@@ -25,7 +25,8 @@
     "db:migrate:deploy": "prisma migrate deploy",
     "db:up": "docker compose up -d postgres postgres-test",
     "db:down": "docker compose down",
-    "postinstall": "prisma generate"
+    "postinstall": "prisma generate",
+    "ops:reconcile": "node dist/ops/reconcile-run.js"
   },
   "dependencies": {
     "@nestjs/common": "12.1.2",

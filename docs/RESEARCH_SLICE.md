@@ -1,6 +1,6 @@
 # TRB-020 research slice: behaviour, recovery and live sample
 
-Status: implementation READY FOR REVIEW; authorized live sample PENDING. Everything below describes the code as implemented; nothing here has been observed against the real OpenAI or Telegram APIs.
+Status: implementation READY FOR REVIEW (review fixes of 2026-10-19 applied); authorized live sample PENDING. Everything below describes the code as implemented; nothing here has been observed against the real OpenAI or Telegram APIs.
 
 ## Behaviour
 
@@ -20,13 +20,24 @@ The destination is always the authorized private chat of the request, stored on 
 
 `ResearchWorker` (in-process loop, database-backed):
 
-1. Claims the oldest QUEUED run with `UPDATE … FOR UPDATE SKIP LOCKED`, setting `RUNNING`, a 60 s lease and an incremented `fencing_token`. A partial unique index (`research_run_single_running`) guarantees at most one RUNNING run globally, even with several processes.
+1. Claims the oldest eligible QUEUED run with `UPDATE … FOR UPDATE SKIP LOCKED`, setting `RUNNING`, a 60 s lease and an incremented `fencing_token`. A partial unique index (`research_run_single_running`) guarantees at most one RUNNING run globally, even with several processes. Live runs are not eligible while an unreconciled live run is UNCERTAIN (see [Fail-closed uncertainty](#fail-closed-uncertainty-and-operator-reconciliation)).
 2. Builds the request: versioned policy (`research-policy-2026-10-18.1`), the prompt between markers, and an explicit context (UTC time, local time and offset in `RESEARCH_TIME_ZONE`, Monday–Sunday week, queue delay). Stores the exact request in `request_snapshot` and sets `submission_state = SUBMITTING` before calling the provider.
 3. OpenAI adapter (`openai@7.27.0`, Responses API): `tools: [{type: "web_search"}]`, `tool_choice: "required"`, `max_output_tokens`, `max_tool_calls`, `background: true`, `store: false`, `include: ["web_search_call.action.sources"]`, optional `reasoning.effort`. No `previous_response_id` or conversation. SDK retries are disabled (`maxRetries: 0`); each HTTP call has `OPENAI_HTTP_TIMEOUT_MS`. No Structured Outputs and no second model call.
-4. Saves the response ID (`SUBMITTED`), then verifies the echoed `max_output_tokens`, `max_tool_calls`, `tool_choice` and web search tool. If any is not confirmed, the response is cancelled and the run fails with `BOUNDS_NOT_CONFIRMED:…`. `max_tool_calls` is documented for `POST /v1/responses` but missing from this SDK version's REST types, so it is added explicitly and only trusted when echoed.
-5. Polls every `OPENAI_POLL_INTERVAL_MS`, renewing the lease. At `RUN_DEADLINE_SECONDS` after submission it cancels the response and fails with `DEADLINE_EXCEEDED`.
-6. On `completed`: extracts text and `url_citation` annotations, then classifies the outcome deterministically. The model must start with `OUTCOME: FOUND|PARTIAL|NO_MATCHES|INCONCLUSIVE`. That declaration is accepted only when a web search call is present and at least one valid citation exists. Otherwise the outcome is INCONCLUSIVE with a visible warning. Incomplete, failed and cancelled responses are FAILED and never delivered as reports.
-7. In one fenced transaction: stores the report, citations, consulted sources, usage, tool-call count and model, sets SUCCEEDED, and creates the REPORT delivery with its rendered parts.
+4. Saves the response ID (`SUBMITTED`) immediately, before any verification.
+5. Bounds verification applies to **every** provider snapshot: the submit response, each poll (including the first poll after a recovery) and any cancellation result. The echoed `max_output_tokens`, `max_tool_calls`, `tool_choice` and web search tool must equal the run's immutable `request_snapshot.request`; current configuration is irrelevant. No "verified" flag is persisted, so a saved response ID never implies verified bounds, and a crash between saving the ID and verification only means the next snapshot is verified. Missing or mismatched bounds never produce a report:
+   - terminal response: `FAILED / BOUNDS_NOT_CONFIRMED:…` (output discarded);
+   - non-terminal response: cancel; a terminal cancellation result gives `FAILED / BOUNDS_NOT_CONFIRMED:…`, anything else `UNCERTAIN / BOUNDS_NOT_CONFIRMED:…;CANCEL_UNCONFIRMED`.
+
+   A run without a stored request fails with `BOUNDS_NOT_CONFIRMED:request_snapshot`. `max_tool_calls` is documented for `POST /v1/responses` but missing from this SDK version's REST types, so it is added explicitly and only trusted when echoed.
+6. Polls every `OPENAI_POLL_INTERVAL_MS`, renewing the lease and recording the newest provider status and usage. At `RUN_DEADLINE_SECONDS` after submission it cancels the response. Only a terminal status returned by the provider counts as confirmed termination:
+   - cancellation returns `completed` with confirmed bounds: normal completion;
+   - cancellation returns `completed` with unconfirmed bounds: `FAILED / BOUNDS_NOT_CONFIRMED:…`;
+   - cancellation returns another terminal status: `FAILED / DEADLINE_EXCEEDED`;
+   - cancellation throws, or returns `queued`/`in_progress`: `UNCERTAIN / DEADLINE_CANCEL_UNCONFIRMED` (the request may still run and bill).
+
+   Accounting merges snapshots: the newest status is kept, and missing usage never overwrites known usage.
+7. On `completed`: extracts text and `url_citation` annotations, then classifies the outcome deterministically. The model must start with `OUTCOME: FOUND|PARTIAL|NO_MATCHES|INCONCLUSIVE`. That declaration is accepted only when a web search call is present and at least one valid citation exists. Otherwise the outcome is INCONCLUSIVE with a visible warning. Incomplete, failed and cancelled responses are FAILED and never delivered as reports.
+8. In one fenced transaction: stores the report, citations, consulted sources, usage, tool-call count and model, sets SUCCEEDED, and creates the REPORT delivery with its rendered parts.
 
 Run states: QUEUED → RUNNING → SUCCEEDED | FAILED | UNCERTAIN. The content outcome (FOUND, PARTIAL, NO_MATCHES, INCONCLUSIVE) is separate, and so is the delivery state.
 
@@ -42,9 +53,28 @@ Run states: QUEUED → RUNNING → SUCCEEDED | FAILED | UNCERTAIN. The content o
 | Submit times out, connection error or 5xx | `UNCERTAIN` (may be billed); not retried. |
 | Graceful shutdown while polling | Lease released immediately; the next process resumes polling. |
 | A worker whose lease was taken over | All its writes are fenced by `(id, fencing_token, state = RUNNING)`; they fail and it stops. A response ID it receives too late is logged for reconciliation. |
-| Run admitted under one provider (fake/live), executed under another | `FAILED / PROVIDER_CHANGED`; never a silent fallback. |
+| RUNNING, lease expired, `SUBMITTED`, bounds not yet verified | The first poll result is verified like a fresh submission (see step 5). |
+| Deadline or bounds-failure cancellation fails or is not confirmed | `UNCERTAIN`; the response ID, newest status and usage are kept. |
+| Run admitted under one provider (fake/live), executed under another | Before submission: `FAILED / PROVIDER_CHANGED`. After submission: `UNCERTAIN / PROVIDER_CHANGED_AFTER_SUBMISSION`. Never a silent fallback. |
 
-Operator action for UNCERTAIN runs: look up the run's request time (and any logged `responseId`) in the OpenAI dashboard to determine usage, then record the decision outside the app. A deliberate new `/research` creates a new run. There is no automatic retry in TRB-020.
+No UNCERTAIN run is ever resubmitted. A deliberate new `/research` creates a new run.
+
+## Fail-closed uncertainty and operator reconciliation
+
+An UNCERTAIN live run (`provider_kind = 'openai'`) may correspond to a provider request that is still running and billing. Until an operator reconciles it:
+- **New live requests are refused.** `/research` replies that live research is blocked, and no run is created. This admission check is best-effort UX.
+- **Queued live runs stay QUEUED.** They are not lost or failed, but no worker claims them. The authoritative check is part of the single claim statement, together with the single-RUNNING check. A run is RUNNING until the commit that makes it UNCERTAIN, so no interleaving of workers and admission lets a live run start. A pre-submission re-check returns a run to the queue as defence in depth.
+- **Fake (simulated) uncertainty never blocks.** Its notice is labelled СИМУЛЯЦІЯ and states that no real request or cost occurred.
+
+UNCERTAIN codes: `SUBMISSION_INTERRUPTED`, an unknown submit outcome (`OPENAI_CONNECTION`, `OPENAI_HTTP_5xx`, …), `RESPONSE_NOT_RETRIEVABLE`, `DEADLINE_CANCEL_UNCONFIRMED`, `BOUNDS_NOT_CONFIRMED:…;CANCEL_UNCONFIRMED`, `PROVIDER_CHANGED_AFTER_SUBMISSION`.
+
+Reconciliation procedure (operator only; never contacts OpenAI or Telegram, never resubmits):
+1. List unresolved runs: `npm run ops:reconcile -- --list`. In Docker: `node dist/ops/reconcile-run.js --list`. The command uses `DATABASE_URL`.
+2. For each run, check in the OpenAI dashboard (Logs/Usage for the project, around `submittedAt`, by `providerResponseId` when present) whether a response exists, whether it is still running and what it cost. Cancel it there if it is still running.
+3. Record the decision:
+   `npm run ops:reconcile -- --run <id> --resolution <PROVIDER_CONFIRMED_TERMINAL|PROVIDER_REQUEST_ABSENT|OPERATOR_ACCEPTED_RISK> --operator <name> --note "<what was checked and the observed cost>"`
+4. The command locks the run and requires `state = UNCERTAIN` with no previous reconciliation. It then appends a `research_reconciliation` row and sets `research_run.reconciled_at`. The row is append-only (a trigger rejects UPDATE/DELETE) and holds the operator, resolution, note and an evidence snapshot: failure code, submission state, response ID, provider status, usage and timestamps.
+5. The run stays UNCERTAIN with its failure code, response ID and usage. Workers cannot reconcile, and a stale worker cannot change the run afterwards, because its fenced writes require `RUNNING`. Queued live work proceeds on the next worker tick.
 
 ## Delivery
 
@@ -79,7 +109,17 @@ Not enforced:
 - **Input tokens.** These include retrieved search content and are not bounded by these settings. OpenAI's documentation limits the web search context window to 128k tokens.
 - **Billing on failure.** A cancelled or failed request may still be billed.
 
-Use an OpenAI project spending limit as the only hard monetary ceiling until TRB-050.
+### OpenAI spending controls (checked 2026-10-19 against the [Spend limits](https://developers.openai.com/api/docs/guides/spend-limits) guide)
+
+Three different things; only the second stops traffic:
+
+| Control | Effect |
+|---|---|
+| Spend alert (notification threshold) | Sends a notification; API traffic continues. Not a cap. |
+| Hard spend limit: a monthly spend limit with **"Enforce a hard limit"** turned on, per organization or per project | At the limit, requests fail with HTTP 429 (`project_spend_limit_exceeded` or `organization_spend_limit_exceeded`). Enforcement is not instantaneous, so recorded spend can slightly exceed the configured amount; it is not an exact dollar ceiling. Resets with the monthly cycle or when the limit is raised or removed. The guide does not say whether in-flight requests are stopped. |
+| Application budgets (`USER_MONTHLY_BUDGET_USD`, `GLOBAL_MONTHLY_BUDGET_USD`, `RUN_MAX_ESTIMATED_COST_USD`) | Parsed, not enforced. Reservation and enforcement are deferred to TRB-050. |
+
+Entering a budget amount without turning on "Enforce a hard limit" leaves only notifications. Until TRB-050, a project hard limit with enforcement enabled is the only mechanism that stops billed traffic. Older community reports describe project limits as notification-only. Verify the toggle in your own dashboard rather than assuming the account has it. A request rejected with 429 `*_spend_limit_exceeded` at submit is classified as not accepted, giving FAILED.
 
 ## Deferred
 
@@ -98,7 +138,12 @@ Requires explicit owner authorization: it makes a billed OpenAI request and send
 
 Prerequisites:
 1. **Telegram bot.** A bot token from @BotFather (a dedicated test bot is recommended) and your numeric Telegram user ID.
-2. **OpenAI project.** An OpenAI API key for a project with a spending limit configured in the OpenAI dashboard. Note whether the project uses Zero Data Retention (background mode then runs with `store=false`, as this adapter requests anyway).
+2. **OpenAI project and hard spend limit.** Use a dedicated project and an API key for that project only.
+   - In the dashboard, open Project settings → Limits → Spend → "Edit spend limit". Enter a small monthly spend limit and **turn on "Enforce a hard limit"**, then Save.
+   - Confirm afterwards that the toggle shows as enforced. If your account does not offer it, stop: do not run the live sample with notification-only alerts.
+   - Optionally add a spend alert below the limit for early notice.
+   - Remember that enforcement lags, so spend can slightly exceed the limit.
+   - Note whether the project uses Zero Data Retention (background mode then runs with `store=false`, as this adapter requests anyway).
 3. **Model.** Select a model that the [web search guide](https://developers.openai.com/api/docs/guides/tools-web-search) lists as supporting `web_search` in the Responses API. Do not use `minimal` reasoning. Record the model name and the [pricing](https://developers.openai.com/api/docs/pricing) page date.
 4. **Bounds.** Suggested values, for owner approval: `OUTPUT_TOKEN_LIMIT=4000`, `TOOL_CALL_LIMIT=3`, `RUN_DEADLINE_SECONDS=300`, `RESEARCH_QUEUE_LIMIT=1`. Estimate the worst case from the pricing page: output at most 4000 tokens, at most 3 tool calls, and input that includes search context of up to 128k tokens.
 5. **No webhook.** Make sure no webhook is registered for the token: `getWebhookInfo` must return an empty `url`. Polling never deletes a webhook; if one exists it stops with a 409.
@@ -145,6 +190,7 @@ Steps (local, polling, no public URL needed):
 9. Disable live execution:
    - stop the process;
    - set `RESEARCH_MODE=disabled` (or `fake`) and `TELEGRAM_MODE=disabled`;
-   - remove the key and token from `.env`, rotating them if they were exposed.
+   - remove the key and token from `.env`, rotating them if they were exposed;
+   - if any run ended UNCERTAIN, reconcile it (procedure above) before the next live session; lower or keep the project hard limit as appropriate.
 
 For a webhook environment, registration is `setWebhook` with `url=$PUBLIC_BASE_URL/telegram/webhook`, `secret_token=$TELEGRAM_WEBHOOK_SECRET` and `allowed_updates=["message"]`. This runbook item belongs to TRB-100.

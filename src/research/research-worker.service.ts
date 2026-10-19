@@ -36,11 +36,12 @@ import {
   type ResearchContext,
   type RunConfigSnapshot,
 } from './request-builder';
+import { hasUnresolvedLiveUncertainty } from './uncertainty';
 
 export const RUN_LEASE_SECONDS = 60;
 const SHUTDOWN_WAIT_MS = 10_000;
 
-/** Stored in research_run.request_snapshot. `request` is written before submission. */
+/** Stored in research_run.request_snapshot. `request` is written before submission and never changed. */
 interface StoredSnapshot {
   config: RunConfigSnapshot;
   context?: ResearchContext;
@@ -52,6 +53,13 @@ interface Claim {
   fencingToken: number;
 }
 
+/** One execution of one claimed run. */
+interface Execution {
+  claim: Claim;
+  provider: ResearchProvider;
+  stored: StoredSnapshot;
+}
+
 /** The lease was lost to another worker; this worker must stop touching the run. */
 export class StaleLeaseError extends Error {
   constructor() {
@@ -60,14 +68,52 @@ export class StaleLeaseError extends Error {
   }
 }
 
+const isTerminal = (snapshot: ProviderSnapshot | null): snapshot is ProviderSnapshot =>
+  snapshot !== null && !NON_TERMINAL_STATUSES.has(snapshot.status);
+
+/**
+ * Combines what is known about one provider response across polls: the newest
+ * status and content, without overwriting known usage or tool/source counts
+ * with missing data.
+ */
+export function mergeSnapshots(
+  previous: ProviderSnapshot | null,
+  next: ProviderSnapshot | null,
+): ProviderSnapshot | null {
+  if (!previous) return next;
+  if (!next) return previous;
+  return {
+    ...next,
+    model: next.model ?? previous.model,
+    usage: next.usage ?? previous.usage,
+    webSearchCalls: Math.max(previous.webSearchCalls, next.webSearchCalls),
+    sources: next.sources.length > 0 ? next.sources : previous.sources,
+  };
+}
+
+/**
+ * Bounds policy, applied to every provider snapshot (fresh submission, poll
+ * after recovery, cancellation result): the echoed bounds must equal the
+ * immutable request snapshot of the run. A saved response ID alone proves
+ * nothing; no verification state is persisted, so recovery re-verifies.
+ */
+export function boundsProblems(stored: StoredSnapshot, snapshot: ProviderSnapshot): string[] {
+  if (!stored.request) return ['request_snapshot'];
+  return unconfirmedBounds(stored.request, snapshot.bounds);
+}
+
 /**
  * Database-backed research execution (prototype, one run globally).
  *
  * Recovery policy for a run whose lease expired:
  * - NOT_SUBMITTED: nothing was sent; execute normally.
  * - SUBMITTING: a request may have reached the provider but no response ID was
- *   saved; mark UNCERTAIN and never resubmit automatically.
- * - SUBMITTED: resume polling the saved response ID; never resubmit.
+ *   saved; UNCERTAIN, never resubmitted automatically.
+ * - SUBMITTED: resume polling the saved response ID (bounds re-verified); never resubmit.
+ *
+ * Termination is "confirmed" only when the provider returns a terminal status.
+ * A failed, missing or non-terminal cancellation leaves the run UNCERTAIN.
+ * Unreconciled live UNCERTAIN runs block claiming of further live work.
  * Every write after claiming is fenced by (id, fencing_token, state=RUNNING).
  */
 @Injectable()
@@ -120,6 +166,12 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
     return true;
   }
 
+  /**
+   * Claims the oldest eligible QUEUED run. Live runs are not eligible while an
+   * unreconciled live run is UNCERTAIN. The check, the single-RUNNING check and
+   * the claim are one statement (one snapshot): a run that becomes UNCERTAIN is
+   * RUNNING until that commit, so no interleaving lets a live run start.
+   */
   private async claimQueued(): Promise<Claim | null> {
     try {
       const rows = await this.prisma.$queryRaw<Claim[]>`
@@ -128,10 +180,14 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
                lease_until = now() + ${RUN_LEASE_SECONDS} * interval '1 second',
                fencing_token = fencing_token + 1, started_at = COALESCE(started_at, now()),
                updated_at = now()
-         WHERE id = (SELECT id FROM research_run
-                      WHERE state = 'QUEUED'
-                        AND NOT EXISTS (SELECT 1 FROM research_run WHERE state = 'RUNNING')
-                      ORDER BY created_at, id
+         WHERE id = (SELECT q.id FROM research_run q
+                      WHERE q.state = 'QUEUED'
+                        AND NOT EXISTS (SELECT 1 FROM research_run r WHERE r.state = 'RUNNING')
+                        AND (q.provider_kind <> 'openai' OR NOT EXISTS (
+                              SELECT 1 FROM research_run u
+                               WHERE u.state = 'UNCERTAIN' AND u.provider_kind = 'openai'
+                                 AND u.reconciled_at IS NULL))
+                      ORDER BY q.created_at, q.id
                       LIMIT 1
                       FOR UPDATE SKIP LOCKED)
         RETURNING id, fencing_token AS "fencingToken"`;
@@ -167,38 +223,49 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
   ): Promise<void> {
     const run = await this.prisma.researchRun.findUniqueOrThrow({ where: { id: claim.id } });
     const stored = run.requestSnapshot as unknown as StoredSnapshot;
+    const execution: Execution = { claim, provider, stored };
 
     // Never switch providers silently (e.g. a run admitted as live must not get fake results).
     if (stored.config.providerKind !== provider.kind) {
-      return this.finishWithoutReport(claim, 'FAILED', 'PROVIDER_CHANGED');
+      return run.submissionState === 'NOT_SUBMITTED'
+        ? this.finishWithoutReport(execution, 'FAILED', 'PROVIDER_CHANGED')
+        : // The original provider request may still exist; it cannot be checked from here.
+          this.finishWithoutReport(execution, 'UNCERTAIN', 'PROVIDER_CHANGED_AFTER_SUBMISSION');
     }
 
     if (run.submissionState === 'SUBMITTING') {
-      return this.finishWithoutReport(claim, 'UNCERTAIN', 'SUBMISSION_INTERRUPTED');
+      return this.finishWithoutReport(execution, 'UNCERTAIN', 'SUBMISSION_INTERRUPTED');
     }
     if (run.submissionState === 'SUBMITTED') {
-      if (!run.providerResponseId || !run.submittedAt)
+      if (!run.providerResponseId || !run.submittedAt) {
         throw new Error('submitted run without response id');
-      return this.poll(
-        claim,
-        provider,
-        stored,
-        run.providerResponseId,
-        run.submittedAt,
-        null,
-        signal,
-      );
+      }
+      return this.poll(execution, run.providerResponseId, run.submittedAt, null, signal);
+    }
+
+    // Defence in depth for the fail-closed gate (normally enforced at claim time).
+    if (provider.kind === 'openai' && (await hasUnresolvedLiveUncertainty(this.prisma))) {
+      await this.fenced(this.prisma, claim, {
+        state: 'QUEUED',
+        leaseOwner: null,
+        leaseUntil: null,
+      });
+      this.logger.warn({
+        message: 'Live run returned to queue: unresolved uncertainty',
+        runId: run.id,
+      });
+      return;
     }
 
     const submittedAt = this.clock.now();
     const context = buildResearchContext(submittedAt, run.createdAt, stored.config.timeZone);
     const request = buildResearchRequest(run.id, run.prompt, stored.config, context);
-    const snapshot: StoredSnapshot = { config: stored.config, context, request };
-    // Record the intent before the potentially billed call.
+    execution.stored = { config: stored.config, context, request };
+    // Record the intent (and the immutable request) before the potentially billed call.
     await this.fenced(this.prisma, claim, {
       submissionState: 'SUBMITTING',
       submittedAt,
-      requestSnapshot: snapshot as unknown as Prisma.InputJsonValue,
+      requestSnapshot: execution.stored as unknown as Prisma.InputJsonValue,
     });
 
     let first: ProviderSnapshot;
@@ -209,10 +276,12 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
       const code = providerError?.code ?? 'SUBMIT_UNEXPECTED';
       this.logger.warn({ message: 'Research submission failed', runId: run.id, code });
       return providerError?.certainty === 'not_accepted'
-        ? this.finishWithoutReport(claim, 'FAILED', code)
-        : this.finishWithoutReport(claim, 'UNCERTAIN', code);
+        ? this.finishWithoutReport(execution, 'FAILED', code)
+        : this.finishWithoutReport(execution, 'UNCERTAIN', code);
     }
 
+    // Persist the response ID immediately; bounds are verified afterwards in poll()
+    // and again after any recovery, so a crash in between cannot skip verification.
     try {
       await this.fenced(this.prisma, claim, {
         submissionState: 'SUBMITTED',
@@ -230,41 +299,32 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
       throw error;
     }
     this.logger.log({ message: 'Research submitted', runId: run.id, responseId: first.id });
-
-    const problems = unconfirmedBounds(request, first.bounds);
-    if (problems.length > 0) {
-      await this.cancelQuietly(provider, first.id, run.id);
-      return this.finishWithoutReport(
-        claim,
-        'FAILED',
-        `BOUNDS_NOT_CONFIRMED:${problems.join(',')}`,
-        first,
-      );
-    }
-    return this.poll(claim, provider, snapshot, first.id, submittedAt, first, signal);
+    return this.poll(execution, first.id, submittedAt, first, signal);
   }
 
   private async poll(
-    claim: Claim,
-    provider: ResearchProvider,
-    stored: StoredSnapshot,
+    execution: Execution,
     responseId: string,
     submittedAt: Date,
     initial: ProviderSnapshot | null,
     signal?: AbortSignal,
   ): Promise<void> {
+    const { claim, provider, stored } = execution;
     const deadline = submittedAt.getTime() + stored.config.deadlineSeconds * 1_000;
     let latest = initial;
+    let known = initial;
     let needsFetch = initial === null;
 
     for (;;) {
-      if (latest && !NON_TERMINAL_STATUSES.has(latest.status)) {
-        return this.finishTerminal(claim, stored, latest);
+      if (latest) {
+        const problems = boundsProblems(stored, latest);
+        if (problems.length > 0) {
+          return this.onUnconfirmedBounds(execution, responseId, latest, known, problems);
+        }
+        if (isTerminal(latest)) return this.finishTerminal(execution, latest, known);
       }
       if (this.clock.now().getTime() >= deadline) {
-        const cancelled = await this.cancelQuietly(provider, responseId, claim.id);
-        if (cancelled?.status === 'completed') return this.finishTerminal(claim, stored, cancelled);
-        return this.finishWithoutReport(claim, 'FAILED', 'DEADLINE_EXCEEDED', cancelled ?? latest);
+        return this.onDeadline(execution, responseId, known);
       }
       if (!needsFetch) await abortableSleep(this.config.OPENAI_POLL_INTERVAL_MS, signal);
       if (signal?.aborted) return this.releaseLease(claim);
@@ -272,9 +332,17 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
       await this.renewLease(claim);
       try {
         latest = await provider.retrieve(responseId);
+        known = mergeSnapshots(known, latest);
+        await this.recordProgress(claim, latest);
       } catch (error) {
+        if (error instanceof StaleLeaseError) throw error;
         if (error instanceof ProviderError && error.gone) {
-          return this.finishWithoutReport(claim, 'UNCERTAIN', 'RESPONSE_NOT_RETRIEVABLE', latest);
+          return this.finishWithoutReport(
+            execution,
+            'UNCERTAIN',
+            'RESPONSE_NOT_RETRIEVABLE',
+            known,
+          );
         }
         // Polling is not billed; keep trying until the deadline.
         this.logger.warn({ message: 'Research poll failed', runId: claim.id, ...errorInfo(error) });
@@ -282,11 +350,65 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
     }
   }
 
-  private async finishTerminal(
-    claim: Claim,
-    stored: StoredSnapshot,
-    response: ProviderSnapshot,
+  /** Never accepts output whose bounds were not confirmed; stops the request if possible. */
+  private async onUnconfirmedBounds(
+    execution: Execution,
+    responseId: string,
+    latest: ProviderSnapshot,
+    known: ProviderSnapshot | null,
+    problems: string[],
   ): Promise<void> {
+    const code = `BOUNDS_NOT_CONFIRMED:${problems.join(',')}`;
+    if (isTerminal(latest)) {
+      // The provider already finished; nothing is running. Output is discarded.
+      return this.finishWithoutReport(execution, 'FAILED', code, known);
+    }
+    const cancelled = await this.cancelQuietly(execution, responseId);
+    const merged = mergeSnapshots(known, cancelled);
+    return isTerminal(cancelled)
+      ? this.finishWithoutReport(execution, 'FAILED', code, merged)
+      : this.finishWithoutReport(execution, 'UNCERTAIN', `${code};CANCEL_UNCONFIRMED`, merged);
+  }
+
+  private async onDeadline(
+    execution: Execution,
+    responseId: string,
+    known: ProviderSnapshot | null,
+  ): Promise<void> {
+    const cancelled = await this.cancelQuietly(execution, responseId);
+    const merged = mergeSnapshots(known, cancelled);
+    if (!isTerminal(cancelled)) {
+      // Cancellation failed or did not confirm termination: the request may still run and bill.
+      return this.finishWithoutReport(
+        execution,
+        'UNCERTAIN',
+        'DEADLINE_CANCEL_UNCONFIRMED',
+        merged,
+      );
+    }
+    if (cancelled.status === 'completed') {
+      const problems = boundsProblems(execution.stored, cancelled);
+      if (problems.length > 0) {
+        return this.finishWithoutReport(
+          execution,
+          'FAILED',
+          `BOUNDS_NOT_CONFIRMED:${problems.join(',')}`,
+          merged,
+        );
+      }
+      return this.finishTerminal(execution, cancelled, merged);
+    }
+    return this.finishWithoutReport(execution, 'FAILED', 'DEADLINE_EXCEEDED', merged);
+  }
+
+  /** `response` provides content; `known` provides the newest accounting. Bounds are already verified. */
+  private async finishTerminal(
+    execution: Execution,
+    response: ProviderSnapshot,
+    known: ProviderSnapshot | null,
+  ): Promise<void> {
+    const { claim, stored } = execution;
+    const accounting = mergeSnapshots(known, response) ?? response;
     if (response.status !== 'completed') {
       const code =
         response.status === 'incomplete'
@@ -295,10 +417,10 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
             ? 'PROVIDER_CANCELLED'
             : `PROVIDER_FAILED:${response.errorCode ?? 'unknown'}`;
       // Incomplete output is never delivered as a report.
-      return this.finishWithoutReport(claim, 'FAILED', code, response);
+      return this.finishWithoutReport(execution, 'FAILED', code, accounting);
     }
     const report = extractReport(response);
-    if (!report) return this.finishWithoutReport(claim, 'FAILED', 'EMPTY_OUTPUT', response);
+    if (!report) return this.finishWithoutReport(execution, 'FAILED', 'EMPTY_OUTPUT', accounting);
 
     const completedAt = this.clock.now();
     const parts = renderReport({
@@ -313,7 +435,7 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
     });
     await this.prisma.$transaction(async (tx) => {
       const run = await this.fenced(tx, claim, {
-        ...this.resultFields(response),
+        ...this.resultFields(accounting),
         state: 'SUCCEEDED',
         outcome: report.outcome,
         reportText: report.text,
@@ -336,14 +458,17 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
   }
 
   private async finishWithoutReport(
-    claim: Claim,
+    execution: Execution,
     state: 'FAILED' | 'UNCERTAIN',
     failureCode: string,
-    response?: ProviderSnapshot | null,
+    accounting?: ProviderSnapshot | null,
   ): Promise<void> {
+    const { claim, stored } = execution;
+    const simulated = stored.config.providerKind === 'fake';
     await this.prisma.$transaction(async (tx) => {
+      // The provider response ID is never cleared: it is the reconciliation evidence.
       const run = await this.fenced(tx, claim, {
-        ...(response ? this.resultFields(response) : {}),
+        ...(accounting ? this.resultFields(accounting) : {}),
         state,
         failureCode: failureCode.slice(0, 120),
         completedAt: this.clock.now(),
@@ -352,21 +477,35 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
       });
       const text =
         state === 'UNCERTAIN'
-          ? messages.runUncertain(claim.id, failureCode)
+          ? messages.runUncertain(claim.id, failureCode, simulated)
           : messages.runFailed(claim.id, failureCode);
       await createStatusDelivery(tx, run.chatId, text, claim.id);
     });
-    this.logger.warn({ message: `Research ${state.toLowerCase()}`, runId: claim.id, failureCode });
+    const log = { message: `Research ${state.toLowerCase()}`, runId: claim.id, failureCode };
+    if (state === 'UNCERTAIN' && !simulated) {
+      this.logger.error({ ...log, action: 'Live work blocked until operator reconciliation' });
+    } else {
+      this.logger.warn(log);
+    }
   }
 
-  private resultFields(response: ProviderSnapshot): Prisma.ResearchRunUpdateManyMutationInput {
+  /** Accounting fields; missing usage never overwrites stored usage. */
+  private resultFields(snapshot: ProviderSnapshot): Prisma.ResearchRunUpdateManyMutationInput {
     return {
-      providerStatus: response.status,
-      providerModel: response.model,
-      usage: (response.usage ?? undefined) as Prisma.InputJsonValue | undefined,
-      toolCallCount: response.webSearchCalls,
-      sources: response.sources,
+      providerStatus: snapshot.status,
+      ...(snapshot.model ? { providerModel: snapshot.model } : {}),
+      ...(snapshot.usage ? { usage: snapshot.usage as unknown as Prisma.InputJsonValue } : {}),
+      toolCallCount: snapshot.webSearchCalls,
+      sources: snapshot.sources,
     };
+  }
+
+  /** Newest provider status (and usage, when reported) while polling. */
+  private async recordProgress(claim: Claim, snapshot: ProviderSnapshot): Promise<void> {
+    await this.fenced(this.prisma, claim, {
+      providerStatus: snapshot.status,
+      ...(snapshot.usage ? { usage: snapshot.usage as unknown as Prisma.InputJsonValue } : {}),
+    });
   }
 
   /** Fenced update; returns the run's destination for follow-up writes. */
@@ -400,15 +539,19 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
        WHERE id = ${claim.id}::uuid AND fencing_token = ${claim.fencingToken} AND state = 'RUNNING'`;
   }
 
+  /** Returns the provider's answer to the cancel request, or null when it is unknown. */
   private async cancelQuietly(
-    provider: ResearchProvider,
+    execution: Execution,
     responseId: string,
-    runId: string,
   ): Promise<ProviderSnapshot | null> {
     try {
-      return await provider.cancel(responseId);
+      return await execution.provider.cancel(responseId);
     } catch (error) {
-      this.logger.warn({ message: 'Research cancel failed', runId, ...errorInfo(error) });
+      this.logger.warn({
+        message: 'Research cancel failed',
+        runId: execution.claim.id,
+        ...errorInfo(error),
+      });
       return null;
     }
   }

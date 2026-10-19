@@ -20,8 +20,31 @@ export class FakeClock implements Clock {
   }
 }
 
+type Bounds = Pick<ResearchRequest, 'maxOutputTokens' | 'maxToolCalls'>;
+
+/** Bounds of a run admitted in fake mode without explicit limits (request-builder defaults). */
+export const FAKE_MODE_BOUNDS: Bounds = { maxOutputTokens: 2000, maxToolCalls: 3 };
+
+/** Echoed bounds; `null` request echoes the fake-mode defaults. */
+export function echoed(request: Bounds | null = FAKE_MODE_BOUNDS) {
+  return {
+    maxOutputTokens: request?.maxOutputTokens ?? null,
+    maxToolCalls: request?.maxToolCalls ?? null,
+    toolChoice: 'required',
+    webSearchTool: true,
+  };
+}
+
+/** Bounds a misbehaving provider might echo: nothing confirmed. */
+export const UNCONFIRMED_BOUNDS = {
+  maxOutputTokens: null,
+  maxToolCalls: null,
+  toolChoice: 'auto',
+  webSearchTool: false,
+};
+
 export function snapshot(
-  request: Pick<ResearchRequest, 'maxOutputTokens' | 'maxToolCalls'> | null,
+  request: Bounds | null,
   overrides: Partial<ProviderSnapshot> = {},
 ): ProviderSnapshot {
   return {
@@ -34,12 +57,7 @@ export function snapshot(
     usage: null,
     incompleteReason: null,
     errorCode: null,
-    bounds: {
-      maxOutputTokens: request?.maxOutputTokens ?? null,
-      maxToolCalls: request?.maxToolCalls ?? null,
-      toolChoice: 'required',
-      webSearchTool: true,
-    },
+    bounds: echoed(request ?? FAKE_MODE_BOUNDS),
     simulated: false,
     ...overrides,
   };
@@ -65,25 +83,31 @@ export function completed(parts: ProviderTextPart[], overrides: Partial<Provider
 export class ScriptedProvider implements ResearchProvider {
   readonly calls = { submit: 0, retrieve: 0, cancel: 0 };
   readonly requests: ResearchRequest[] = [];
+  /** Bounds the default handlers echo: those of the last submitted request. */
+  echo: Bounds = FAKE_MODE_BOUNDS;
   onSubmit: (request: ResearchRequest) => Promise<ProviderSnapshot> = (request) =>
     Promise.resolve(snapshot(request));
   onRetrieve: (id: string) => Promise<ProviderSnapshot> = () =>
     Promise.resolve(
-      completed([
-        buildTextPart([
-          'OUTCOME: FOUND\nClaim one.',
-          { cite: { url: 'https://example.com/a', title: 'Example A' } },
-        ]),
-      ]),
+      completed(
+        [
+          buildTextPart([
+            'OUTCOME: FOUND\nClaim one.',
+            { cite: { url: 'https://example.com/a', title: 'Example A' } },
+          ]),
+        ],
+        { bounds: echoed(this.echo) },
+      ),
     );
   onCancel: (id: string) => Promise<ProviderSnapshot> = (id) =>
-    Promise.resolve(snapshot(null, { id, status: 'cancelled' }));
+    Promise.resolve(snapshot(this.echo, { id, status: 'cancelled' }));
 
   constructor(readonly kind: ProviderKind = 'fake') {}
 
   submit(request: ResearchRequest): Promise<ProviderSnapshot> {
     this.calls.submit += 1;
     this.requests.push(request);
+    this.echo = { maxOutputTokens: request.maxOutputTokens, maxToolCalls: request.maxToolCalls };
     return this.onSubmit(request);
   }
   retrieve(id: string): Promise<ProviderSnapshot> {

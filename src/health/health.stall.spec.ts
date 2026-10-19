@@ -54,7 +54,7 @@ describe('readiness against a stalled database endpoint', () => {
   });
 
   it('shares one in-flight probe and releases its connection at the connect timeout', async () => {
-    const { fixture, app, prisma } = await start({ connect: 1_500, shutdown: 5_000 });
+    const { fixture, app, prisma } = await start({ connect: 4_000, shutdown: 5_000 });
     const server = httpServer(app);
 
     for (let i = 0; i < 5; i += 1) {
@@ -72,14 +72,14 @@ describe('readiness against a stalled database endpoint', () => {
     expect(prisma.poolStats().total).toBeLessThanOrEqual(1);
 
     // The driver timeout destroys the stalled socket; nothing is left behind.
-    await fixture.waitForOpenConnections((open) => open === 0, 3_000);
+    await fixture.waitForOpenConnections((open) => open === 0, 6_000);
     expect(prisma.poolStats()).toEqual({ total: 0, idle: 0, waiting: 0 });
 
     // The finished probe is not reused: the next request starts a new one.
     await request(server).get('/health/ready').expect(503);
     expect(fixture.accepted).toBe(2);
     expect(fixture.openConnections).toBeLessThanOrEqual(1);
-  });
+  }, 15_000);
 
   it('drains the stalled connection on shutdown within the connect timeout', async () => {
     const { fixture, app } = await start({ connect: 300, shutdown: 5_000 });

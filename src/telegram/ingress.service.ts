@@ -8,6 +8,7 @@ import { createDelivery, createStatusDelivery } from '../delivery/delivery-recor
 import { messages } from '../delivery/messages';
 import { codePointLength } from '../research/report';
 import { snapshotRunConfig } from '../research/request-builder';
+import { hasUnresolvedLiveUncertainty } from '../research/uncertainty';
 import { parseCommand, parseUpdate, type ParsedUpdate } from './update-parser';
 
 type Disposition = 'RUN_ACCEPTED' | 'RESULT_REQUESTED' | 'REPLIED' | 'REJECTED' | 'IGNORED';
@@ -164,6 +165,13 @@ export class TelegramIngressService {
     }
     const snapshot = snapshotRunConfig(this.config);
     if (!snapshot) throw new Error('research admission without research configuration');
+    // Fail-closed: no new live work while a billed request may still be unresolved.
+    // Best-effort here; the worker's claim statement is the authoritative gate.
+    if (snapshot.providerKind === 'openai' && (await hasUnresolvedLiveUncertainty(tx))) {
+      await record('REJECTED', 'LIVE_BLOCKED_UNCERTAIN');
+      await createStatusDelivery(tx, chatId, messages.liveBlocked);
+      return { disposition: 'REJECTED', reason: 'LIVE_BLOCKED_UNCERTAIN' };
+    }
 
     const runId = randomUUID();
     await record('RUN_ACCEPTED', null, runId);
@@ -196,7 +204,7 @@ export class TelegramIngressService {
   ): Promise<void> {
     const run = await tx.researchRun.findFirst({
       where: { id: runId, requestedByTelegramUserId: senderId },
-      select: { id: true, state: true, failureCode: true },
+      select: { id: true, state: true, failureCode: true, providerKind: true, reconciledAt: true },
     });
     if (!run) {
       await createStatusDelivery(tx, chatId, messages.runNotFound);
@@ -209,7 +217,13 @@ export class TelegramIngressService {
           : run.state === 'RUNNING'
             ? messages.runRunning(run.id)
             : run.state === 'UNCERTAIN'
-              ? messages.runUncertain(run.id, run.failureCode ?? 'UNKNOWN')
+              ? run.reconciledAt
+                ? messages.runUncertainReconciled(run.id, run.failureCode ?? 'UNKNOWN')
+                : messages.runUncertain(
+                    run.id,
+                    run.failureCode ?? 'UNKNOWN',
+                    run.providerKind === 'fake',
+                  )
               : messages.runFailed(run.id, run.failureCode ?? 'UNKNOWN');
       await createStatusDelivery(tx, chatId, text, run.id);
       return;

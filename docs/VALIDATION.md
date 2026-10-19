@@ -107,6 +107,35 @@ Live sample: **PENDING**. Requires owner authorization (billed OpenAI request an
 - the unit of annotation offsets (the code handles code points and UTF-16);
 - actual source quality, latency and cost.
 
+### TRB-020 review fixes (2026-10-19, reviewed commit 1d01db6)
+
+Finding 1 (recovery bypassed bounds verification), Finding 2 (failed or unconfirmed cancellation treated as definite failure) and the spending-control documentation. Local Windows 11, Node 24.19.0, Docker 29.7.2. Mock validation only: no OpenAI request, no Telegram message.
+
+| Check | Command | Result |
+|---|---|---|
+| Migration | `prisma migrate dev --create-only`, then `migrate deploy` / `migrate status` against the dev DB | `20261019091824_trb_020_uncertainty_reconciliation` applied: `reconciled_at`, append-only `research_reconciliation` (trigger), check and partial index. "Database schema is up to date"; `migrate diff --exit-code` reports no drift |
+| Static checks | `npm run format:check`, `npm run lint`, `npm run typecheck`, `npm run prisma:validate` | Pass |
+| Unit tests | `npm test` | 112 passed (10 files) |
+| Integration tests | `npm run test:integration` | 56 passed (5 files); 0 disposable databases left |
+| Regression tests fail on the reviewed code | new `research-uncertainty.int-spec.ts` "Finding" tests run with `research-worker.service.ts` from 1d01db6 | 12 failed, 3 passed (the 3 cover correct paths: valid recovery, confirmed cancellation usage, completed cancellation with valid bounds) |
+| Build | `npm run build` | Pass |
+| Reconcile CLI | `npm run ops:reconcile` on a scratch database with one UNCERTAIN live run | `--list` shows it; missing arguments: exit 2; reconcile: exit 0 and audit row; second attempt: `ALREADY_RECONCILED`, exit 1; run stays UNCERTAIN with failure code and response ID; list then empty |
+| Docker smoke (fake mode) | image on an internal Docker network, as for TRB-020 | Webhook 200 / duplicate deduplicated / wrong secret 401; real FakeResearchProvider run SUCCEEDED; deliveries UNKNOWN without resend; `node dist/ops/reconcile-run.js --list` works in the image; no token, secret, prompt or DB credentials in logs; `docker stop` exit 0 in 2.6 s |
+
+Regression scenarios (`test/integration/research-uncertainty.int-spec.ts`, `src/research/provider/fake.provider.spec.ts`):
+- **Finding 1, recovery.** A crash after saving the response ID and before verification: recovered `queued`/`in_progress` responses with unconfirmed bounds are cancelled and FAILED. Recovered `completed` responses with missing or mismatched bounds are discarded (FAILED, no report, usage kept, no cancel).
+- **Finding 1, correct paths.** A valid recovered response completes with zero submissions. Verification uses the run snapshot even when current `OUTPUT_TOKEN_LIMIT`/`TOOL_CALL_LIMIT` differ. A missing request snapshot is unverifiable.
+- **Finding 2, cancellation.** Deadline cancellation throwing a network error, or returning `queued`/`in_progress`, gives UNCERTAIN `DEADLINE_CANCEL_UNCONFIRMED` with the response ID, newest status and poll usage kept. Bounds-failure cancellation throwing gives UNCERTAIN. A confirmed cancellation stores its returned usage, and without usage keeps the earlier usage. A completed cancellation response is accepted only with confirmed bounds.
+- **Fail-closed blocking.** After an unknown submission outcome, and after an interrupted submission without an ID, a queued live run stays QUEUED across two concurrent workers and a new live `/research` is refused without creating a run. Explicit reconciliation lets the queued run execute: one new submission, for the queued run only, and the original stays UNCERTAIN with its evidence.
+- **Fake mode.** Simulated uncertainty does not block, and its notice says СИМУЛЯЦІЯ without claiming cost.
+- **Reconciliation.** It keeps state, failure code, response ID and submission state. The audit row holds operator, resolution and evidence, and UPDATE/DELETE on it fail. Reconciliation refuses: already reconciled, non-UNCERTAIN runs, unknown runs, invalid note or resolution.
+- **Stale workers.** A worker stuck in a deadline cancel cannot finalize after a newer worker completed the run. A worker whose late submit returns cannot overwrite a run that another worker made UNCERTAIN and the operator reconciled.
+- **Fake provider.** The fake provider echoes bounds after a "restart" (new instance). This test caught a regex escaping defect introduced while editing during this fix, before it reached any commit.
+
+Also fixed: `health.stall.spec.ts` (TRB-010) failed once under load. Ten sequential probes could exceed its 1.5 s connect timeout and open a second connection. The test now uses a 4 s connect timeout with a 15 s test timeout; three consecutive full unit runs passed before the change, and the targeted run passes after it.
+
+Live sample: still **PENDING**.
+
 ## Release checklist
 
 - Exact model/tool compatibility verified in official docs and an authorized sample.

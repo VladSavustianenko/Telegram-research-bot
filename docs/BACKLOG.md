@@ -20,7 +20,7 @@ Implement an administrator-only private-chat prototype command, OpenAI provider 
 
 Acceptance: one command can produce one persisted report with clickable claim-linked citations; processing does not block webhook acknowledgment; unsupported/missing provider config fails safely; no report is labelled live-tested without a live run. Compare fixtures and a small authorized sample before expanding integration.
 
-Status: DONE (2026-10-18). Authorized live sample: PENDING (procedure in docs/RESEARCH_SLICE.md). Not DONE until the owner accepts the implementation and the live sample is completed. Evidence: docs/VALIDATION.md, "TRB-020 evidence".
+Status: READY FOR REVIEW (2026-10-18; review fixes for commit 1d01db6 applied 2026-10-19). Authorized live sample: PENDING (procedure in docs/RESEARCH_SLICE.md). Not DONE until the owner accepts the implementation and the live sample is completed. Evidence: docs/VALIDATION.md, "TRB-020 evidence" and "TRB-020 review fixes".
 
 ## TRB-030 — Invitations, identity and authorization
 

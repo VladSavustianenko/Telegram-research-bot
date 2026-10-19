@@ -39,6 +39,9 @@ describe('research recovery (real PostgreSQL)', () => {
 
   const run = () => h.prisma.researchRun.findFirstOrThrow();
 
+  /** The immutable request a real submission would have stored (fake-mode bounds). */
+  const WITH_REQUEST = `request_snapshot = request_snapshot || '{"request":{"maxOutputTokens":2000,"maxToolCalls":3}}'::jsonb`;
+
   /** Simulates a process that died while holding the run. */
   async function crashWhileRunning(fields: string): Promise<void> {
     await h.prisma.$executeRawUnsafe(
@@ -76,7 +79,9 @@ describe('research recovery (real PostgreSQL)', () => {
     });
     expect(h.provider.calls).toEqual({ submit: 0, retrieve: 0, cancel: 0 });
     await drainDeliveries(h);
-    expect(h.sender.sent.at(-1)?.html).toContain('міг бути виконаний і оплачений');
+    // Fake mode: the uncertainty is simulated and must not claim billed activity.
+    expect(h.sender.sent.at(-1)?.html).toContain('СИМУЛЯЦІЯ');
+    expect(h.sender.sent.at(-1)?.html).not.toContain('оплачений');
   });
 
   it('resumes polling a saved response ID without resubmitting', async () => {
@@ -86,7 +91,7 @@ describe('research recovery (real PostgreSQL)', () => {
       return new ScriptedProvider().onRetrieve(id);
     };
     await crashWhileRunning(
-      `submission_state = 'SUBMITTED', provider_response_id = 'resp_saved', submitted_at = '2026-10-18T12:00:00Z'`,
+      `${WITH_REQUEST}, submission_state = 'SUBMITTED', provider_response_id = 'resp_saved', submitted_at = '2026-10-18T12:00:00Z'`,
     );
     await h.research.tick();
 
@@ -99,7 +104,7 @@ describe('research recovery (real PostgreSQL)', () => {
     h.provider.onRetrieve = () =>
       Promise.reject(new ProviderError('OPENAI_HTTP_404', 'not_accepted', true));
     await crashWhileRunning(
-      `submission_state = 'SUBMITTED', provider_response_id = 'resp_gone', submitted_at = '2026-10-18T12:00:00Z'`,
+      `${WITH_REQUEST}, submission_state = 'SUBMITTED', provider_response_id = 'resp_gone', submitted_at = '2026-10-18T12:00:00Z'`,
     );
     await h.research.tick();
     expect(await run()).toMatchObject({

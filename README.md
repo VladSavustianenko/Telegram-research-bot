@@ -60,7 +60,7 @@ The dev database uses port 5434 so that it does not collide with a locally insta
 
 ### Research prototype (TRB-020)
 
-Administrator-only, private-chat commands: `/research <prompt>` (acknowledges with a run ID; the sourced report arrives separately) and `/result <run-id>` (resends the stored report, never researches again). Webhook at `POST /telegram/webhook` (secret header required) or development polling. Research and delivery run in database-backed in-process workers, one research request at a time.
+Administrator-only, private-chat commands: `/research <prompt>` (acknowledges with a run ID; the sourced report arrives separately) and `/result <run-id>` (resends the stored report, never researches again). Webhook at `POST /telegram/webhook` (secret header required) or development polling. Research and delivery run in database-backed in-process workers, one research request at a time. An unresolved UNCERTAIN live run (a billed request may still be active) blocks further live research until an operator reconciles it with `npm run ops:reconcile`. Before any live use, enable an OpenAI project hard spend limit with "Enforce a hard limit" turned on; spend alerts alone do not stop traffic, and application budgets are not enforced before TRB-050.
 
 To try it without cost, use `RESEARCH_MODE=fake`: simulated, clearly labelled results from dated synthetic fixtures. Real Telegram delivery still needs a bot token and is an operator action. Behaviour, recovery policy, enforced and unenforced cost controls, deferred items and the authorized live-sample procedure are in [docs/RESEARCH_SLICE.md](docs/RESEARCH_SLICE.md).
 
