@@ -199,6 +199,34 @@ Telemetry tests:
   - Telemetry persists for an execution that ended UNCERTAIN, including the cancellation snapshot.
   - A legacy run without telemetry reports `not_recorded` (unknown, not zero); a rejected submission reports recorded with 0 items.
 
+### TRB-020 diagnostic live run and dashboard evidence (2026-10-19)
+
+The owner started a second live run with the telemetry build: same prompt, model and bounds. The owner also shared an OpenAI Usage dashboard screenshot. Nothing below was read through an authenticated API by the implementation.
+
+**Dashboard evidence for run `0241a554-…`** (owner screenshot: Usage, "Default project", "All API keys", week to date, taken after the second run)
+- **Figures shown.** Total spend $0.20; total tokens 23,806; total requests 1; "Responses and Chat Completions: 1 requests, 23.806K input tokens"; "Web Searches: 4 requests"; October spend $0.20 / $100.00.
+- **Attribution.** The figures fit run `0241a554-…` only: 23,806 input tokens and 1 request match it exactly. The invalid-key attempt has no usage. The second run (23,358 input tokens, submitted 10:54:57 UTC) was not yet reflected, consistent with dashboard ingestion delay.
+- **Interpretation.** The project's usage metering recorded **4 web search requests** for a response whose request carried `max_tool_calls = 3`.
+- **Cost consistency.** $0.20 is consistent with 4 metered search calls: input $0.119 + output $0.037 + 4 × $0.01 = $0.196. With 3 calls it would be $0.186; the dashboard's rounding does not allow a firm distinction from cost alone.
+- **Still unknown.**
+  - Which actions the 4 metered requests were; per-item metadata was not recorded for that run.
+  - Whether "Web Searches requests" equals billed calls one-to-one.
+  - Whether the fourth was an ignored attempt or an executed action.
+- **Not verified.** The screenshot does not show whether "Enforce a hard limit" is on. "$0.20 / $100.00" could be an alert threshold or a hard limit.
+
+**Diagnostic run `1f9d1736-eb9c-4251-b333-39f9b9944352`** (database and `npm run ops:tool-telemetry`)
+- **Execution.** SUCCEEDED / FOUND in 22.3 s; model `gpt-5.5-2026-04-23`, reasoning `low`; bounds 4000 / 3 echoed.
+- **Usage and citations.** 23,358 input and 1,222 output tokens (447 reasoning); 4 citations to 3 distinct sources (FC Barcelona schedule, LALIGA club page, LALIGA matchday page); 42 consulted URLs.
+- **Delivery.** ACK and REPORT SENT on the first attempt.
+- **Telemetry.** Recorded: **3 observed tool items**, all `completed` — 2 `search` and 1 `open_page`. `tool_call_count` = 3; no items without provider ID.
+- **Observation timing.** Every item was first and last seen in the same snapshot (observations = 1). The earlier in-progress polls exposed no tool items, so no intermediate status was observed.
+- **Evidence it adds.** An `open_page` action appears as a separate `web_search_call` item and counts toward the observed items. Here the observed items equal `max_tool_calls` (3).
+- **What it does not show.** How `open_page` is metered, or what the 4 items of the first run were.
+
+**Pending decisive check (no new run needed).** Once the dashboard includes the second run, the totals should be 2 requests and 47,164 input tokens. "Web Searches" then shows whether the 3 observed items were all metered (total 7) or only the 2 `search` actions (total 6). Any other value, or totals that do not match, leaves attribution unresolved.
+
+**Status.** Tool-limit verification remains **unresolved**. The first run had 4 observed output items and 4 metered web search requests with `max_tool_calls = 3`, so the echoed bound alone must not be treated as an enforced cap on metered web searches. Football facts are not independently verified.
+
 ## Release checklist
 
 - Exact model/tool compatibility verified in official docs and an authorized sample.
