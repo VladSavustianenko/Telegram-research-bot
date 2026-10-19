@@ -367,6 +367,81 @@ Remaining limitations:
 - **Earlier suspensions.** Suspensions that were already reactivated before the migration left no per-work evidence and are not reconstructed (docs/IDENTITY.md, "Legacy limitation").
 - **Not run:** Docker smoke (Dockerfile and dependencies unchanged), CI, and live Telegram.
 
+### TRB-030 acceptance (2026-10-19)
+
+The owner accepted TRB-030 after review of commit `cce6affda159b732b8702b329af2aad7923e97c2`: implementation 6540e6a plus the review fixes recorded above. The sections above are left as recorded.
+
+**Accepted limitation.** The durable-suppression migration does not reconstruct the effects of suspensions that were already reactivated before it ran (docs/IDENTITY.md, "Legacy limitation"). The owner's database has no historical suspended users or affected deliveries, so no further historical backfill is required. The migration is not claimed to handle every historical state.
+
+Durable suppression and the current-access check at delivery remain in the code. Their regression suites (`identity-delivery.int-spec.ts`, `identity.int-spec.ts`) pass with TRB-040.
+
+### TRB-040 evidence (2026-10-19, local Windows 11, Node 24.19.0, PostgreSQL 17)
+
+Mock validation only: fake research provider, recording Telegram sender, real disposable PostgreSQL. No OpenAI request, no Telegram message, no deployment. Behaviour: docs/TASKS.md.
+
+| Check | Command | Result |
+|---|---|---|
+| Static checks | `npm run format:check`, `npm run lint`, `npm run typecheck`, `npm run prisma:validate` | Pass |
+| Unit tests | `npm test` | 158 passed (12 files) |
+| Integration tests | `npm run test:integration` | 110 passed (10 files, all earlier suites included); 0 disposable databases left |
+| Build | `npm run build` | Pass |
+| Migration, isolated DB | integration global setup (`prisma migrate deploy` on a fresh database); `identity-migration.int-spec.ts` applies every migration after TRB-020, including `20261019185534_trb_040_tasks`, to a database with TRB-020 records | Pass; all rows of the six TRB-020 tables unchanged |
+| Migration, dev DB | `prisma migrate deploy`, `migrate status`, `migrate diff --exit-code` | Applied without reset; "up to date"; "No difference detected" (exit 0). Existing rows kept: 3 runs, 1 user, 10 deliveries |
+| Mutation check | Each guard removed in turn, `tasks.int-spec.ts` and task unit tests rerun (script outside the repository) | 11 of 11 caught. Guards: edit-save revision condition, draft-button version check, task owner scope, exclusion of deleted tasks, task-button revision check together with the delete and pause conditions, draft expiry, Save ending the draft, schedule-kind field clearing, a deleted edit target, and the access recheck inside the task services. The last one initially survived, because the router checks first; a test calling the services directly was added |
+
+Scenarios (`test/integration/tasks.int-spec.ts`). After every test there are zero research runs and zero provider submissions in every application instance used:
+- **Creation.**
+  - Manual, daily and weekly tasks through the steps, including the empty `/tasks` state and the "+ Нове завдання" button; a typed zone (`America/New_York`).
+  - The preview shows the exact configuration, with HTML in the prompt escaped; the stored fields are checked.
+- **Back and Cancel.**
+  - Back keeps values ("Зараз: 10:00", the ✓ weekday).
+  - Switching weekly to daily drops the weekday, and switching to manual drops the time.
+  - "Залишити як є" keeps the time; Cancel and `/cancel` save nothing, and the first step has no Back button.
+- **Validation.** Empty, overlong and multi-line names; an overlong prompt; text at a button step; a forged weekday `w8`; invalid times (`24:00`, `9.00`, text) and zones (`EST`, `Mars/Olympus`, `+03:00`). Each keeps the step and gives a clear message.
+- **Duplicates.** The same Save update twice plus a second press from another application instance, run concurrently, then another press: exactly one task and one `TASK_CREATED`.
+- **Open drafts.** `/new` with an open draft offers Continue or "Відкинути й почати нове"; nothing is discarded silently.
+- **Restart.** A creation draft and an edit draft each survive a restart and are completed in a new instance.
+- **Expiry.** An expired draft is neither saved (old Save button) nor resumed (text); the user is told, and `/new` starts afresh. Rejected input does not extend the expiry; an accepted step extends it to 24 h.
+- **Stale buttons.** An older step's button, a future version and a button of an ended draft change nothing.
+- **Editing.**
+  - The saved task is unchanged until Save; the edit applies only its section and increments the revision.
+  - Cancel and expiry of an edit leave the task unchanged.
+- **Stale edit.** A task paused after the edit started: Save is refused with the stale message, and the pause is kept.
+- **Overlapping changes.**
+  - An external session holds the user's identity advisory lock until an edit Save (instance 1) and a stale-card Pause (instance 2) both wait at PostgreSQL; two lock waiters are observed.
+  - Exactly one change is applied, the revision becomes 2, and the other is refused as stale.
+- **Pause and resume.** Repeated and stale presses change nothing; resume increments the revision.
+- **Limits.** Active and saved limits apply at save, resume and `/new`.
+- **Delete.**
+  - A stale confirmation (the task changed after the request) does not delete.
+  - Confirmed deletion soft-deletes (`DELETED`, `deleted_at`).
+  - An open edit draft of the deleted task ends safely. View, resume, edit and confirm on it answer "Завдання не знайдено.".
+- **Ownership.**
+  - User B gets "Завдання не знайдено." for every operation on A's task and on a nonexistent ID.
+  - A's draft buttons pressed by B do nothing to A's draft.
+  - B's list is empty, and nothing of A's appears in B's messages.
+- **Access.** Each of the following changes no draft or task:
+  - a suspended member's commands, text and draft button;
+  - an unknown sender's commands (invitation-required reply only);
+  - group commands and a group button press;
+  - a direct call of each task service with a suspended user (defence in depth).
+- **Task zone.** Changing the user's zone does not change an existing task or its card. Editing the schedule suggests the task's zone, and a new task suggests the user's.
+- **Logs.** Task names and prompts do not appear in logs; reason codes do.
+
+Unit (`src/tasks/tasks.spec.ts`):
+- **Dialog transitions** for every kind; Back keeps values; the kind change clears fields; per-step errors; edit sections.
+- **Configuration checks.** Partial or tampered configurations are refused; a manual schedule never keeps a time or weekday.
+- **Input rules.** Name, prompt and time rules.
+- **Callback data.** Payloads stay within 64 bytes; forged payloads are rejected.
+- **Escaping and splitting.** HTML is escaped, and long previews are split between graphemes without broken entities.
+- **Card wording.** Cards show the task zone and no invented next run.
+
+Remaining limitations:
+- **Not executed yet.** Schedules are stored configuration only: no next occurrence is computed (TRB-070), and there is no task "Run now" (TRB-050/060). Pausing or deleting cancels no queued work, because none exists yet.
+- **Settings.** The user's default zone cannot be changed from Telegram (`/settings` is not implemented); the independence test changes it directly in the database.
+- **Abandoned drafts.** Expired drafts nobody touches stay in `task_draft` until the user's next interaction (retention: TRB-090).
+- **Not run:** Docker smoke (Dockerfile and dependencies unchanged; two new optional variables with defaults), CI, live Telegram (inline buttons, multi-part previews).
+
 ## Release checklist
 
 - Exact model/tool compatibility verified in official docs and an authorized sample.

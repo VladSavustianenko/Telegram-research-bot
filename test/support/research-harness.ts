@@ -133,7 +133,7 @@ export async function resetDatabase(
   options: { onboardedAdmins?: boolean } = {},
 ): Promise<void> {
   await prisma.$executeRawUnsafe(
-    'TRUNCATE audit_event, invitation, research_tool_item, research_reconciliation, delivery_part, delivery, research_run, telegram_update, app_user RESTART IDENTITY CASCADE',
+    'TRUNCATE task_draft, task, audit_event, invitation, research_tool_item, research_reconciliation, delivery_part, delivery, research_run, telegram_update, app_user RESTART IDENTITY CASCADE',
   );
   if (options.onboardedAdmins === false) return;
   for (const id of [ADMIN_ID, OTHER_ADMIN_ID]) {

@@ -135,6 +135,9 @@ export const envSchema = z
       emptyAsUnset,
       z.enum(['disabled', 'fake', 'live']).default('disabled'),
     ),
+    // Tasks (TRB-040; proposed SPEC §3 defaults). Paused tasks count as saved, not active.
+    TASK_ACTIVE_LIMIT: positiveIntWithDefault(5),
+    TASK_SAVED_LIMIT: positiveIntWithDefault(20),
     RESEARCH_TIME_ZONE: z.preprocess(emptyAsUnset, ianaTimeZone.default('Europe/Kyiv')),
     RESEARCH_PROMPT_MAX_CHARS: positiveIntWithDefault(8_000),
     // Maximum QUEUED + RUNNING research runs; further requests are rejected.

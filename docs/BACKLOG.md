@@ -32,7 +32,9 @@ Implement single-use invitations, admin bootstrap, user onboarding, zone confirm
 
 Acceptance: expired/replayed invitations fail; two concurrent redemptions yield one winner; foreign callback IDs cannot expose content or mutate records; non-admin access to admin actions fails; group updates create no research; duplicate Telegram updates do not duplicate actions.
 
-Status: READY FOR REVIEW (2026-10-19; review fixes for commit 6540e6a applied 2026-10-19). Mock validation only: fake provider, recording Telegram sender, real PostgreSQL; no live Telegram or OpenAI check. Behaviour: docs/IDENTITY.md. Evidence: docs/VALIDATION.md, "TRB-030 evidence" and "TRB-030 review fixes". Live research remains administrator-only until TRB-050 is accepted.
+Status: DONE — accepted by the owner on 2026-10-19 after review of commit cce6affda159b732b8702b329af2aad7923e97c2 (implementation 6540e6a and review fixes). Behaviour: docs/IDENTITY.md. Evidence: docs/VALIDATION.md, "TRB-030 evidence", "TRB-030 review fixes" and "TRB-030 acceptance". Mock validation only; no live Telegram or OpenAI check. Live research remains administrator-only until TRB-050 is accepted.
+
+Accepted limitation: the durable-suppression migration does not reconstruct the effects of earlier suspensions that were already reactivated. The owner's database has no historical suspended users or affected deliveries, so no further historical backfill is required for acceptance. The migration is not claimed to handle every historical state.
 
 ## TRB-040 — Task CRUD and durable dialogs
 
@@ -41,6 +43,8 @@ Depends on: 030.
 Implement /tasks, /new, cards, editable prompts/schedules, pause/resume/delete, /cancel, persisted drafts and task revisions. Configure manual/daily/weekly options without cron input.
 
 Acceptance: full creation/edit flow works with Back/Cancel; restart resumes an unexpired draft; malformed zone/time/input is rejected; stale edit callbacks do not overwrite changes; existing tasks keep their zone when the user default changes; save never launches research implicitly.
+
+Status: READY FOR REVIEW (2026-10-19). Mock validation only: fake provider, recording Telegram sender, real PostgreSQL; no live Telegram check. Behaviour: docs/TASKS.md. Evidence: docs/VALIDATION.md, "TRB-040 evidence". Schedules are stored configuration only; execution is TRB-070, and "Run now" from a task is TRB-050/060.
 
 ## TRB-050 — Atomic admission, quotas and cost reservations
 

@@ -1,6 +1,6 @@
 # Telegram Research Bot — implementation brief
 
-Version: 1.0 · 2026-10-18 · Documentation package, project foundation (TRB-010, DONE), first research-to-Telegram slice (TRB-020, DONE; tool-call metering unresolved) and invitations, identity and authorization (TRB-030, ready for review).
+Version: 1.0 · 2026-10-18 · Documentation package, project foundation (TRB-010, DONE), first research-to-Telegram slice (TRB-020, DONE; tool-call metering unresolved) invitations, identity and authorization (TRB-030, DONE) and task management with durable dialogs (TRB-040, ready for review; schedules are not executed yet).
 
 Build a private-beta, multi-user Telegram bot that runs user-authored research prompts manually or on a schedule, uses OpenAI web search, and delivers sourced results. Deploy one NestJS application and PostgreSQL on Railway.
 
@@ -73,6 +73,14 @@ Administrators come from `ADMIN_TELEGRAM_IDS`; everyone else needs a single-use 
 - **Live research** remains administrator-only until TRB-050.
 
 Commands, token handling, suspension semantics and the migration of existing runs are in [docs/IDENTITY.md](docs/IDENTITY.md).
+
+### Tasks (TRB-040)
+
+- **Commands.** `/tasks`, `/new` and `/cancel` manage saved research tasks: name, prompt, a manual, daily or weekly schedule, and their own time zone.
+- **Dialogs.** Guided steps with Back and Cancel, persisted drafts (24 h), revision-checked edits, pause, resume and confirmed soft delete.
+- **Not executed yet.** Saving or changing a task never starts research. Scheduled execution comes in TRB-070, and running a task from its card in TRB-050/060.
+
+Details: [docs/TASKS.md](docs/TASKS.md).
 
 Prisma owns the `public` schema and its migrations in `prisma/migrations`; pg-boss will own a separate `pgboss` schema (TRB-060). The generated Prisma client is written to `src/generated/prisma` (not committed).
 

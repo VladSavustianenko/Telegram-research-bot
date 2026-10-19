@@ -1,6 +1,6 @@
 # TRB-030: identity, invitations, onboarding and authorization
 
-Status: READY FOR REVIEW (review fixes for commit 6540e6a applied 2026-10-19: durable suppression, current access at delivery). Validated with fake providers, a recording Telegram sender and real PostgreSQL only; nothing here was exercised against the real Telegram API.
+Status: DONE (accepted by the owner on 2026-10-19 after review of commit cce6aff, including the review fixes: durable suppression, current access at delivery). Accepted limitation: see "Legacy limitation" below; the owner's database has no historical suspended users or affected deliveries. Validated with fake providers, a recording Telegram sender and real PostgreSQL only; nothing here was exercised against the real Telegram API.
 
 ## Identity
 

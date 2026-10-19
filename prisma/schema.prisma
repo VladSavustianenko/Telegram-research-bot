@@ -300,6 +300,8 @@ model AppUser {
   invitationRedeemed Invitation?     @relation("InvitationRedeemer")
   auditAsActor       AuditEvent[]    @relation("AuditActor")
   auditAsSubject     AuditEvent[]    @relation("AuditSubject")
+  tasks              Task[]
+  taskDraft          TaskDraft?
 
   @@map("app_user")
 }
@@ -348,4 +350,92 @@ model AuditEvent {
 
   @@index([subjectUserId, createdAt])
   @@map("audit_event")
+}
+
+// ---------------------------------------------------------------------------
+// TRB-040: research tasks and durable creation/edit dialogs. Schedules store
+// local intent (weekday, HH:mm, IANA zone); execution is added by TRB-070.
+
+enum TaskState {
+  ACTIVE
+  PAUSED
+  /// Soft-deleted: hidden from navigation, accepts no further actions; history is kept.
+  DELETED
+}
+
+enum ScheduleKind {
+  MANUAL
+  DAILY
+  WEEKLY
+}
+
+model Task {
+  id                 String       @id @default(uuid()) @db.Uuid
+  userId             String       @map("user_id") @db.Uuid
+  user               AppUser      @relation(fields: [userId], references: [id], onDelete: Restrict)
+  name               String
+  prompt             String
+  scheduleKind       ScheduleKind @map("schedule_kind")
+  /// ISO weekday 1 (Monday) to 7 (Sunday); WEEKLY only.
+  weekday            Int?
+  /// Local wall-clock time "HH:mm" in time_zone; DAILY and WEEKLY only. Never converted to UTC.
+  localTime          String?      @map("local_time")
+  /// The task's own IANA zone; independent of the user's default.
+  timeZone           String       @map("time_zone")
+  state              TaskState    @default(ACTIVE)
+  /// Incremented on every change; edits and buttons carry it (optimistic concurrency).
+  revision           Int          @default(1)
+  /// The draft that created it; unique, so one draft can never create two tasks.
+  createdFromDraftId String?      @unique @map("created_from_draft_id") @db.Uuid
+  deletedAt          DateTime?    @map("deleted_at") @db.Timestamptz(3)
+  createdAt          DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
+  drafts             TaskDraft[]
+
+  @@index([userId, state, createdAt])
+  @@map("task")
+}
+
+enum DraftMode {
+  CREATE
+  EDIT
+}
+
+enum DraftSection {
+  NAME
+  PROMPT
+  SCHEDULE
+}
+
+enum DraftStep {
+  NAME
+  PROMPT
+  SCHEDULE_KIND
+  WEEKDAY
+  LOCAL_TIME
+  TIME_ZONE
+  PREVIEW
+}
+
+/// At most one open dialog per user (creation or editing). Survives restarts;
+/// expires after inactivity. Values entered so far live in `data`.
+model TaskDraft {
+  id           String        @id @default(uuid()) @db.Uuid
+  userId       String        @unique @map("user_id") @db.Uuid
+  user         AppUser       @relation(fields: [userId], references: [id], onDelete: Restrict)
+  mode         DraftMode
+  /// EDIT only: the task being edited, the section and the task revision when editing began.
+  taskId       String?       @map("task_id") @db.Uuid
+  task         Task?         @relation(fields: [taskId], references: [id], onDelete: Restrict)
+  section      DraftSection?
+  baseRevision Int?          @map("base_revision")
+  step         DraftStep
+  data         Json
+  /// Incremented on every change; buttons carry it, so old buttons do nothing.
+  version      Int           @default(0)
+  expiresAt    DateTime      @map("expires_at") @db.Timestamptz(3)
+  createdAt    DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@map("task_draft")
 }

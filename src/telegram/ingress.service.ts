@@ -16,6 +16,15 @@ import { normalizeTimeZone } from '../identity/time-zone';
 import { lockTelegramIdentity, resolveSender } from '../identity/users';
 import { admitResearch } from '../research/admission';
 import { codePointLength } from '../research/report';
+import {
+  cancelDraft,
+  onDraftAction,
+  onDraftText,
+  onTaskAction,
+  showTasks,
+  startCreate,
+  type TaskContext,
+} from '../tasks/task-service';
 import { parseCallbackData } from './callback-data';
 import { TELEGRAM_SENDER, type InlineKeyboard, type TelegramSender } from './telegram-sender';
 import { parseCommand, parseUpdate, type ParsedUpdate } from './update-parser';
@@ -197,6 +206,12 @@ export class TelegramIngressService {
           : this.reply(context, 'REPLIED', 'HELP', help);
       case 'help':
         return this.reply(context, 'REPLIED', 'HELP', help);
+      case 'tasks':
+        return showTasks(this.taskContext(context, user));
+      case 'new':
+        return startCreate(this.taskContext(context, user));
+      case 'cancel':
+        return cancelDraft(this.taskContext(context, user));
       case 'research': {
         if (this.config.RESEARCH_MODE === 'disabled') {
           return this.reply(context, 'REPLIED', 'RESEARCH_DISABLED', messages.researchDisabled);
@@ -228,7 +243,11 @@ export class TelegramIngressService {
           chatId: update.chatId,
         });
       case undefined:
-        return this.reply(context, 'REPLIED', 'NOT_A_COMMAND', help);
+        // Commands are routed first; free text is a value only for an open draft.
+        return (
+          (await onDraftText(this.taskContext(context, user), text)) ??
+          this.reply(context, 'REPLIED', 'NOT_A_COMMAND', help)
+        );
       default:
         return this.reply(context, 'REPLIED', 'UNKNOWN_COMMAND', messages.unknownCommand);
     }
@@ -320,6 +339,27 @@ export class TelegramIngressService {
     if (access === 'SUSPENDED') {
       return { disposition: 'REJECTED', reason: 'SUSPENDED', callbackAnswer: messages.suspended };
     }
+    if (action.kind !== 'confirm_time_zone') {
+      // Task and draft buttons need a completed account; services recheck access.
+      if (access !== 'ACTIVE') {
+        return {
+          disposition: 'REJECTED',
+          reason: 'ONBOARDING_INCOMPLETE',
+          callbackAnswer: messages.onboardingRequired,
+        };
+      }
+      const tasks = this.taskContext(context, user);
+      switch (action.kind) {
+        case 'draft':
+          return onDraftAction(tasks, action.version, action.op);
+        case 'task':
+          return onTaskAction(tasks, action.taskId, action.revision, action.op);
+        case 'task_list':
+          return showTasks(tasks, action.page);
+        case 'task_new':
+          return startCreate(tasks);
+      }
+    }
     if (access === 'ACTIVE') {
       return {
         disposition: 'IGNORED',
@@ -364,6 +404,10 @@ export class TelegramIngressService {
   ): Promise<Outcome> {
     await createStatusDelivery(context.tx, context.update.chatId, text, undefined, replyMarkup);
     return { disposition, reason };
+  }
+
+  private taskContext(context: Context, user: AppUser): TaskContext {
+    return { tx: context.tx, config: this.config, user, chatId: context.update.chatId };
   }
 
   private helpFor(user: AppUser): string {
