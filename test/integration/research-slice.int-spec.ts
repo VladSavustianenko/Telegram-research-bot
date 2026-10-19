@@ -54,7 +54,7 @@ describe('research-to-Telegram slice (fake provider and Telegram, real PostgreSQ
       await off.post(privateMessage('/research football')).expect(404);
     });
 
-    it('rejects non-administrators and group chats without creating research', async () => {
+    it('rejects unregistered users and group chats without creating research', async () => {
       await h.post(privateMessage('/research football', 2002)).expect(200);
       await h.post(groupMessage('/research football')).expect(200);
       await h.research.tick();
@@ -63,10 +63,10 @@ describe('research-to-Telegram slice (fake provider and Telegram, real PostgreSQ
       expect(h.provider.calls.submit).toBe(0);
       const updates = await h.prisma.telegramUpdate.findMany({ orderBy: { updateId: 'asc' } });
       expect(updates.map((u) => [u.disposition, u.reason])).toEqual([
-        ['REJECTED', 'NOT_ADMIN'],
+        ['REJECTED', 'NOT_REGISTERED'],
         ['IGNORED', 'NOT_PRIVATE_CHAT'],
       ]);
-      // Only the private non-admin gets a generic reply; nothing is sent to the group.
+      // Only the private unregistered user gets a generic reply; nothing is sent to the group.
       const sent = await deliveries();
       expect(sent.map((d) => d.chatId)).toEqual([2002n]);
     });
@@ -99,7 +99,7 @@ describe('research-to-Telegram slice (fake provider and Telegram, real PostgreSQ
       await drainDeliveries(h);
       expect(h.sender.sent.map((s) => s.html.split('\n')[0])).toEqual([
         'Запит прийнято (СИМУЛЯЦІЯ, без реального пошуку).',
-        'Приватний дослідницький бот (прототип, лише для адміністраторів).',
+        'Приватний дослідницький бот (прототип).',
       ]);
       expect((await runs())[0]).toMatchObject({ state: 'RUNNING', submissionState: 'SUBMITTING' });
 

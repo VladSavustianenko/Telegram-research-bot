@@ -227,6 +227,95 @@ The owner started a second live run with the telemetry build: same prompt, model
 
 **Status.** Tool-limit verification remains **unresolved**. The first run had 4 observed output items and 4 metered web search requests with `max_tool_calls = 3`, so the echoed bound alone must not be treated as an enforced cap on metered web searches. Football facts are not independently verified.
 
+### TRB-020 acceptance (2026-10-19)
+
+The owner accepted TRB-020 after review of commit `8e1591a3ea356305b6120920872444bcfcd233da` and the live evidence above. The sections above are left as recorded.
+
+- **What acceptance covers.** The implementation and the observed live behaviour: provider integration, stored report, delivery and `/result`.
+- **What it does not cover.** Acceptance does **not** verify that `max_tool_calls` caps billable searches, and it does not establish an exact spending ceiling. Tool-call metering remains **unresolved**.
+- **Clarification of the pending dashboard check** (the sections above are unchanged). A "Web Searches" total of 7 or 6 would only show which observed metering total the dashboard reports, all observed items or only the `search` actions, for these two runs. It would not independently prove which actions OpenAI bills, or how. That requires billing documentation or invoice-level evidence.
+- **Consequence for TRB-050.** Budget reservations must not assume `max_tool_calls` is a hard cap on billable searches. Unknown usage and potential overruns need an explicit policy (docs/BACKLOG.md, TRB-050). Live research stays administrator-only until then (TRB-030).
+
+### TRB-030 evidence (2026-10-19, local Windows 11, Node 24.19.0, PostgreSQL 17)
+
+Mock validation only: fake research provider, recording Telegram sender, real disposable PostgreSQL. No OpenAI request, no Telegram message, no deployment. Behaviour: docs/IDENTITY.md.
+
+| Check | Command | Result |
+|---|---|---|
+| Static checks | `npm run format:check`, `npm run lint`, `npm run typecheck`, `npm run prisma:validate` | Pass |
+| Unit tests | `npm test` | 148 passed (11 files) |
+| Integration tests | `npm run test:integration` | 81 passed (8 files, including all TRB-010/020 suites); 0 disposable databases left |
+| Build | `npm run build` | Pass |
+| Migration, dev DB | `prisma migrate deploy`, `migrate status`, `migrate diff --exit-code` | `20261019111654_trb_030_identity` applied without reset; "up to date"; "No difference detected" (exit 0) |
+| Dev data preserved | MD5 over all rows of `research_run`, `delivery`, `delivery_part`, `research_tool_item` (new columns excluded) before and after the migration and after bootstrap; reconciliation row count | Identical. The 3 TRB-020 runs were linked to the configured administrator at startup (`ADMIN_GRANTED`, `linkedRuns: 3`); the application ran with `TELEGRAM_MODE` and `RESEARCH_MODE` disabled |
+| Mutation check | Each guard removed in turn, TRB-030 suites rerun (script outside the repository) | 10 of 11 mutations caught: worker eligibility gate, delivery suppression, single-redemption condition, expiry condition, `/result` owner scope, live admin-only admission, suspension cancelling queued runs, redemption by suspended users, in-flight suspension check, and both revision checks together. Removing only the router's revision check is not detected, because the conditional update in `confirmTimeZone` enforces the same rule (defence in depth) |
+
+Scenarios (`test/integration/identity.int-spec.ts`, `identity-migration.int-spec.ts`, `src/identity/identity.spec.ts`, `src/telegram/ingress.spec.ts`):
+- **Bootstrap.**
+  - Idempotent on repeat, with no invitation used.
+  - A removed ID loses the role. A re-added suspended user stays suspended and cannot act.
+  - A configured administrator onboards through `/start` and the time-zone button.
+  - A removed administrator without an invitation has no account.
+- **Invitations.**
+  - End-to-end onboarding with a typed zone (`america/new_york` normalised and confirmed by button) and an invalid zone rejected. Fake research then succeeds in the user's zone.
+  - The inviting administrator is notified with the Telegram ID only.
+  - The token is absent from `invitation`, `delivery_part` (placeholder only), `telegram_update`, `audit_event`, `app_user` and the logs.
+  - Malformed, unknown, expired and consumed tokens get one identical reply and create no user.
+  - Five rounds of two concurrent redeemers each produce exactly one user.
+  - Members, administrators, suspended users and group messages never consume an invitation; an unused invitation still works afterwards, granting MEMBER only.
+  - Without `INVITATION_TOKEN_SECRET`, creation is refused.
+- **Duplicates.** Replayed or concurrent identical updates create one invitation, one user, one redemption audit, one notice, one confirmation and one run; a second press after completion changes nothing.
+- **Restart.** Onboarding resumes in a new application instance, and a button issued before the restart still confirms.
+- **Callbacks.** These change nothing and create no message:
+  - stale revision;
+  - invalid zone (`EST`);
+  - injected `;owner=` suffix;
+  - unknown prefix;
+  - a press by a sender without an account;
+  - a press in a group, or in a chat that is not the presser's.
+- **Ownership.**
+  - `/result` for another user's run, for a nonexistent run and by an administrator for a member's run all get "Запуск не знайдено." and create no RESEND.
+  - A member's `/admin suspend` and `/admin invite` look like unknown commands and change nothing.
+  - A foreign run ID is not recorded in the inbox.
+  - Unregistered senders get only the invitation-required reply for every command.
+- **Suspension.**
+  - Queued runs become CANCELLED and their acknowledgment SUPPRESSED, with no provider call; further `/research`, `/result` and `/start <token>` are refused.
+  - Repeated suspension is idempotent; administrators and unknown IDs are refused; the audit holds counts only.
+  - Reactivation delivers no backlog.
+  - Suspension committed after admission without cancellation: the worker cancels before submission.
+  - Pending report: SUPPRESSED, and the stored result is kept.
+  - In-flight request: provider cancellation is requested; confirmed gives CANCELLED and keeps the response ID; a failed cancellation gives UNCERTAIN `SUSPENDED_CANCEL_UNCONFIRMED`; nothing is delivered.
+- **Live before TRB-050.**
+  - A member's live request is refused, with no run and no simulated fallback.
+  - A member's queued live run is CANCELLED `LIVE_NOT_PERMITTED` with zero submissions.
+  - An administrator's live run proceeds.
+- **Migration.** A database with TRB-020 records was migrated up to TRB-020, then TRB-030 was applied:
+  - All rows of six tables are unchanged, and no owner is assigned by the migration.
+  - Bootstrap links only the configured administrator's runs, with row content unchanged apart from `user_id`; reconciliation is still append-only and owners cannot be reassigned.
+  - Records used:
+    - SUCCEEDED live run with report, resend and tool items;
+    - reconciled UNCERTAIN run;
+    - unreconciled UNCERTAIN run of a former administrator;
+    - SUCCEEDED and QUEUED fake runs;
+    - status delivery.
+  - The former administrator's unreconciled live UNCERTAIN run still blocks live work.
+  - The unowned QUEUED run is CANCELLED `OWNER_UNRESOLVED` with zero submissions, and its notice is suppressed.
+  - The administrator resends a TRB-020 report after onboarding.
+  - The former administrator has no access until invited; redemption then links exactly their runs.
+- **Unit.**
+  - Authorization matrix; time-zone normalisation (accepts region names and UTC; rejects `EST`, `est5edt`, `GMT+3`, offsets and unknown zones).
+  - Callback data bounds and forged payloads; token shape and hashing; unsafe Telegram IDs rejected rather than rounded.
+
+Found and fixed while testing:
+- `Intl` accepts `EST` as `America/Panama`, so only region names and UTC are accepted.
+- `Intl` spells `Europe/Kyiv` as `Europe/Kiev`, so stored spelling follows the runtime list or the user's title-cased input.
+- The cancellation notice of an unowned run was delivered to its original chat; deliveries of unowned runs are now suppressed.
+
+Not run:
+- **Docker image smoke.** The Dockerfile and dependencies are unchanged and the new variables are optional.
+- **CI on a hosted runner.**
+- **Live Telegram check of buttons, deep links and callback acknowledgements.** It needs owner authorization and real messages; `answerCallbackQuery` and `reply_markup` are verified only against the grammY types.
+
 ## Release checklist
 
 - Exact model/tool compatibility verified in official docs and an authorized sample.

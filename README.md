@@ -1,6 +1,6 @@
 # Telegram Research Bot — implementation brief
 
-Version: 1.0 · 2026-10-18 · Documentation package, project foundation (TRB-010, DONE) and first research-to-Telegram slice (TRB-020, ready for review; live sample pending).
+Version: 1.0 · 2026-10-18 · Documentation package, project foundation (TRB-010, DONE), first research-to-Telegram slice (TRB-020, DONE; tool-call metering unresolved) and invitations, identity and authorization (TRB-030, ready for review).
 
 Build a private-beta, multi-user Telegram bot that runs user-authored research prompts manually or on a schedule, uses OpenAI web search, and delivers sourced results. Deploy one NestJS application and PostgreSQL on Railway.
 
@@ -60,9 +60,19 @@ The dev database uses port 5434 so that it does not collide with a locally insta
 
 ### Research prototype (TRB-020)
 
-Administrator-only, private-chat commands: `/research <prompt>` (acknowledges with a run ID; the sourced report arrives separately) and `/result <run-id>` (resends the stored report, never researches again). Webhook at `POST /telegram/webhook` (secret header required) or development polling. Research and delivery run in database-backed in-process workers, one research request at a time. An unresolved UNCERTAIN live run (a billed request may still be active) blocks further live research until an operator reconciles it with `npm run ops:reconcile`. Before any live use, enable an OpenAI project hard spend limit with "Enforce a hard limit" turned on; spend alerts alone do not stop traffic, and application budgets are not enforced before TRB-050.
+Private-chat commands for users with completed onboarding (TRB-030): `/research <prompt>` (acknowledges with a run ID; the sourced report arrives separately) and `/result <run-id>` (resends the stored report, never researches again). Webhook at `POST /telegram/webhook` (secret header required) or development polling. Research and delivery run in database-backed in-process workers, one research request at a time. An unresolved UNCERTAIN live run (a billed request may still be active) blocks further live research until an operator reconciles it with `npm run ops:reconcile`. Before any live use, enable an OpenAI project hard spend limit with "Enforce a hard limit" turned on; spend alerts alone do not stop traffic, and application budgets are not enforced before TRB-050.
 
 To try it without cost, use `RESEARCH_MODE=fake`: simulated, clearly labelled results from dated synthetic fixtures. Real Telegram delivery still needs a bot token and is an operator action. Behaviour, recovery policy, enforced and unenforced cost controls, deferred items and the authorized live-sample procedure are in [docs/RESEARCH_SLICE.md](docs/RESEARCH_SLICE.md).
+
+### Access (TRB-030)
+
+Administrators come from `ADMIN_TELEGRAM_IDS`; everyone else needs a single-use invitation:
+- **Invite.** `/admin invite` sends a link that expires after 7 days by default. It needs `INVITATION_TOKEN_SECRET`.
+- **Onboard.** New users open the link and confirm a time zone (Europe/Kyiv is suggested). Administrators onboard with `/start` and confirm a time zone too.
+- **Suspend.** `/admin suspend <Telegram ID>` and `/admin reactivate <Telegram ID>` manage access.
+- **Live research** remains administrator-only until TRB-050.
+
+Commands, token handling, suspension semantics and the migration of existing runs are in [docs/IDENTITY.md](docs/IDENTITY.md).
 
 Prisma owns the `public` schema and its migrations in `prisma/migrations`; pg-boss will own a separate `pgboss` schema (TRB-060). The generated Prisma client is written to `src/generated/prisma` (not committed).
 

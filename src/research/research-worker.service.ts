@@ -20,6 +20,8 @@ import { createDelivery, createStatusDelivery } from '../delivery/delivery-recor
 import { messages } from '../delivery/messages';
 import { renderReport } from '../delivery/report-renderer';
 import type { Prisma } from '../generated/prisma/client';
+import { submissionDenial } from '../identity/authorization';
+import { lockUserForShare } from '../identity/users';
 import {
   NON_TERMINAL_STATUSES,
   ProviderError,
@@ -59,6 +61,8 @@ interface Execution {
   claim: Claim;
   provider: ResearchProvider;
   stored: StoredSnapshot;
+  /** Run owner; null for an unlinked TRB-020 run (never submitted). */
+  ownerId: string | null;
 }
 
 /** The lease was lost to another worker; this worker must stop touching the run. */
@@ -116,6 +120,13 @@ export function boundsProblems(stored: StoredSnapshot, snapshot: ProviderSnapsho
  * A failed, missing or non-terminal cancellation leaves the run UNCERTAIN.
  * Unreconciled live UNCERTAIN runs block claiming of further live work.
  * Every write after claiming is fenced by (id, fencing_token, state=RUNNING).
+ *
+ * Owner eligibility (TRB-030) is rechecked before a new submission, in the
+ * transaction that records SUBMITTING and under a shared lock on the owner's
+ * row: a suspended, unresolved or no-longer-permitted owner (live research is
+ * administrator-only) gets CANCELLED with zero provider calls. A suspension
+ * committed after SUBMITTING lets the request go out; polling then sees the
+ * suspension and requests provider cancellation, keeping the request tracked.
  */
 @Injectable()
 export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
@@ -224,7 +235,7 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
   ): Promise<void> {
     const run = await this.prisma.researchRun.findUniqueOrThrow({ where: { id: claim.id } });
     const stored = run.requestSnapshot as unknown as StoredSnapshot;
-    const execution: Execution = { claim, provider, stored };
+    const execution: Execution = { claim, provider, stored, ownerId: run.userId };
 
     // Never switch providers silently (e.g. a run admitted as live must not get fake results).
     if (stored.config.providerKind !== provider.kind) {
@@ -261,15 +272,24 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
     const submittedAt = this.clock.now();
     const context = buildResearchContext(submittedAt, run.createdAt, stored.config.timeZone);
     const request = buildResearchRequest(run.id, run.prompt, stored.config, context);
-    execution.stored = { config: stored.config, context, request };
-    // Record the intent (and the immutable request) before the potentially billed call.
-    await this.fenced(this.prisma, claim, {
-      submissionState: 'SUBMITTING',
-      submittedAt,
-      // From here on, every provider snapshot's tool items are recorded (research_tool_item).
-      toolTelemetryVersion: TOOL_TELEMETRY_VERSION,
-      requestSnapshot: execution.stored as unknown as Prisma.InputJsonValue,
+    const nextStored: StoredSnapshot = { config: stored.config, context, request };
+    // Recheck the owner and record the intent (and the immutable request) before
+    // the potentially billed call, atomically.
+    const denial = await this.prisma.$transaction(async (tx) => {
+      const owner = run.userId ? await lockUserForShare(tx, run.userId) : null;
+      const reason = submissionDenial(owner, provider.kind, this.config);
+      if (reason) return reason;
+      await this.fenced(tx, claim, {
+        submissionState: 'SUBMITTING',
+        submittedAt,
+        // From here on, every provider snapshot's tool items are recorded (research_tool_item).
+        toolTelemetryVersion: TOOL_TELEMETRY_VERSION,
+        requestSnapshot: nextStored as unknown as Prisma.InputJsonValue,
+      });
+      return null;
     });
+    if (denial) return this.finishWithoutReport(execution, 'CANCELLED', denial);
+    execution.stored = nextStored;
 
     let first: ProviderSnapshot;
     try {
@@ -328,6 +348,9 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
           return this.onUnconfirmedBounds(execution, responseId, latest, known, problems);
         }
         if (isTerminal(latest)) return this.finishTerminal(execution, latest, known);
+      }
+      if (await this.ownerSuspended(execution)) {
+        return this.onOwnerSuspended(execution, responseId, known);
       }
       if (this.clock.now().getTime() >= deadline) {
         return this.onDeadline(execution, responseId, known);
@@ -409,6 +432,55 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
     return this.finishWithoutReport(execution, 'FAILED', 'DEADLINE_EXCEEDED', merged);
   }
 
+  private async ownerSuspended(execution: Execution): Promise<boolean> {
+    if (!execution.ownerId) return false;
+    const owner = await this.prisma.appUser.findUnique({
+      where: { id: execution.ownerId },
+      select: { status: true },
+    });
+    return owner?.status === 'SUSPENDED';
+  }
+
+  /**
+   * The owner was suspended while the request was at the provider. Requests
+   * cancellation; only a terminal provider answer counts as confirmed. A
+   * completed answer is stored as a report (its delivery is suppressed).
+   */
+  private async onOwnerSuspended(
+    execution: Execution,
+    responseId: string,
+    known: ProviderSnapshot | null,
+  ): Promise<void> {
+    this.logger.warn({
+      message: 'Run owner suspended; cancelling research',
+      runId: execution.claim.id,
+    });
+    const cancelled = await this.cancelQuietly(execution, responseId);
+    if (cancelled) await this.observe(execution.claim, responseId, cancelled);
+    const merged = mergeSnapshots(known, cancelled);
+    if (!isTerminal(cancelled)) {
+      return this.finishWithoutReport(
+        execution,
+        'UNCERTAIN',
+        'SUSPENDED_CANCEL_UNCONFIRMED',
+        merged,
+      );
+    }
+    if (cancelled.status === 'cancelled') {
+      return this.finishWithoutReport(execution, 'CANCELLED', 'USER_SUSPENDED', merged);
+    }
+    const problems = boundsProblems(execution.stored, cancelled);
+    if (problems.length > 0) {
+      return this.finishWithoutReport(
+        execution,
+        'FAILED',
+        `BOUNDS_NOT_CONFIRMED:${problems.join(',')}`,
+        merged,
+      );
+    }
+    return this.finishTerminal(execution, cancelled, merged);
+  }
+
   /** `response` provides content; `known` provides the newest accounting. Bounds are already verified. */
   private async finishTerminal(
     execution: Execution,
@@ -467,7 +539,7 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
 
   private async finishWithoutReport(
     execution: Execution,
-    state: 'FAILED' | 'UNCERTAIN',
+    state: 'FAILED' | 'UNCERTAIN' | 'CANCELLED',
     failureCode: string,
     accounting?: ProviderSnapshot | null,
   ): Promise<void> {
@@ -483,10 +555,13 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
         leaseOwner: null,
         leaseUntil: null,
       });
+      // Delivery is suppressed later if the owner is suspended.
       const text =
         state === 'UNCERTAIN'
           ? messages.runUncertain(claim.id, failureCode, simulated)
-          : messages.runFailed(claim.id, failureCode);
+          : state === 'CANCELLED'
+            ? messages.runCancelled(claim.id, failureCode)
+            : messages.runFailed(claim.id, failureCode);
       await createStatusDelivery(tx, run.chatId, text, claim.id);
     });
     const log = { message: `Research ${state.toLowerCase()}`, runId: claim.id, failureCode };

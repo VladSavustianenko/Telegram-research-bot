@@ -1,18 +1,32 @@
 # TRB-020 research slice: behaviour, recovery and live sample
 
-Status: implementation READY FOR REVIEW (review fixes of 2026-10-19 applied). Authorized live sample performed 2026-10-19: provider integration, delivery and `/result` passed; tool-limit verification unresolved (docs/VALIDATION.md). Everything below describes the code as implemented; nothing here has been observed against the real OpenAI or Telegram APIs.
+Status: DONE (accepted by the owner on 2026-10-19). Authorized live sample performed 2026-10-19: provider integration, delivery and `/result` passed. Tool-call metering is unresolved, and acceptance does not verify `max_tool_calls` as a cap on billable searches (docs/VALIDATION.md, "TRB-020 acceptance"). Apart from that recorded live sample, everything below describes the code as implemented.
+
+TRB-030 (READY FOR REVIEW) replaced the administrator-only access rule with invitations, onboarding and suspension; see docs/IDENTITY.md. The sections below note where it changed this slice.
 
 ## Behaviour
 
-Administrator-only prototype. Commands are accepted only from a sender listed in `ADMIN_TELEGRAM_IDS`, in that sender's private chat with the bot (chat ID equal to sender ID, non-bot sender). Group, supergroup and channel updates are recorded as ignored and get no reply. Other private users get a generic "private bot" reply.
+Commands are accepted only in the sender's own private chat with the bot (chat ID equal to sender ID, non-bot sender). Group, supergroup and channel updates are recorded as ignored and get no reply.
+
+Since TRB-030 (docs/IDENTITY.md):
+- **Who may run research.** Active users with completed onboarding: configured administrators and invited members. Live research is administrator-only until TRB-050.
+- **Senders without an account** get the invitation-required reply.
+- **Time zone.** Runs use the user's confirmed time zone instead of `RESEARCH_TIME_ZONE`.
 
 | Command | Effect |
 |---|---|
 | `/research <prompt>` | Validates the prompt (non-empty, at most `RESEARCH_PROMPT_MAX_CHARS` code points) and queues a run. Replies with the run ID. The report is delivered later as separate messages. |
-| `/result <run-id>` | Resends the stored report of the sender's own run (a new `RESEND` delivery copying the stored parts). Never starts research. A foreign or missing run gets "not found". |
+| `/result <run-id>` | Resends the stored report of the sender's own run (a new `RESEND` delivery copying the stored parts). Never starts research. A foreign or missing run gets "not found". Since TRB-030 the lookup is scoped by the owner's user ID. |
 | `/start`, `/help` | Help text. |
 
-Ingress (`POST /telegram/webhook`, or development polling) verifies `X-Telegram-Bot-Api-Secret-Token` in constant time, then in one transaction: inserts `telegram_update(update_id)` (a replay hits the primary key and becomes a no-op), applies authorization, takes an advisory lock, checks the queue bound (`RESEARCH_QUEUE_LIMIT`, QUEUED + RUNNING), and inserts the run with its configuration snapshot plus the acknowledgment delivery. The HTTP 200 is returned only after commit; research and sending happen in background workers.
+Ingress (`POST /telegram/webhook`, or development polling) verifies `X-Telegram-Bot-Api-Secret-Token` in constant time. Then, in one transaction, it:
+1. inserts `telegram_update(update_id)`; a replay conflicts and becomes a no-op;
+2. since TRB-030, takes a per-sender lock and loads the sender's user record;
+3. applies authorization;
+4. takes an advisory lock and checks the queue bound (`RESEARCH_QUEUE_LIMIT`, QUEUED + RUNNING);
+5. inserts the run with its configuration snapshot and owner, plus the acknowledgment delivery.
+
+The HTTP 200 is returned only after commit; research and sending happen in background workers.
 
 The destination is always the authorized private chat of the request, stored on the run. Neither the prompt nor model output can change it.
 
@@ -39,7 +53,7 @@ The destination is always the authorized private chat of the request, stored on 
 7. On `completed`: extracts text and `url_citation` annotations, then classifies the outcome deterministically. The model must start with `OUTCOME: FOUND|PARTIAL|NO_MATCHES|INCONCLUSIVE`. That declaration is accepted only when a web search call is present and at least one valid citation exists. Otherwise the outcome is INCONCLUSIVE with a visible warning. Incomplete, failed and cancelled responses are FAILED and never delivered as reports.
 8. In one fenced transaction: stores the report, citations, consulted sources, usage, tool-call count and model, sets SUCCEEDED, and creates the REPORT delivery with its rendered parts.
 
-Run states: QUEUED → RUNNING → SUCCEEDED | FAILED | UNCERTAIN. The content outcome (FOUND, PARTIAL, NO_MATCHES, INCONCLUSIVE) is separate, and so is the delivery state.
+Run states: QUEUED → RUNNING → SUCCEEDED | FAILED | UNCERTAIN | CANCELLED. CANCELLED was added by TRB-030: suspension, an owner who is unresolved or lost access, or live research by a non-administrator. Before submission no provider request exists; after a confirmed provider cancellation the evidence is kept. The content outcome (FOUND, PARTIAL, NO_MATCHES, INCONCLUSIVE) is separate, and so is the delivery state.
 
 ## Recovery policy (prototype)
 
@@ -66,7 +80,7 @@ An UNCERTAIN live run (`provider_kind = 'openai'`) may correspond to a provider 
 - **Queued live runs stay QUEUED.** They are not lost or failed, but no worker claims them. The authoritative check is part of the single claim statement, together with the single-RUNNING check. A run is RUNNING until the commit that makes it UNCERTAIN, so no interleaving of workers and admission lets a live run start. A pre-submission re-check returns a run to the queue as defence in depth.
 - **Fake (simulated) uncertainty never blocks.** Its notice is labelled СИМУЛЯЦІЯ and states that no real request or cost occurred.
 
-UNCERTAIN codes: `SUBMISSION_INTERRUPTED`, an unknown submit outcome (`OPENAI_CONNECTION`, `OPENAI_HTTP_5xx`, …), `RESPONSE_NOT_RETRIEVABLE`, `DEADLINE_CANCEL_UNCONFIRMED`, `BOUNDS_NOT_CONFIRMED:…;CANCEL_UNCONFIRMED`, `PROVIDER_CHANGED_AFTER_SUBMISSION`.
+UNCERTAIN codes: `SUBMISSION_INTERRUPTED`, an unknown submit outcome (`OPENAI_CONNECTION`, `OPENAI_HTTP_5xx`, …), `RESPONSE_NOT_RETRIEVABLE`, `DEADLINE_CANCEL_UNCONFIRMED`, `BOUNDS_NOT_CONFIRMED:…;CANCEL_UNCONFIRMED`, `PROVIDER_CHANGED_AFTER_SUBMISSION`, `SUSPENDED_CANCEL_UNCONFIRMED` (TRB-030: the owner was suspended while the request ran, and cancellation was not confirmed).
 
 Reconciliation procedure (operator only; never contacts OpenAI or Telegram, never resubmits):
 1. List unresolved runs: `npm run ops:reconcile -- --list`. In Docker: `node dist/ops/reconcile-run.js --list`. The command uses `DATABASE_URL`.
@@ -141,14 +155,14 @@ Entering a budget amount without turning on "Enforce a hard limit" leaves only n
 
 | To | Items |
 |---|---|
-| TRB-030 | Invitations, user records, onboarding, per-user serialization, sanitized inbox payload retention |
+| TRB-030 | Implemented (READY FOR REVIEW, docs/IDENTITY.md): invitations, user records, onboarding, per-user serialization. The inbox still stores no payload. |
 | TRB-050 | Budget reservations, pricing snapshots, usage ledger, quotas, retries with fresh reservation |
 | TRB-060 | pg-boss with outbox, attempts table, configurable retry policy, fair dispatch, process roles |
 | TRB-080 | Full-text document fallback, history, blocked-destination handling that pauses automatic work |
 | TRB-090 | Retention cleanup: prompts and reports are currently stored without automatic purge |
 | TRB-100 | Webhook registration runbook, migration release step (the runtime image has no Prisma CLI), deployment |
 
-## Authorized live sample procedure (PENDING)
+## Authorized live sample procedure (performed 2026-10-19)
 
 Requires explicit owner authorization: it makes a billed OpenAI request and sends real Telegram messages.
 
@@ -180,7 +194,7 @@ Steps (local, polling, no public URL needed):
    RESEARCH_QUEUE_LIMIT=1
    ```
 3. Run `npm start`. Confirm the startup warning `LIVE research enabled` and the logged model and bounds.
-4. In a private chat with the bot, send `/help`, then one prompt:
+4. In a private chat with the bot, send `/start` and confirm the time zone (required since TRB-030), then send one prompt:
    `/research Які офіційні матчі чоловічої основної команди FC Barcelona заплановані на наступний календарний тиждень (понеділок–неділя, Europe/Kyiv)? Для кожного: суперник, турнір, дата і час початку за Києвом. Посилайся на офіційні джерела; якщо час не визначено, так і напиши.`
 5. Inspect the Telegram messages:
    - acknowledgment with the run ID;
@@ -209,4 +223,4 @@ Steps (local, polling, no public URL needed):
    - remove the key and token from `.env`, rotating them if they were exposed;
    - if any run ended UNCERTAIN, reconcile it (procedure above) before the next live session; lower or keep the project hard limit as appropriate.
 
-For a webhook environment, registration is `setWebhook` with `url=$PUBLIC_BASE_URL/telegram/webhook`, `secret_token=$TELEGRAM_WEBHOOK_SECRET` and `allowed_updates=["message"]`. This runbook item belongs to TRB-100.
+For a webhook environment, registration is `setWebhook` with `url=$PUBLIC_BASE_URL/telegram/webhook`, `secret_token=$TELEGRAM_WEBHOOK_SECRET` and `allowed_updates=["message","callback_query"]`; the callback updates are needed for the onboarding buttons since TRB-030. This runbook item belongs to TRB-100.

@@ -8,7 +8,11 @@ import {
   type ResearchProvider,
   type ResearchRequest,
 } from '../../src/research/provider/provider.types';
-import { TelegramSendError, type TelegramSender } from '../../src/telegram/telegram-sender';
+import {
+  TelegramSendError,
+  type InlineKeyboard,
+  type TelegramSender,
+} from '../../src/telegram/telegram-sender';
 
 export class FakeClock implements Clock {
   constructor(private current = new Date('2026-10-18T12:00:00Z')) {}
@@ -130,8 +134,9 @@ export const unknownOutcome = (code = 'OPENAI_CONNECTION') => new ProviderError(
 
 /** Records sent messages; `failNext` scripts failures for upcoming sends. */
 export class RecordingSender implements TelegramSender {
-  readonly sent: { chatId: bigint; html: string }[] = [];
+  readonly sent: { chatId: bigint; html: string; replyMarkup?: InlineKeyboard }[] = [];
   readonly attempts: { chatId: bigint; html: string }[] = [];
+  readonly callbackAnswers: { id: string; text: string | undefined }[] = [];
   private readonly failures: TelegramSendError[] = [];
   beforeSend: (html: string) => Promise<void> = () => Promise.resolve();
   private nextMessageId = 100;
@@ -140,14 +145,23 @@ export class RecordingSender implements TelegramSender {
     this.failures.push(...errors);
   }
 
-  async sendHtml(chatId: bigint, html: string): Promise<{ messageId: number }> {
+  async sendHtml(
+    chatId: bigint,
+    html: string,
+    replyMarkup?: InlineKeyboard,
+  ): Promise<{ messageId: number }> {
     this.attempts.push({ chatId, html });
     await this.beforeSend(html);
     const failure = this.failures.shift();
     if (failure) throw failure;
-    this.sent.push({ chatId, html });
+    this.sent.push({ chatId, html, ...(replyMarkup ? { replyMarkup } : {}) });
     this.nextMessageId += 1;
     return { messageId: this.nextMessageId };
+  }
+
+  answerCallback(id: string, text?: string): Promise<void> {
+    this.callbackAnswers.push({ id, text });
+    return Promise.resolve();
   }
 }
 

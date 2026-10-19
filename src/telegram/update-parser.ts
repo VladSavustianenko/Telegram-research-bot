@@ -1,6 +1,6 @@
 import type { Update } from 'grammy/types';
 
-/** Minimal, validated view of an incoming update. Message text is never logged. */
+/** Minimal, validated view of an incoming update. Message text and callback data are never logged. */
 export type ParsedUpdate =
   | { kind: 'invalid' }
   | {
@@ -18,6 +18,17 @@ export type ParsedUpdate =
       chatType: string;
       isBot: boolean;
       text: string;
+    }
+  | {
+      kind: 'callback';
+      updateId: bigint;
+      callbackId: string;
+      senderId: bigint;
+      /** Chat of the message carrying the button. */
+      chatId: bigint;
+      chatType: string;
+      isBot: boolean;
+      data: string | null;
     };
 
 export interface ParsedCommand {
@@ -34,6 +45,7 @@ export function parseUpdate(raw: unknown): ParsedUpdate {
     return { kind: 'invalid' };
   }
   const updateId = BigInt(update.update_id as number);
+  if (update.callback_query) return parseCallback(updateId, update.callback_query);
   const message = update.message;
   if (!message) {
     return {
@@ -44,9 +56,10 @@ export function parseUpdate(raw: unknown): ParsedUpdate {
       chatType: null,
     };
   }
-  const senderId = typeof message.from?.id === 'number' ? BigInt(message.from.id) : null;
+  const senderId = telegramId(message.from?.id);
   const chatType = typeof message.chat?.type === 'string' ? message.chat.type : null;
-  if (senderId === null || chatType === null || typeof message.chat.id !== 'number') {
+  const chatId = telegramId(message.chat?.id);
+  if (senderId === null || chatType === null || chatId === null) {
     return { kind: 'ignored', updateId, reason: 'NO_SENDER', senderId, chatType };
   }
   if (typeof message.text !== 'string') {
@@ -56,11 +69,46 @@ export function parseUpdate(raw: unknown): ParsedUpdate {
     kind: 'message',
     updateId,
     senderId,
-    chatId: BigInt(message.chat.id),
+    chatId,
     chatType,
     isBot: message.from?.is_bot === true,
     text: message.text,
   };
+}
+
+function parseCallback(
+  updateId: bigint,
+  query: NonNullable<Update['callback_query']>,
+): ParsedUpdate {
+  const senderId = telegramId(query.from?.id);
+  const chat = query.message?.chat;
+  const chatType = typeof chat?.type === 'string' ? chat.type : null;
+  if (senderId === null || typeof query.id !== 'string') {
+    return { kind: 'ignored', updateId, reason: 'NO_SENDER', senderId, chatType };
+  }
+  // Inline-mode callbacks have no message; they never come from this bot's own buttons.
+  const chatId = telegramId(chat?.id);
+  if (chatType === null || chatId === null) {
+    return { kind: 'ignored', updateId, reason: 'CALLBACK_WITHOUT_CHAT', senderId, chatType };
+  }
+  return {
+    kind: 'callback',
+    updateId,
+    callbackId: query.id,
+    senderId,
+    chatId,
+    chatType,
+    isBot: query.from.is_bot === true,
+    data: typeof query.data === 'string' ? query.data : null,
+  };
+}
+
+/**
+ * Telegram IDs fit in 52 bits; JSON numbers beyond the safe integer range
+ * cannot be converted exactly and are rejected rather than rounded.
+ */
+function telegramId(value: unknown): bigint | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) ? BigInt(value) : null;
 }
 
 /** Parses "/name@bot args". Returns null for non-command text. */

@@ -49,6 +49,8 @@ enum ResearchRunState {
   SUCCEEDED
   FAILED
   UNCERTAIN
+  /// Stopped by the application (suspension, eligibility); before submission no provider request exists.
+  CANCELLED
 }
 
 /// Whether a (potentially billed) provider request may exist for this run.
@@ -68,6 +70,11 @@ enum ResearchOutcome {
 model ResearchRun {
   id                        String           @id @default(uuid()) @db.Uuid
   requestedByTelegramUserId BigInt           @map("requested_by_telegram_user_id")
+  /// Owner. Null only for TRB-020 runs whose Telegram identity has no user record
+  /// yet; such runs are inaccessible and never submitted (fail closed). A trigger
+  /// keeps it consistent with requested_by_telegram_user_id.
+  userId                    String?          @map("user_id") @db.Uuid
+  user                      AppUser?         @relation(fields: [userId], references: [id], onDelete: Restrict)
   /// Destination derived from the authorized private chat of the request.
   chatId                    BigInt           @map("chat_id")
   sourceUpdateId            BigInt           @unique @map("source_update_id")
@@ -118,6 +125,7 @@ model ResearchRun {
   deliveries Delivery[]
 
   @@index([state, createdAt])
+  @@index([userId, createdAt])
   @@map("research_run")
 }
 
@@ -125,6 +133,8 @@ enum DeliveryKind {
   STATUS
   REPORT
   RESEND
+  /// Carries an invitation link; the token is derived at send time, never stored.
+  INVITATION
 }
 
 enum DeliveryState {
@@ -134,6 +144,8 @@ enum DeliveryState {
   RETRYABLE_FAILURE
   UNKNOWN
   PERMANENT_FAILURE
+  /// Not sent because the run's owner is suspended (terminal).
+  SUPPRESSED
 }
 
 enum DeliveryPartState {
@@ -157,6 +169,9 @@ model Delivery {
   leaseUntil    DateTime?      @map("lease_until") @db.Timestamptz(3)
   fencingToken  Int            @default(0) @map("fencing_token")
   lastErrorCode String?        @map("last_error_code")
+  /// Set only for kind INVITATION.
+  invitationId  String?        @map("invitation_id") @db.Uuid
+  invitation    Invitation?    @relation(fields: [invitationId], references: [id], onDelete: Restrict)
   createdAt     DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt     DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
   parts         DeliveryPart[]
@@ -171,6 +186,8 @@ model DeliveryPart {
   delivery          Delivery          @relation(fields: [deliveryId], references: [id])
   ordinal           Int
   html              String
+  /// Telegram inline keyboard (callback buttons only), or null.
+  replyMarkup       Json?             @map("reply_markup")
   contentHash       String            @map("content_hash")
   state             DeliveryPartState @default(PENDING)
   telegramMessageId BigInt?           @map("telegram_message_id")
@@ -227,4 +244,100 @@ model ResearchToolItem {
   @@id([responseId, itemKey])
   @@index([runId])
   @@map("research_tool_item")
+}
+
+// ---------------------------------------------------------------------------
+// TRB-030: identity, invitations, onboarding, suspension and audit. Triggers
+// and checks Prisma cannot express are added in the SQL migration.
+
+enum UserRole {
+  ADMIN
+  MEMBER
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+enum OnboardingState {
+  AWAITING_TIME_ZONE
+  COMPLETED
+}
+
+/// A Telegram user known to the bot. Identity is the immutable Telegram user ID
+/// (a trigger rejects changes); usernames and display names are not stored.
+model AppUser {
+  id                 String          @id @default(uuid()) @db.Uuid
+  telegramUserId     BigInt          @unique @map("telegram_user_id")
+  /// Private chat with the bot, recorded from the user's own private messages.
+  privateChatId      BigInt?         @map("private_chat_id")
+  /// Mirror of ADMIN_TELEGRAM_IDS, which is authoritative (synchronized at startup
+  /// and on each update from the user). Invitations never grant ADMIN.
+  role               UserRole        @default(MEMBER)
+  status             UserStatus      @default(ACTIVE)
+  onboardingState    OnboardingState @default(AWAITING_TIME_ZONE) @map("onboarding_state")
+  /// Confirmed IANA time zone; required once onboarding is COMPLETED.
+  timeZone           String?         @map("time_zone")
+  /// Incremented on every onboarding or lifecycle change; callbacks carry it, so stale buttons do nothing.
+  revision           Int             @default(0)
+  /// Set when the user redeemed an invitation. Members need it; administrators do not.
+  invitedAt          DateTime?       @map("invited_at") @db.Timestamptz(3)
+  onboardedAt        DateTime?       @map("onboarded_at") @db.Timestamptz(3)
+  suspendedAt        DateTime?       @map("suspended_at") @db.Timestamptz(3)
+  createdAt          DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
+  runs               ResearchRun[]
+  invitationsCreated Invitation[]    @relation("InvitationCreator")
+  invitationRedeemed Invitation?     @relation("InvitationRedeemer")
+  auditAsActor       AuditEvent[]    @relation("AuditActor")
+  auditAsSubject     AuditEvent[]    @relation("AuditSubject")
+
+  @@map("app_user")
+}
+
+/// Single-use invitation. Only the SHA-256 hash of the token is stored; the token
+/// itself is derived at send time (docs/IDENTITY.md).
+model Invitation {
+  id               String       @id @db.Uuid
+  tokenHash        String       @unique @map("token_hash")
+  createdByUserId  String       @map("created_by_user_id") @db.Uuid
+  createdBy        AppUser      @relation("InvitationCreator", fields: [createdByUserId], references: [id])
+  expiresAt        DateTime     @map("expires_at") @db.Timestamptz(3)
+  redeemedByUserId String?      @unique @map("redeemed_by_user_id") @db.Uuid
+  redeemedBy       AppUser?     @relation("InvitationRedeemer", fields: [redeemedByUserId], references: [id], onDelete: Restrict)
+  redeemedAt       DateTime?    @map("redeemed_at") @db.Timestamptz(3)
+  createdAt        DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  deliveries       Delivery[]
+  auditEvents      AuditEvent[]
+
+  @@map("invitation")
+}
+
+enum AuditEventKind {
+  ADMIN_GRANTED
+  ADMIN_REVOKED
+  INVITATION_CREATED
+  INVITATION_REDEEMED
+  USER_SUSPENDED
+  USER_REACTIVATED
+}
+
+/// Append-only access audit (UPDATE and DELETE are rejected by a trigger).
+/// Holds identifiers, codes and counts only: no tokens, prompts or report content.
+model AuditEvent {
+  id            String         @id @default(uuid()) @db.Uuid
+  kind          AuditEventKind
+  /// Null for configuration-driven changes (administrator bootstrap).
+  actorUserId   String?        @map("actor_user_id") @db.Uuid
+  actor         AppUser?       @relation("AuditActor", fields: [actorUserId], references: [id], onDelete: Restrict)
+  subjectUserId String?        @map("subject_user_id") @db.Uuid
+  subject       AppUser?       @relation("AuditSubject", fields: [subjectUserId], references: [id], onDelete: Restrict)
+  invitationId  String?        @map("invitation_id") @db.Uuid
+  invitation    Invitation?    @relation(fields: [invitationId], references: [id], onDelete: Restrict)
+  details       Json
+  createdAt     DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([subjectUserId, createdAt])
+  @@map("audit_event")
 }

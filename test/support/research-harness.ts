@@ -17,6 +17,8 @@ export const ADMIN_ID = 1001;
 export const OTHER_ADMIN_ID = 1002;
 export const BOT_TOKEN = '123456:TEST-TOKEN-not-real';
 export const WEBHOOK_SECRET = 'test_webhook_secret';
+export const INVITATION_SECRET = 'test-invitation-secret-0123456789abcdef';
+export const BOT_USERNAME = 'trb_test_bot';
 
 /** Records every log call so tests can assert what is (not) logged. */
 export class CaptureLogger implements LoggerService {
@@ -64,16 +66,23 @@ export interface Harness {
 /** App wired to the disposable database, fakes and manual worker ticks (no background loops). */
 export async function startHarness(
   env: Record<string, string> = {},
-  deps: { provider?: ScriptedProvider; sender?: RecordingSender; clock?: FakeClock } = {},
+  deps: {
+    provider?: ScriptedProvider;
+    sender?: RecordingSender;
+    clock?: FakeClock;
+    databaseUrl?: string;
+  } = {},
 ): Promise<Harness> {
   const config = parseEnv({
     NODE_ENV: 'test',
-    DATABASE_URL: inject('databaseUrl'),
+    DATABASE_URL: deps.databaseUrl ?? inject('databaseUrl'),
     BACKGROUND_WORKERS: 'off',
     TELEGRAM_MODE: 'webhook',
     TELEGRAM_BOT_TOKEN: BOT_TOKEN,
     TELEGRAM_WEBHOOK_SECRET: WEBHOOK_SECRET,
     ADMIN_TELEGRAM_IDS: `${ADMIN_ID},${OTHER_ADMIN_ID}`,
+    INVITATION_TOKEN_SECRET: INVITATION_SECRET,
+    TELEGRAM_BOT_USERNAME: BOT_USERNAME,
     RESEARCH_MODE: 'fake',
     OPENAI_POLL_INTERVAL_MS: '5',
     ...env,
@@ -114,10 +123,25 @@ export async function startHarness(
   };
 }
 
-export async function resetDatabase(prisma: PrismaService): Promise<void> {
+/**
+ * Empties all application tables. By default the two configured administrators
+ * are then recreated with completed onboarding (Europe/Kyiv), as after their
+ * first /start; pass `{ onboardedAdmins: false }` for an empty user table.
+ */
+export async function resetDatabase(
+  prisma: PrismaService,
+  options: { onboardedAdmins?: boolean } = {},
+): Promise<void> {
   await prisma.$executeRawUnsafe(
-    'TRUNCATE research_tool_item, research_reconciliation, delivery_part, delivery, research_run, telegram_update RESTART IDENTITY CASCADE',
+    'TRUNCATE audit_event, invitation, research_tool_item, research_reconciliation, delivery_part, delivery, research_run, telegram_update, app_user RESTART IDENTITY CASCADE',
   );
+  if (options.onboardedAdmins === false) return;
+  for (const id of [ADMIN_ID, OTHER_ADMIN_ID]) {
+    await prisma.$executeRaw`
+      INSERT INTO app_user (id, telegram_user_id, private_chat_id, role, onboarding_state, time_zone,
+                            onboarded_at, updated_at)
+      VALUES (gen_random_uuid(), ${id}, ${id}, 'ADMIN', 'COMPLETED', 'Europe/Kyiv', now(), now())`;
+  }
 }
 
 let nextUpdateId = 1;
@@ -144,6 +168,30 @@ export function groupMessage(text: string, from = ADMIN_ID, updateId = nextUpdat
       from: { id: from, is_bot: false, first_name: 'Test' },
       chat: { id: -100123, type: 'supergroup', title: 'Group' },
       text,
+    },
+  };
+}
+
+/** A press of an inline button attached to a message in the sender's private chat. */
+export function callbackQuery(
+  data: string,
+  from = ADMIN_ID,
+  updateId = nextUpdateId++,
+  chat: { id: number; type: string } = { id: from, type: 'private' },
+) {
+  return {
+    update_id: updateId,
+    callback_query: {
+      id: `cbq-${updateId}`,
+      from: { id: from, is_bot: false, first_name: 'Test' },
+      chat_instance: 'ci',
+      data,
+      message: {
+        message_id: 1,
+        date: 1_792_324_800,
+        chat: { ...chat, first_name: 'Test' },
+        text: 'buttons',
+      },
     },
   };
 }

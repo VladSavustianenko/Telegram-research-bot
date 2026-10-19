@@ -114,6 +114,20 @@ export const envSchema = z
     ),
     PUBLIC_BASE_URL: optional(z.url({ protocol: /^https?$/, error: 'must be an http(s) URL' })),
     ADMIN_TELEGRAM_IDS: optional(telegramIdList),
+    // Optional bot username (without "@") for t.me invitation links; without it the
+    // invitation shows a "/start <token>" command instead.
+    TELEGRAM_BOT_USERNAME: optional(
+      z.string().regex(/^[A-Za-z0-9_]{5,32}$/, 'must be a Telegram bot username without "@"'),
+    ),
+
+    // Invitations (TRB-030). The secret derives invitation tokens at send time so that
+    // neither the database nor stored messages contain them. Without it, /admin invite
+    // is refused. Rotating it invalidates invitations whose message is not yet sent.
+    INVITATION_TOKEN_SECRET: optional(z.string().min(32, 'must be at least 32 characters')),
+    INVITATION_TTL_HOURS: positiveIntWithDefault(168).refine(
+      (hours) => hours <= 720,
+      'must be at most 720 (30 days)',
+    ),
 
     // Research. disabled (default): /research is refused. fake: simulated results,
     // clearly labelled, no OpenAI call. live: paid OpenAI research; operator opt-in.

@@ -17,8 +17,19 @@ export class TelegramSendError extends Error {
   }
 }
 
+/** Inline keyboard with callback buttons only (no URL or login buttons). */
+export interface InlineKeyboard {
+  inline_keyboard: { text: string; callback_data: string }[][];
+}
+
 export interface TelegramSender {
-  sendHtml(chatId: bigint, html: string): Promise<{ messageId: number }>;
+  sendHtml(
+    chatId: bigint,
+    html: string,
+    replyMarkup?: InlineKeyboard,
+  ): Promise<{ messageId: number }>;
+  /** Best-effort acknowledgement of a button press; not a business action. */
+  answerCallback(callbackQueryId: string, text?: string): Promise<void>;
 }
 
 export const TELEGRAM_SENDER = Symbol('TELEGRAM_SENDER');
@@ -31,13 +42,26 @@ export class GrammyTelegramSender implements TelegramSender {
     this.api = new Api(token, { timeoutSeconds });
   }
 
-  async sendHtml(chatId: bigint, html: string): Promise<{ messageId: number }> {
+  async sendHtml(
+    chatId: bigint,
+    html: string,
+    replyMarkup?: InlineKeyboard,
+  ): Promise<{ messageId: number }> {
     try {
       const message = await this.api.sendMessage(chatId.toString(), html, {
         parse_mode: 'HTML',
         link_preview_options: { is_disabled: true },
+        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
       });
       return { messageId: message.message_id };
+    } catch (error) {
+      throw classifyTelegramError(error);
+    }
+  }
+
+  async answerCallback(callbackQueryId: string, text?: string): Promise<void> {
+    try {
+      await this.api.answerCallbackQuery(callbackQueryId, text ? { text } : {});
     } catch (error) {
       throw classifyTelegramError(error);
     }

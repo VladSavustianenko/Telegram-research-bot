@@ -51,7 +51,7 @@ export class TelegramPollingService implements OnApplicationBootstrap, OnModuleD
     while (!signal.aborted) {
       try {
         const updates = await api.getUpdates(
-          { offset, timeout: LONG_POLL_SECONDS, allowed_updates: ['message'] },
+          { offset, timeout: LONG_POLL_SECONDS, allowed_updates: ['message', 'callback_query'] },
           // grammY types its signal with the abort-controller polyfill; Node's is compatible.
           signal as unknown as Parameters<Api['getUpdates']>[1],
         );

@@ -1,83 +1,67 @@
-import { randomUUID } from 'node:crypto';
-import { Inject, Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
+import { errorInfo } from '../common/error-info';
 import { APP_CONFIG } from '../config/config.module';
 import type { Env } from '../config/env.schema';
 import { isUniqueViolation, type Tx } from '../database/prisma-errors';
 import { PrismaService } from '../database/prisma.service';
-import { createDelivery, createStatusDelivery } from '../delivery/delivery-records';
+import { createStatusDelivery } from '../delivery/delivery-records';
 import { messages } from '../delivery/messages';
+import { requestResultResend } from '../delivery/result-resend';
+import type { AppUser } from '../generated/prisma/client';
+import { runAdminCommand } from '../identity/admin-actions';
+import { accountAccess, isAdministrator, mayRedeemInvitation } from '../identity/authorization';
+import { redeemInvitation } from '../identity/invitations';
+import { confirmTimeZone, timeZoneKeyboard } from '../identity/onboarding';
+import { normalizeTimeZone } from '../identity/time-zone';
+import { lockTelegramIdentity, resolveSender } from '../identity/users';
+import { admitResearch } from '../research/admission';
 import { codePointLength } from '../research/report';
-import { snapshotRunConfig } from '../research/request-builder';
-import { hasUnresolvedLiveUncertainty } from '../research/uncertainty';
+import { parseCallbackData } from './callback-data';
+import { TELEGRAM_SENDER, type InlineKeyboard, type TelegramSender } from './telegram-sender';
 import { parseCommand, parseUpdate, type ParsedUpdate } from './update-parser';
 
 type Disposition = 'RUN_ACCEPTED' | 'RESULT_REQUESTED' | 'REPLIED' | 'REJECTED' | 'IGNORED';
 
-/** What to do with an update, decided without database access. */
-export type Decision =
-  | { action: 'ignore'; reason: string }
-  | { action: 'reply'; disposition: 'REPLIED' | 'REJECTED'; reason: string; text: string }
-  | { action: 'research'; prompt: string }
-  | { action: 'result'; runId: string };
+interface Outcome {
+  disposition: Disposition;
+  reason: string | null;
+  runId?: string;
+  /** Text for the best-effort callback acknowledgement (button presses only). */
+  callbackAnswer?: string;
+}
+
+/** A private, non-bot update whose chat is the sender's own chat. */
+type PrivateUpdate = Extract<ParsedUpdate, { kind: 'message' | 'callback' }>;
+
+interface Context {
+  tx: Tx;
+  update: PrivateUpdate;
+  user: AppUser | null;
+}
 
 export type IngressResult = 'processed' | 'duplicate' | 'invalid';
 
-/** Postgres advisory lock key serialising research admission (queue bound). */
-const ADMISSION_LOCK_KEY = 20_020;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
- * Authorization and command routing. Identity comes only from the update's
- * sender; the destination is the authorized private chat itself.
+ * Chat-level filter, decided without database access. Only a non-bot sender
+ * in their own private chat (chat ID equal to sender ID) is processed; group,
+ * supergroup and channel updates are recorded as ignored and get no reply.
  */
-export function decide(update: Exclude<ParsedUpdate, { kind: 'invalid' }>, config: Env): Decision {
-  if (update.kind === 'ignored') return { action: 'ignore', reason: update.reason };
-  if (update.chatType !== 'private') return { action: 'ignore', reason: 'NOT_PRIVATE_CHAT' };
-  // In a private chat the chat ID equals the user ID; anything else is not a 1:1 chat.
-  if (update.chatId !== update.senderId)
-    return { action: 'ignore', reason: 'CHAT_SENDER_MISMATCH' };
-  if (update.isBot) return { action: 'ignore', reason: 'BOT_SENDER' };
-
-  const admins = config.ADMIN_TELEGRAM_IDS ?? [];
-  if (!admins.includes(update.senderId.toString())) {
-    return {
-      action: 'reply',
-      disposition: 'REJECTED',
-      reason: 'NOT_ADMIN',
-      text: messages.notAuthorized,
-    };
-  }
-
-  const command = parseCommand(update.text);
-  const reply = (reason: string, text: string): Decision => ({
-    action: 'reply',
-    disposition: 'REPLIED',
-    reason,
-    text,
-  });
-  switch (command?.name) {
-    case 'start':
-    case 'help':
-      return reply('HELP', messages.help);
-    case 'research': {
-      if (config.RESEARCH_MODE === 'disabled')
-        return reply('RESEARCH_DISABLED', messages.researchDisabled);
-      if (!command.args) return reply('EMPTY_PROMPT', messages.emptyPrompt);
-      if (codePointLength(command.args) > config.RESEARCH_PROMPT_MAX_CHARS) {
-        return reply('PROMPT_TOO_LONG', messages.promptTooLong(config.RESEARCH_PROMPT_MAX_CHARS));
-      }
-      return { action: 'research', prompt: command.args };
-    }
-    case 'result':
-      if (!UUID.test(command.args)) return reply('RESULT_USAGE', messages.resultUsage);
-      return { action: 'result', runId: command.args.toLowerCase() };
-    case undefined:
-      return reply('NOT_A_COMMAND', messages.help);
-    default:
-      return reply('UNKNOWN_COMMAND', messages.unknownCommand);
-  }
+export function chatRejection(update: Exclude<ParsedUpdate, { kind: 'invalid' }>): string | null {
+  if (update.kind === 'ignored') return update.reason;
+  if (update.chatType !== 'private') return 'NOT_PRIVATE_CHAT';
+  if (update.chatId !== update.senderId) return 'CHAT_SENDER_MISMATCH';
+  if (update.isBot) return 'BOT_SENDER';
+  return null;
 }
 
+/**
+ * Telegram inbox: deduplication, identity and command routing. Identity comes
+ * only from the update's sender; the destination is the sender's own private
+ * chat. Business actions are delegated to application services, which check
+ * authorization themselves.
+ */
 @Injectable()
 export class TelegramIngressService {
   private readonly logger = new Logger(TelegramIngressService.name);
@@ -85,6 +69,7 @@ export class TelegramIngressService {
   constructor(
     private readonly prisma: PrismaService,
     @Inject(APP_CONFIG) private readonly config: Env,
+    @Optional() @Inject(TELEGRAM_SENDER) private readonly sender: TelegramSender | null = null,
   ) {}
 
   /**
@@ -95,149 +80,303 @@ export class TelegramIngressService {
   async handle(raw: unknown): Promise<IngressResult> {
     const update = parseUpdate(raw);
     if (update.kind === 'invalid') return 'invalid';
-    const decision = decide(update, this.config);
 
+    let outcome: Outcome | null;
     try {
-      const outcome = await this.prisma.$transaction((tx) => this.apply(tx, update, decision));
-      this.logger.log({
-        message: 'Telegram update processed',
-        updateId: update.updateId.toString(),
-        disposition: outcome.disposition,
-        reason: outcome.reason,
-        ...(outcome.runId ? { runId: outcome.runId } : {}),
-      });
-      return 'processed';
+      outcome = await this.prisma.$transaction((tx) => this.process(tx, update));
     } catch (error) {
-      if (isUniqueViolation(error)) {
-        this.logger.log({
-          message: 'Duplicate Telegram update ignored',
-          updateId: update.updateId.toString(),
-        });
-        return 'duplicate';
-      }
-      throw error;
+      if (!isUniqueViolation(error)) throw error;
+      outcome = null;
     }
+    if (!outcome) {
+      this.logger.log({
+        message: 'Duplicate Telegram update ignored',
+        updateId: update.updateId.toString(),
+      });
+      return 'duplicate';
+    }
+    this.logger.log({
+      message: 'Telegram update processed',
+      updateId: update.updateId.toString(),
+      disposition: outcome.disposition,
+      reason: outcome.reason,
+      ...(outcome.runId ? { runId: outcome.runId } : {}),
+    });
+    if (update.kind === 'callback') this.answerCallback(update.callbackId, outcome.callbackAnswer);
+    return 'processed';
   }
 
-  private async apply(
+  /** Returns null for an update_id that was already recorded (replay). */
+  private async process(
     tx: Tx,
     update: Exclude<ParsedUpdate, { kind: 'invalid' }>,
-    decision: Decision,
-  ): Promise<{ disposition: Disposition; reason: string | null; runId?: string }> {
-    const record = (disposition: Disposition, reason: string | null, runId?: string) =>
-      tx.telegramUpdate.create({
-        data: {
-          updateId: update.updateId,
-          senderTelegramId: update.senderId,
-          chatType: update.chatType,
-          disposition,
-          reason,
-          runId: runId ?? null,
-        },
-      });
+  ): Promise<Outcome | null> {
+    // Deduplication first: a concurrent replay waits here for the first
+    // transaction and then inserts nothing. No message text or payload is stored.
+    const inserted = await tx.$queryRaw<{ updateId: bigint }[]>`
+      INSERT INTO telegram_update (update_id, sender_telegram_id, chat_type, disposition, reason)
+      VALUES (${update.updateId}, ${update.senderId}, ${update.chatType}, 'IGNORED', 'PROCESSING')
+      ON CONFLICT (update_id) DO NOTHING
+      RETURNING update_id AS "updateId"`;
+    if (inserted.length === 0) return null;
 
-    if (decision.action === 'ignore' || update.kind !== 'message') {
-      const reason = decision.action === 'ignore' ? decision.reason : 'IGNORED';
-      await record('IGNORED', reason);
-      return { disposition: 'IGNORED', reason };
-    }
-    const chatId = update.chatId;
-
-    if (decision.action === 'reply') {
-      await record(decision.disposition, decision.reason);
-      await createStatusDelivery(tx, chatId, decision.text);
-      return { disposition: decision.disposition, reason: decision.reason };
-    }
-
-    if (decision.action === 'result') {
-      await record('RESULT_REQUESTED', null, decision.runId);
-      await this.queueResult(tx, decision.runId, update.senderId, chatId);
-      return { disposition: 'RESULT_REQUESTED', reason: null, runId: decision.runId };
-    }
-
-    // Research admission: serialised so the queue bound holds under concurrency.
-    await tx.$queryRaw`SELECT 1 AS locked FROM pg_advisory_xact_lock(${ADMISSION_LOCK_KEY})`;
-    const active = await tx.researchRun.count({ where: { state: { in: ['QUEUED', 'RUNNING'] } } });
-    if (active >= this.config.RESEARCH_QUEUE_LIMIT) {
-      await record('REJECTED', 'QUEUE_FULL');
-      await createStatusDelivery(tx, chatId, messages.queueFull(this.config.RESEARCH_QUEUE_LIMIT));
-      return { disposition: 'REJECTED', reason: 'QUEUE_FULL' };
-    }
-    const snapshot = snapshotRunConfig(this.config);
-    if (!snapshot) throw new Error('research admission without research configuration');
-    // Fail-closed: no new live work while a billed request may still be unresolved.
-    // Best-effort here; the worker's claim statement is the authoritative gate.
-    if (snapshot.providerKind === 'openai' && (await hasUnresolvedLiveUncertainty(tx))) {
-      await record('REJECTED', 'LIVE_BLOCKED_UNCERTAIN');
-      await createStatusDelivery(tx, chatId, messages.liveBlocked);
-      return { disposition: 'REJECTED', reason: 'LIVE_BLOCKED_UNCERTAIN' };
-    }
-
-    const runId = randomUUID();
-    await record('RUN_ACCEPTED', null, runId);
-    await tx.researchRun.create({
+    const outcome = await this.route(tx, update);
+    await tx.telegramUpdate.update({
+      where: { updateId: update.updateId },
       data: {
-        id: runId,
-        requestedByTelegramUserId: update.senderId,
-        chatId,
-        sourceUpdateId: update.updateId,
-        prompt: decision.prompt,
-        providerKind: snapshot.providerKind,
-        requestSnapshot: { config: { ...snapshot } },
+        disposition: outcome.disposition,
+        reason: outcome.reason,
+        runId: outcome.runId ?? null,
       },
     });
-    await createStatusDelivery(
-      tx,
-      chatId,
-      messages.accepted(runId, snapshot.providerKind === 'fake'),
-      runId,
-    );
-    return { disposition: 'RUN_ACCEPTED', reason: null, runId };
+    return outcome;
   }
 
-  /** Explicit resend of a stored result. Never starts research. Owner-scoped lookup. */
-  private async queueResult(
+  private async route(
     tx: Tx,
-    runId: string,
-    senderId: bigint,
-    chatId: bigint,
-  ): Promise<void> {
-    const run = await tx.researchRun.findFirst({
-      where: { id: runId, requestedByTelegramUserId: senderId },
-      select: { id: true, state: true, failureCode: true, providerKind: true, reconciledAt: true },
-    });
-    if (!run) {
-      await createStatusDelivery(tx, chatId, messages.runNotFound);
-      return;
+    update: Exclude<ParsedUpdate, { kind: 'invalid' }>,
+  ): Promise<Outcome> {
+    const rejection = chatRejection(update);
+    if (rejection || update.kind === 'ignored') {
+      return { disposition: 'IGNORED', reason: rejection ?? 'IGNORED' };
     }
-    if (run.state !== 'SUCCEEDED') {
-      const text =
-        run.state === 'QUEUED'
-          ? messages.runQueued(run.id)
-          : run.state === 'RUNNING'
-            ? messages.runRunning(run.id)
-            : run.state === 'UNCERTAIN'
-              ? run.reconciledAt
-                ? messages.runUncertainReconciled(run.id, run.failureCode ?? 'UNKNOWN')
-                : messages.runUncertain(
-                    run.id,
-                    run.failureCode ?? 'UNKNOWN',
-                    run.providerKind === 'fake',
-                  )
-              : messages.runFailed(run.id, run.failureCode ?? 'UNKNOWN');
-      await createStatusDelivery(tx, chatId, text, run.id);
-      return;
+    // One sender at a time; then load (and row-lock) the sender's record.
+    await lockTelegramIdentity(tx, update.senderId);
+    const user = await resolveSender(tx, this.config, update.senderId, update.chatId);
+    const context: Context = { tx, update, user };
+    return update.kind === 'callback'
+      ? this.onCallback(context, update.data)
+      : this.onMessage(context, update.text);
+  }
+
+  private async onMessage(context: Context, text: string): Promise<Outcome> {
+    const { tx, update, user } = context;
+    const command = parseCommand(text);
+    const access = accountAccess(user, this.config);
+
+    if (access === 'SUSPENDED')
+      return this.reply(context, 'REJECTED', 'SUSPENDED', messages.suspended);
+    if (access === 'NONE' || !user) {
+      if (command?.name === 'start' && command.args && mayRedeemInvitation(user, this.config)) {
+        return this.redeem(context, command.args);
+      }
+      return this.reply(context, 'REJECTED', 'NOT_REGISTERED', messages.invitationRequired);
     }
-    const report = await tx.delivery.findFirst({
-      where: { runId: run.id, kind: 'REPORT' },
-      select: { parts: { orderBy: { ordinal: 'asc' }, select: { html: true } } },
+
+    if (command?.name === 'admin') {
+      return runAdminCommand(tx, this.config, {
+        actor: user,
+        chatId: update.chatId,
+        args: command.args,
+      });
+    }
+
+    if (access === 'ONBOARDING') {
+      if (!command) return this.onTimeZoneText(context, user, text);
+      const reason =
+        command.name === 'start'
+          ? command.args
+            ? 'INVITATION_NOT_NEEDED'
+            : 'ONBOARDING_PROMPT'
+          : 'ONBOARDING_INCOMPLETE';
+      const lead = command.name === 'start' ? null : messages.onboardingRequired;
+      return this.promptTimeZone(context, user, reason, lead);
+    }
+
+    const help = this.helpFor(user);
+    switch (command?.name) {
+      case 'start':
+        // Already registered: an invitation in the payload is not consumed.
+        return command.args
+          ? this.reply(
+              context,
+              'REPLIED',
+              'INVITATION_NOT_NEEDED',
+              `${messages.alreadyRegistered}\n\n${help}`,
+            )
+          : this.reply(context, 'REPLIED', 'HELP', help);
+      case 'help':
+        return this.reply(context, 'REPLIED', 'HELP', help);
+      case 'research': {
+        if (this.config.RESEARCH_MODE === 'disabled') {
+          return this.reply(context, 'REPLIED', 'RESEARCH_DISABLED', messages.researchDisabled);
+        }
+        if (!command.args)
+          return this.reply(context, 'REPLIED', 'EMPTY_PROMPT', messages.emptyPrompt);
+        if (codePointLength(command.args) > this.config.RESEARCH_PROMPT_MAX_CHARS) {
+          return this.reply(
+            context,
+            'REPLIED',
+            'PROMPT_TOO_LONG',
+            messages.promptTooLong(this.config.RESEARCH_PROMPT_MAX_CHARS),
+          );
+        }
+        return admitResearch(tx, this.config, {
+          user,
+          chatId: update.chatId,
+          updateId: update.updateId,
+          prompt: command.args,
+        });
+      }
+      case 'result':
+        if (!UUID.test(command.args)) {
+          return this.reply(context, 'REPLIED', 'RESULT_USAGE', messages.resultUsage);
+        }
+        return requestResultResend(tx, this.config, {
+          user,
+          runId: command.args.toLowerCase(),
+          chatId: update.chatId,
+        });
+      case undefined:
+        return this.reply(context, 'REPLIED', 'NOT_A_COMMAND', help);
+      default:
+        return this.reply(context, 'REPLIED', 'UNKNOWN_COMMAND', messages.unknownCommand);
+    }
+  }
+
+  /** Invitation redemption by a sender without an account (checked by the caller). */
+  private async redeem(context: Context, payload: string): Promise<Outcome> {
+    const { tx, update } = context;
+    const redemption = await redeemInvitation(tx, {
+      payload,
+      telegramUserId: update.senderId,
+      privateChatId: update.chatId,
+      existing: context.user,
     });
-    if (!report) throw new Error('succeeded run without report delivery');
-    await createDelivery(tx, {
-      kind: 'RESEND',
-      chatId,
-      runId: run.id,
-      parts: report.parts.map((part) => part.html),
+    if (!redemption.ok) {
+      return this.reply(context, 'REJECTED', 'INVITATION_INVALID', messages.invitationInvalid);
+    }
+    const { user, createdBy } = redemption;
+    await createStatusDelivery(
+      tx,
+      createdBy.privateChatId ?? createdBy.telegramUserId,
+      messages.invitationRedeemedNotice(user.telegramUserId.toString()),
+    );
+    if (user.onboardingState === 'COMPLETED') {
+      return this.reply(
+        context,
+        'REPLIED',
+        'INVITATION_REDEEMED',
+        `${messages.welcome}\n\n${this.helpFor(user)}`,
+      );
+    }
+    return this.promptTimeZone(context, user, 'INVITATION_REDEEMED', messages.welcome);
+  }
+
+  /** Free text while onboarding is a proposed time zone; it is confirmed by a button. */
+  private onTimeZoneText(context: Context, user: AppUser, text: string): Promise<Outcome> {
+    const zone = normalizeTimeZone(text);
+    if (!zone) {
+      return this.reply(
+        context,
+        'REJECTED',
+        'TIME_ZONE_INVALID',
+        messages.timeZoneInvalid,
+        timeZoneKeyboard(user),
+      );
+    }
+    return this.reply(
+      context,
+      'REPLIED',
+      'TIME_ZONE_PROPOSED',
+      messages.timeZoneQuestion(zone),
+      timeZoneKeyboard(user, zone),
+    );
+  }
+
+  private promptTimeZone(
+    context: Context,
+    user: AppUser,
+    reason: string,
+    lead: string | null,
+  ): Promise<Outcome> {
+    const text = lead ? `${lead}\n\n${messages.timeZonePrompt}` : messages.timeZonePrompt;
+    const disposition = reason === 'ONBOARDING_INCOMPLETE' ? 'REJECTED' : 'REPLIED';
+    return this.reply(context, disposition, reason, text, timeZoneKeyboard(user));
+  }
+
+  /**
+   * Button presses act only on the sender's own record. Stale buttons (an older
+   * revision), replays and presses after completion change nothing.
+   */
+  private async onCallback(context: Context, data: string | null): Promise<Outcome> {
+    const { tx, update, user } = context;
+    const action = parseCallbackData(data);
+    if (!action) {
+      return {
+        disposition: 'IGNORED',
+        reason: 'CALLBACK_UNKNOWN',
+        callbackAnswer: messages.staleButton,
+      };
+    }
+    const access = accountAccess(user, this.config);
+    if (access === 'NONE' || !user) {
+      return {
+        disposition: 'REJECTED',
+        reason: 'NOT_REGISTERED',
+        callbackAnswer: messages.invitationRequired,
+      };
+    }
+    if (access === 'SUSPENDED') {
+      return { disposition: 'REJECTED', reason: 'SUSPENDED', callbackAnswer: messages.suspended };
+    }
+    if (access === 'ACTIVE') {
+      return {
+        disposition: 'IGNORED',
+        reason: 'TIME_ZONE_ALREADY_CONFIRMED',
+        callbackAnswer: messages.timeZoneAlreadyConfirmed(user.timeZone ?? ''),
+      };
+    }
+    const zone = normalizeTimeZone(action.zone);
+    if (action.revision !== user.revision || !zone) {
+      return {
+        disposition: 'IGNORED',
+        reason: zone ? 'CALLBACK_STALE' : 'TIME_ZONE_INVALID',
+        callbackAnswer: messages.staleButton,
+      };
+    }
+    const confirmed = await confirmTimeZone(tx, user, action.revision, zone);
+    if (!confirmed) {
+      return {
+        disposition: 'IGNORED',
+        reason: 'CALLBACK_STALE',
+        callbackAnswer: messages.staleButton,
+      };
+    }
+    await createStatusDelivery(
+      tx,
+      update.chatId,
+      `${messages.timeZoneConfirmed(zone)}\n\n${this.helpFor(confirmed)}`,
+    );
+    return {
+      disposition: 'REPLIED',
+      reason: 'TIME_ZONE_CONFIRMED',
+      callbackAnswer: messages.timeZoneConfirmed(zone),
+    };
+  }
+
+  private async reply(
+    context: Context,
+    disposition: Disposition,
+    reason: string,
+    text: string,
+    replyMarkup?: InlineKeyboard,
+  ): Promise<Outcome> {
+    await createStatusDelivery(context.tx, context.update.chatId, text, undefined, replyMarkup);
+    return { disposition, reason };
+  }
+
+  private helpFor(user: AppUser): string {
+    return isAdministrator(user, this.config)
+      ? `${messages.help}\n\n${messages.adminHelp}`
+      : messages.help;
+  }
+
+  /** Best-effort, after commit: a failure only leaves the client's spinner running. */
+  private answerCallback(callbackId: string, text: string | undefined): void {
+    if (!this.sender) return;
+    this.sender.answerCallback(callbackId, text).catch((error: unknown) => {
+      this.logger.warn({ message: 'Callback acknowledgement failed', ...errorInfo(error) });
     });
   }
 }

@@ -20,7 +20,9 @@ Implement an administrator-only private-chat prototype command, OpenAI provider 
 
 Acceptance: one command can produce one persisted report with clickable claim-linked citations; processing does not block webhook acknowledgment; unsupported/missing provider config fails safely; no report is labelled live-tested without a live run. Compare fixtures and a small authorized sample before expanding integration.
 
-Status: READY FOR REVIEW (2026-10-18; review fixes for commit 1d01db6 applied 2026-10-19). Authorized live sample: performed 2026-10-19; provider integration, delivery and /result passed; tool-limit verification UNRESOLVED (docs/VALIDATION.md, "TRB-020 authorized live sample"). Not DONE until the owner accepts the implementation and the live sample is completed. Evidence: docs/VALIDATION.md, "TRB-020 evidence", "TRB-020 review fixes", "TRB-020 authorized live sample" and "TRB-020 tool telemetry follow-up".
+Status: DONE — accepted by the owner on 2026-10-19 after review of commit 8e1591a3ea356305b6120920872444bcfcd233da and its recorded live evidence. Evidence: docs/VALIDATION.md, "TRB-020 evidence", "TRB-020 review fixes", "TRB-020 authorized live sample", "TRB-020 tool telemetry follow-up", "TRB-020 diagnostic live run and dashboard evidence" and "TRB-020 acceptance".
+
+Accepted with an open limitation: tool-call metering is UNRESOLVED. Acceptance does not mean that `max_tool_calls` was verified as a cap on billable searches or that any exact spending ceiling exists. The first live run had 4 observed output items and 4 metered web search requests with `max_tool_calls = 3`.
 
 ## TRB-030 — Invitations, identity and authorization
 
@@ -29,6 +31,8 @@ Depends on: 010, 020.
 Implement single-use invitations, admin bootstrap, user onboarding, zone confirmation, suspension, private-chat restriction, inbox deduplication and owner-scoped access services.
 
 Acceptance: expired/replayed invitations fail; two concurrent redemptions yield one winner; foreign callback IDs cannot expose content or mutate records; non-admin access to admin actions fails; group updates create no research; duplicate Telegram updates do not duplicate actions.
+
+Status: READY FOR REVIEW (2026-10-19). Mock validation only: fake provider, recording Telegram sender, real PostgreSQL; no live Telegram or OpenAI check. Behaviour: docs/IDENTITY.md. Evidence: docs/VALIDATION.md, "TRB-030 evidence". Live research remains administrator-only until TRB-050 is accepted.
 
 ## TRB-040 — Task CRUD and durable dialogs
 
@@ -45,6 +49,11 @@ Depends on: 030, 040.
 Add active-run unique constraint, user/global counters, usage ledger, reservations, versioned pricing and outbox. Implement /usage and bounded run settings.
 
 Acceptance: simultaneous requests cannot exceed active-run/quota/reservation capacity; missing budgets/pricing prevent paid execution; rejected requests create no paid work; retries reserve additional allowance; unknown spend is retained; reservation/settlement replay is idempotent; concurrent users remain isolated.
+
+Acceptance note (owner, 2026-10-19, from the TRB-020 live evidence):
+- **No assumed cap.** Budget reservations must not treat `max_tool_calls` as a proven hard cap on billable searches. One live run carried `max_tool_calls = 3` and was metered with 4 web search requests (docs/VALIDATION.md).
+- **Explicit policy.** Unknown usage and potential overruns need a documented policy, for example a reservation margin for extra searches, retention of unknown amounts and reconciliation against billing evidence. It must be accepted before live research is opened to members.
+- **Until then,** live research stays administrator-only (TRB-030).
 
 ## TRB-060 — Persistent queue execution and recovery
 

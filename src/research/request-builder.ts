@@ -31,8 +31,11 @@ export interface ResearchContext {
   delayMinutes: number;
 }
 
-/** Returns null when research is disabled; live configuration is validated by the env schema. */
-export function snapshotRunConfig(config: Env): RunConfigSnapshot | null {
+/**
+ * Returns null when research is disabled; live configuration is validated by the env schema.
+ * `timeZone` is the requesting user's confirmed zone; RESEARCH_TIME_ZONE is the fallback.
+ */
+export function snapshotRunConfig(config: Env, timeZone?: string | null): RunConfigSnapshot | null {
   if (config.RESEARCH_MODE === 'disabled') return null;
   const live = config.RESEARCH_MODE === 'live';
   return {
@@ -49,7 +52,7 @@ export function snapshotRunConfig(config: Env): RunConfigSnapshot | null {
       ? required(config.RUN_DEADLINE_SECONDS)
       : (config.RUN_DEADLINE_SECONDS ?? FAKE_DEFAULTS.deadlineSeconds),
     reasoningEffort: config.OPENAI_REASONING_EFFORT ?? null,
-    timeZone: config.RESEARCH_TIME_ZONE,
+    timeZone: timeZone ?? config.RESEARCH_TIME_ZONE,
   };
 }
 

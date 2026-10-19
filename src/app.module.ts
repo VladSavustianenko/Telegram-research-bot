@@ -5,6 +5,7 @@ import { Env } from './config/env.schema';
 import { DatabaseModule } from './database/database.module';
 import { DeliveryModule } from './delivery/delivery.module';
 import { HealthModule } from './health/health.module';
+import { IdentityModule } from './identity/identity.module';
 import { ResearchModule } from './research/research.module';
 import { TelegramModule } from './telegram/telegram.module';
 
@@ -18,6 +19,7 @@ export class AppModule {
         CommonModule,
         DatabaseModule,
         HealthModule,
+        IdentityModule,
         TelegramModule,
         ResearchModule,
         DeliveryModule,
