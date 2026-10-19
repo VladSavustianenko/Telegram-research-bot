@@ -442,6 +442,42 @@ Remaining limitations:
 - **Abandoned drafts.** Expired drafts nobody touches stay in `task_draft` until the user's next interaction (retention: TRB-090).
 - **Not run:** Docker smoke (Dockerfile and dependencies unchanged; two new optional variables with defaults), CI, live Telegram (inline buttons, multi-part previews).
 
+### TRB-040 review fix (2026-10-19, reviewed commit ebff202)
+
+**Finding.** Old buttons could act on a different draft.
+
+**Root cause.** Draft buttons carried only `d:<version>:<op>`, and every new draft starts at version 0. `onDraftAction` compared the button's version with whatever draft was currently open, so a button of a cancelled draft A acted on a later draft B at the same version.
+
+**Fix.** Draft buttons now carry the draft's persistent ID: `d:<draft id>:<version>:<op>`, at most 51 bytes of Telegram's 64.
+- **Order of checks.** `onDraftAction` checks the ID against the user's own open draft before expiry cleanup, the version check and step applicability. A mismatch is `IGNORED / CALLBACK_STALE` with no write.
+- **Legacy payloads.** The version-only form no longer parses (`CALLBACK_UNKNOWN`).
+- No schema change: the existing `task_draft.id` is used.
+
+| Check | Command | Result |
+|---|---|---|
+| Reproduction before fix | new `test/integration/task-draft-identity.int-spec.ts` against the code of ebff202 | 7 failed, 2 passed. The 2 passing tests check behaviour that must be preserved: restart, and concurrent Save |
+| Static checks | `npm run format:check`, `npm run lint`, `npm run typecheck`, `npm run prisma:validate` | Pass |
+| Unit tests | `npm test` | 159 passed (12 files) |
+| Integration tests | `npm run test:integration` | 119 passed (11 files, all earlier suites included); 0 disposable databases left |
+| Build | `npm run build` | Pass |
+
+Regression scenarios (real PostgreSQL). For each rejected press, the current draft's ID, data, step, version and expiry are compared before and after (unchanged). Each also leaves no task, no research run and no provider submission.
+1. Cancel from draft A does not delete draft B at the same version 0.
+2. Save from A does not save B at PREVIEW, both at version 4; B's own Save then creates exactly one task.
+3. A's schedule-kind button and Back do not change B at the same version and step.
+4. A's old Продовжити and Відкинути (conflict dialog) do not resume or replace B at the same version.
+5. Another user's Cancel button does not touch the caller's draft at the same version, nor the other user's draft.
+6. Legacy `d:<version>:<op>` payloads (Save, Cancel, Back, Resume, Discard) are rejected as `CALLBACK_UNKNOWN`.
+7. A mismatched button neither removes nor extends an expired replacement draft. The draft's own button then reports the expiry and ends it.
+8. A valid button issued before a restart works in a new application instance.
+9. The same Save update twice, plus a press from a second instance concurrently, plus a later press: exactly one task.
+
+Unit: the new draft format round-trips, and payloads stay within the size limit. Rejected: the legacy form, an upper-case, truncated, extended or hyphen-less ID, a non-UUID, a missing operation, a leading-zero version, an extra suffix and weekday `w8`. The formatter refuses a non-UUID ID.
+
+Not run: Docker smoke (no configuration or dependency change), CI, live Telegram.
+
+**Limitation.** Buttons sent before this fix stop working; users get the stale-button acknowledgement and continue with `/new` or `/cancel`. No real users had such buttons: Telegram was disabled outside tests.
+
 ## Release checklist
 
 - Exact model/tool compatibility verified in official docs and an authorized sample.

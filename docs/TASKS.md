@@ -1,6 +1,6 @@
 # TRB-040: tasks and durable dialogs
 
-Status: READY FOR REVIEW. Validated with fake providers, a recording Telegram sender and real PostgreSQL only; nothing here was exercised against the real Telegram API.
+Status: READY FOR REVIEW (review fix for commit ebff202 applied 2026-10-19: draft buttons are bound to their draft). Validated with fake providers, a recording Telegram sender and real PostgreSQL only; nothing here was exercised against the real Telegram API.
 
 **Configuration only.** Tasks store *what* to research and *when* (local intent). Nothing executes them yet:
 - **Scheduled runs:** TRB-070.
@@ -59,8 +59,18 @@ Creation steps: **name → prompt → schedule kind (Вручну / Щодня /
   - Card buttons carry `t:<task id>:<revision>:<op>`.
   - A mutating button whose revision is not current changes nothing and re-sends the current card: "Завдання змінилося; ось його актуальний стан."
   - Every mutation is also a conditional update on the revision, so a stale action cannot overwrite newer data even without the per-user lock.
-- **Drafts.** Every stored change increments `task_draft.version`. Draft buttons carry `d:<version>:<op>`.
-  - A button from an older step, an older draft or an ended draft does nothing; it gets only the acknowledgement "Ця кнопка застаріла.".
+- **Drafts.** Every stored change increments `task_draft.version`. Draft buttons carry `d:<draft id>:<version>:<op>`, at most 51 bytes.
+  - **Identity.** The draft ID binds every draft button, including the conflict dialog's Продовжити and Відкинути, to the draft that issued it. Versions alone are not unique: every new draft starts at version 0.
+  - **Checks, in order:**
+    1. the user's own draft exists (the lookup is scoped to the authenticated user, so a foreign draft ID never matches);
+    2. its ID equals the button's;
+    3. only then expiry;
+    4. the version;
+    5. whether the operation applies to the current step.
+  - **Mismatch.** A button of an earlier, replaced or foreign draft gets only the acknowledgement "Ця кнопка застаріла." (`CALLBACK_STALE`). It never changes, deletes, saves or extends the current draft, and does not end it even when it has expired.
+  - **Other stale buttons.** A button from an older step or an ended draft also does nothing.
+  - **Legacy buttons.** Buttons in the earlier version-only form `d:<version>:<op>` (sent before this fix) are not recognised (`CALLBACK_UNKNOWN`) and are never applied to the current draft. The user starts again with `/new`, `/cancel` or a fresh card.
+  - `/cancel` is a command and still targets the user's current draft.
   - Rejected input does not change the version, so the buttons on screen stay valid.
 - **Callback data** never contains a user ID, is at most 64 bytes, and is parsed with strict patterns (`src/telegram/callback-data.ts`). The action applies to the presser's own records. A forged weekday (`w8`), an unknown operation or an extra suffix is rejected.
 - **Concurrency.** All updates of one user are serialised by the TRB-030 identity lock and the user row lock in the inbox transaction. Conditional updates and unique keys hold even without them:

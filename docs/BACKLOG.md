@@ -44,7 +44,7 @@ Implement /tasks, /new, cards, editable prompts/schedules, pause/resume/delete, 
 
 Acceptance: full creation/edit flow works with Back/Cancel; restart resumes an unexpired draft; malformed zone/time/input is rejected; stale edit callbacks do not overwrite changes; existing tasks keep their zone when the user default changes; save never launches research implicitly.
 
-Status: READY FOR REVIEW (2026-10-19). Mock validation only: fake provider, recording Telegram sender, real PostgreSQL; no live Telegram check. Behaviour: docs/TASKS.md. Evidence: docs/VALIDATION.md, "TRB-040 evidence". Schedules are stored configuration only; execution is TRB-070, and "Run now" from a task is TRB-050/060.
+Status: READY FOR REVIEW (2026-10-19; review fix for commit ebff202 applied 2026-10-19). Mock validation only: fake provider, recording Telegram sender, real PostgreSQL; no live Telegram check. Behaviour: docs/TASKS.md. Evidence: docs/VALIDATION.md, "TRB-040 evidence" and "TRB-040 review fix". Schedules are stored configuration only; execution is TRB-070, and "Run now" from a task is TRB-050/060.
 
 ## TRB-050 — Atomic admission, quotas and cost reservations
 

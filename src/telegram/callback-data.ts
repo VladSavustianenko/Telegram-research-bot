@@ -4,14 +4,17 @@
  * revalidated against the current database state. At most 64 bytes
  * (Telegram's limit). Formats:
  *   tz:<revision>:<zone>          confirm <zone> as the sender's time zone (onboarding)
- *   d:<version>:<op>              act on the sender's open task draft at <version>
+ *   d:<draft id>:<version>:<op>   act on the sender's open task draft <draft id> at <version>;
+ *                                 the ID binds a button to the draft that issued it (the
+ *                                 earlier version-only form d:<version>:<op> is rejected)
  *   t:<task id>:<revision>:<op>   act on the sender's task at <revision>
  *   tl:<page>                     task list page
  *   tn                            start creating a task
  */
 const MAX_CALLBACK_BYTES = 64;
 const TIME_ZONE_CALLBACK = /^tz:(0|[1-9]\d{0,8}):([A-Za-z][A-Za-z0-9_+\-/]{0,39})$/;
-const DRAFT_CALLBACK = /^d:(0|[1-9]\d{0,8}):(b|x|k|s|r|n|km|kd|kw|w[1-7]|z)$/;
+const DRAFT_CALLBACK =
+  /^d:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}):(0|[1-9]\d{0,8}):(b|x|k|s|r|n|km|kd|kw|w[1-7]|z)$/;
 const TASK_CALLBACK =
   /^t:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}):([1-9]\d{0,8}):(v|en|ep|es|p|u|d|dy)$/;
 const LIST_CALLBACK = /^tl:(0|[1-9]\d{0,3})$/;
@@ -30,7 +33,7 @@ export type TaskOp = 'v' | 'en' | 'ep' | 'es' | 'p' | 'u' | 'd' | 'dy';
 
 export type CallbackAction =
   | { kind: 'confirm_time_zone'; revision: number; zone: string }
-  | { kind: 'draft'; version: number; op: DraftOp }
+  | { kind: 'draft'; draftId: string; version: number; op: DraftOp }
   | { kind: 'task'; taskId: string; revision: number; op: TaskOp }
   | { kind: 'task_list'; page: number }
   | { kind: 'task_new' };
@@ -46,8 +49,8 @@ export function timeZoneCallbackData(revision: number, zone: string): string {
   return bounded(data);
 }
 
-export function draftCallbackData(version: number, op: DraftOp): string {
-  const data = `d:${version}:${op}`;
+export function draftCallbackData(draftId: string, version: number, op: DraftOp): string {
+  const data = `d:${draftId}:${version}:${op}`;
   if (!DRAFT_CALLBACK.test(data)) throw new Error('draft callback data out of bounds');
   return bounded(data);
 }
@@ -72,7 +75,14 @@ export function parseCallbackData(data: string | null): CallbackAction | null {
   let match = TIME_ZONE_CALLBACK.exec(data);
   if (match) return { kind: 'confirm_time_zone', revision: Number(match[1]), zone: match[2] ?? '' };
   match = DRAFT_CALLBACK.exec(data);
-  if (match) return { kind: 'draft', version: Number(match[1]), op: (match[2] ?? 'x') as DraftOp };
+  if (match) {
+    return {
+      kind: 'draft',
+      draftId: match[1] ?? '',
+      version: Number(match[2]),
+      op: (match[3] ?? 'x') as DraftOp,
+    };
+  }
   match = TASK_CALLBACK.exec(data);
   if (match) {
     return {

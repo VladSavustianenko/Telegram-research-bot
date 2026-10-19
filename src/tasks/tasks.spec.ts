@@ -164,7 +164,7 @@ describe('task callbacks and messages', () => {
 
   it('round-trips payloads within 64 bytes and rejects forged ones', () => {
     for (const data of [
-      draftCallbackData(123456789, 'kw'),
+      draftCallbackData(id, 123456789, 'kw'),
       taskCallbackData(id, 999999999, 'dy'),
       taskListCallbackData(9999),
     ]) {
@@ -191,10 +191,39 @@ describe('task callbacks and messages', () => {
     }
   });
 
+  it('binds draft buttons to their draft and rejects legacy or malformed draft payloads', () => {
+    const data = draftCallbackData(id, 999999999, 'kw');
+    expect(data).toBe(`d:${id}:999999999:kw`);
+    expect(Buffer.byteLength(data)).toBeLessThanOrEqual(64);
+    expect(parseCallbackData(draftCallbackData(id, 4, 's'))).toEqual({
+      kind: 'draft',
+      draftId: id,
+      version: 4,
+      op: 's',
+    });
+    for (const rejected of [
+      'd:4:s', // legacy version-only form: never applied to the current draft
+      'd:0:x',
+      `d:${id.toUpperCase()}:4:s`,
+      `d:${id.slice(0, -1)}:4:s`,
+      `d:${id}0:4:s`,
+      `d:${id.replace(/-/g, '')}:4:s`,
+      `d:not-a-uuid-at-all-0000000000000000000:4:s`,
+      `d:${id}:4`,
+      `d:${id}:01:s`,
+      `d:${id}:4:s:${id}`,
+      `d:${id}:4:w8`,
+    ]) {
+      expect(parseCallbackData(rejected)).toBeNull();
+    }
+    expect(() => draftCallbackData('not-a-uuid', 1, 's')).toThrow();
+  });
+
   it('escapes user text and splits long previews without breaking entities', () => {
     const prompt = `<b>&${'я'.repeat(4000)}👍🏽`;
     const view = previewView({
       ...start(),
+      id,
       step: 'PREVIEW',
       version: 1,
       data: {

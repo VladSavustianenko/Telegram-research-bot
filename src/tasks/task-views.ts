@@ -27,6 +27,8 @@ const PROMPT_PREVIEW_CHARS = 300;
 const BUTTON_NAME_CHARS = 40;
 
 export interface DraftView extends DraftShape {
+  /** Bound into every draft button, so a button never acts on another draft. */
+  id: string;
   version: number;
   /** Name of the task being edited (EDIT only). */
   taskName?: string;
@@ -66,16 +68,16 @@ function header(draft: DraftView): string {
 function navigation(draft: DraftView): Button[] {
   const row: Button[] = [];
   if (previousStep(draft)) {
-    row.push({ text: '« Назад', callback_data: draftCallbackData(draft.version, 'b') });
+    row.push({ text: '« Назад', callback_data: draftCallbackData(draft.id, draft.version, 'b') });
   }
-  row.push({ text: 'Скасувати', callback_data: draftCallbackData(draft.version, 'x') });
+  row.push({ text: 'Скасувати', callback_data: draftCallbackData(draft.id, draft.version, 'x') });
   return row;
 }
 
 /** The question for the draft's current step, with its buttons. */
 export function stepView(draft: DraftView, notice?: string): View {
   if (draft.step === 'PREVIEW') return previewView(draft, notice);
-  const { data, version } = draft;
+  const { id, data, version } = draft;
   const lines: string[] = [];
   const rows: Button[][] = [];
   const mark = (selected: boolean, label: string) => (selected ? `✓ ${label}` : label);
@@ -95,6 +97,7 @@ export function stepView(draft: DraftView, notice?: string): View {
         (['MANUAL', 'DAILY', 'WEEKLY'] as const).map((kind) => ({
           text: mark(data.scheduleKind === kind, KIND_LABELS[kind]),
           callback_data: draftCallbackData(
+            id,
             version,
             kind === 'MANUAL' ? 'km' : kind === 'DAILY' ? 'kd' : 'kw',
           ),
@@ -110,7 +113,7 @@ export function stepView(draft: DraftView, notice?: string): View {
         rows.push(
           days.map((day) => ({
             text: mark(data.weekday === day, WEEKDAY_NAMES[day - 1] ?? ''),
-            callback_data: draftCallbackData(version, `w${day}`),
+            callback_data: draftCallbackData(id, version, `w${day}`),
           })),
         );
       }
@@ -126,7 +129,7 @@ export function stepView(draft: DraftView, notice?: string): View {
       rows.push([
         {
           text: `Використати ${data.suggestedTimeZone}`,
-          callback_data: draftCallbackData(version, 'z'),
+          callback_data: draftCallbackData(id, version, 'z'),
         },
       ]);
       break;
@@ -134,7 +137,7 @@ export function stepView(draft: DraftView, notice?: string): View {
   const current = currentValue(draft);
   if (acceptsText(draft.step) && current !== undefined) {
     lines.push(`Зараз: ${truncate(current, PROMPT_PREVIEW_CHARS)}`);
-    rows.push([{ text: 'Залишити як є', callback_data: draftCallbackData(version, 'k') }]);
+    rows.push([{ text: 'Залишити як є', callback_data: draftCallbackData(id, version, 'k') }]);
   }
   rows.push(navigation(draft));
   return {
@@ -145,7 +148,7 @@ export function stepView(draft: DraftView, notice?: string): View {
 
 /** Exactly what Save stores: the full name, prompt, schedule and zone. */
 export function previewView(draft: DraftView, notice?: string): View {
-  const { data, version } = draft;
+  const { id, data, version } = draft;
   const editing = draft.mode === 'EDIT' ? draft.section : null;
   const lines = [
     ...(notice ? [notice] : []),
@@ -172,7 +175,7 @@ export function previewView(draft: DraftView, notice?: string): View {
     text: lines.join('\n'),
     keyboard: {
       inline_keyboard: [
-        [{ text: 'Зберегти', callback_data: draftCallbackData(version, 's') }],
+        [{ text: 'Зберегти', callback_data: draftCallbackData(id, version, 's') }],
         navigation(draft),
       ],
     },
@@ -186,17 +189,22 @@ export function draftConflictView(draft: DraftView, purpose: 'new' | 'edit'): Vi
       ? `створення завдання${draft.data.name ? ` «${draft.data.name}»` : ''}`
       : `редагування завдання «${draft.taskName ?? ''}»`;
   const rows: Button[][] = [
-    [{ text: 'Продовжити', callback_data: draftCallbackData(draft.version, 'r') }],
+    [{ text: 'Продовжити', callback_data: draftCallbackData(draft.id, draft.version, 'r') }],
   ];
   rows.push(
     purpose === 'new'
       ? [
           {
             text: 'Відкинути й почати нове',
-            callback_data: draftCallbackData(draft.version, 'n'),
+            callback_data: draftCallbackData(draft.id, draft.version, 'n'),
           },
         ]
-      : [{ text: 'Відкинути чернетку', callback_data: draftCallbackData(draft.version, 'x') }],
+      : [
+          {
+            text: 'Відкинути чернетку',
+            callback_data: draftCallbackData(draft.id, draft.version, 'x'),
+          },
+        ],
   );
   return {
     text: `У вас є незавершене ${what}. Продовжити його чи відкинути?`,

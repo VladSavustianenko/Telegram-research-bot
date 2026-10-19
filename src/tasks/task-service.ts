@@ -297,6 +297,7 @@ async function openDraft(ctx: TaskContext): Promise<{ draft: DraftRow; expired: 
 
 function viewOf(draft: DraftRow): DraftView {
   return {
+    id: draft.id,
     mode: draft.mode,
     section: draft.section,
     step: draft.step,
@@ -492,9 +493,14 @@ const DRAFT_EVENTS: Partial<Record<DraftOp, DraftEvent>> = {
   kw: { type: 'kind', kind: 'WEEKLY' },
 };
 
-/** Draft button. Only the user's own open draft, at the version the button was issued for. */
+/**
+ * Draft button. Acts only on the user's own open draft with the ID the button
+ * was issued for, at that version; the query is scoped to the user, so a
+ * foreign draft ID never matches.
+ */
 export async function onDraftAction(
   ctx: TaskContext,
+  draftId: string,
   version: number,
   op: DraftOp,
 ): Promise<TaskOutcome> {
@@ -502,6 +508,11 @@ export async function onDraftAction(
   if (refused) return refused;
   const open = await openDraft(ctx);
   if (!open) return { disposition: 'IGNORED', reason: 'DRAFT_NONE', callbackAnswer: STALE_BUTTON };
+  // Identity first: a button of an earlier (or foreign) draft must not touch this
+  // one in any way, not even by ending it as expired.
+  if (open.draft.id !== draftId) {
+    return { disposition: 'IGNORED', reason: 'CALLBACK_STALE', callbackAnswer: STALE_BUTTON };
+  }
   if (open.expired) return expire(ctx, open.draft);
   const { draft } = open;
   if (draft.version !== version) {

@@ -214,8 +214,9 @@ describe('TRB-040 tasks and durable dialogs (fakes, real PostgreSQL)', () => {
       await sayL('щодня');
       expect(lastText()).toContain('Оберіть варіант кнопкою нижче.');
       await press(button('Щотижня'), ADMIN_ID, limited);
-      const version = (await draft())?.version ?? -1;
-      await press(`d:${version}:w8`, ADMIN_ID, limited); // invalid weekday payload
+      const current = await draft();
+      const version = current?.version ?? -1;
+      await press(`d:${current?.id ?? ''}:${version}:w8`, ADMIN_ID, limited); // invalid weekday payload
       expect((await draft())?.step).toBe('WEEKDAY');
       await press(button('неділя'), ADMIN_ID, limited);
       for (const time of ['24:00', '9.00', 'завтра']) {
@@ -326,7 +327,7 @@ describe('TRB-040 tasks and durable dialogs (fakes, real PostgreSQL)', () => {
       await press(kindButton);
       const before = await draft();
       await press(kindButton); // same button again: older version
-      await press(draftCallbackData((before?.version ?? 0) + 7, 's'));
+      await press(draftCallbackData(before?.id ?? '', (before?.version ?? 0) + 7, 's'));
       expect(await draft()).toEqual(before);
       expect(await reasons(2)).toEqual(['CALLBACK_STALE', 'CALLBACK_STALE']);
       await press(button('Скасувати'));
@@ -381,7 +382,8 @@ describe('TRB-040 tasks and durable dialogs (fakes, real PostgreSQL)', () => {
       await press(pause);
       expect((await tasks())[0]).toMatchObject({ state: 'PAUSED', revision: 2 });
       // The pause card is the last message; the draft's Save is on the earlier preview.
-      const saveFromDraft = draftCallbackData((await draft())?.version ?? -1, 's');
+      const current = await draft();
+      const saveFromDraft = draftCallbackData(current?.id ?? '', current?.version ?? -1, 's');
       await press(saveFromDraft);
       expect(lastText()).toContain(
         'Завдання змінилося після початку редагування, тому зміни не збережено.',
@@ -526,8 +528,8 @@ describe('TRB-040 tasks and durable dialogs (fakes, real PostgreSQL)', () => {
         expect(lastText(OTHER_ADMIN_ID)).toBe('Завдання не знайдено.');
       }
       // A's draft buttons pressed by B act on B's (absent) draft only.
-      await press(draftCallbackData(draftA?.version ?? 0, 's'), OTHER_ADMIN_ID);
-      await press(draftCallbackData(draftA?.version ?? 0, 'x'), OTHER_ADMIN_ID);
+      await press(draftCallbackData(draftA?.id ?? '', draftA?.version ?? 0, 's'), OTHER_ADMIN_ID);
+      await press(draftCallbackData(draftA?.id ?? '', draftA?.version ?? 0, 'x'), OTHER_ADMIN_ID);
       await say('/tasks', OTHER_ADMIN_ID);
       expect(lastText(OTHER_ADMIN_ID)).toBe('Завдань ще немає.');
       await say('/cancel', OTHER_ADMIN_ID);
@@ -545,7 +547,7 @@ describe('TRB-040 tasks and durable dialogs (fakes, real PostgreSQL)', () => {
       const memberDraft = await draft(MEMBER);
       await say(`/admin suspend ${MEMBER}`);
       for (const text of ['/tasks', '/new', '/cancel', 'текст']) await say(text, MEMBER);
-      await press(draftCallbackData(memberDraft?.version ?? 0, 'x'), MEMBER);
+      await press(draftCallbackData(memberDraft?.id ?? '', memberDraft?.version ?? 0, 'x'), MEMBER);
       expect(
         new Set(
           messagesTo(MEMBER)
@@ -594,7 +596,7 @@ describe('TRB-040 tasks and durable dialogs (fakes, real PostgreSQL)', () => {
           await showTasks(ctx),
           await startCreate(ctx),
           await onDraftText(ctx, 'значення'),
-          await onDraftAction(ctx, open?.version ?? 0, 'x'),
+          await onDraftAction(ctx, open?.id ?? '', open?.version ?? 0, 'x'),
           await onTaskAction(ctx, task?.id ?? '', 1, 'p'),
           await onTaskAction(ctx, task?.id ?? '', 1, 'dy'),
         ];

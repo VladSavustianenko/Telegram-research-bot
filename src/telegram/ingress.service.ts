@@ -351,7 +351,7 @@ export class TelegramIngressService {
       const tasks = this.taskContext(context, user);
       switch (action.kind) {
         case 'draft':
-          return onDraftAction(tasks, action.version, action.op);
+          return onDraftAction(tasks, action.draftId, action.version, action.op);
         case 'task':
           return onTaskAction(tasks, action.taskId, action.revision, action.op);
         case 'task_list':
