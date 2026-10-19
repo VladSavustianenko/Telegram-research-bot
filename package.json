@@ -26,7 +26,8 @@
     "db:up": "docker compose up -d postgres postgres-test",
     "db:down": "docker compose down",
     "postinstall": "prisma generate",
-    "ops:reconcile": "node dist/ops/reconcile-run.js"
+    "ops:reconcile": "node dist/ops/reconcile-run.js",
+    "ops:tool-telemetry": "node dist/ops/tool-telemetry.js"
   },
   "dependencies": {
     "@nestjs/common": "12.1.2",

@@ -136,6 +136,69 @@ Also fixed: `health.stall.spec.ts` (TRB-010) failed once under load. Ten sequent
 
 Live sample: still **PENDING**.
 
+### TRB-020 authorized live sample (2026-10-19, owner-run, local polling)
+
+Owner-authorized, run once by the owner on a fresh test bot with a dedicated OpenAI project. Evidence below comes from the Telegram conversation, application logs and the local database. No figure was read from OpenAI billing.
+
+**Observed facts**
+
+| Check | Evidence | Result |
+|---|---|---|
+| Configuration gate | First attempt with an invalid key: run `7dbef1a4-…` FAILED / `OPENAI_HTTP_401_invalid_api_key`, no response ID, no retry, failure notice delivered | Pass (not accepted by OpenAI) |
+| Real provider integration | Run `0241a554-c529-4ff3-94a7-d5e61c6800d5` SUCCEEDED / FOUND in 22.4 s. Model requested `gpt-5.5`, returned `gpt-5.5-2026-04-23`, reasoning `low`. `background: true`, `store: false`, `tool_choice: "required"` | Pass |
+| Echoed bounds | Report accepted, so the response echoed `max_output_tokens=4000`, `max_tool_calls=3`, `tool_choice=required` and the web search tool (otherwise `BOUNDS_NOT_CONFIRMED`) | Pass (echo only; see tool limit below) |
+| Usage recorded | 23,806 input tokens (0 cached), 1,245 output tokens including 519 reasoning tokens; 2 url_citation annotations; 44 consulted URLs (`action.sources`) | Recorded |
+| Report delivery | Acknowledgment and REPORT delivered (1 part each, 1 attempt); clickable `[1]` citation next to the claims; no simulation banner | Pass |
+| `/result` | RESEND delivery SENT, part content hash identical to the REPORT part. Still 2 runs total; the run's usage, tool count and `updated_at` unchanged | Pass (no new research run created) |
+| Tool limit | `tool_call_count` = 4 web_search_call output items with `max_tool_calls` = 3 echoed | **Unresolved** (see below) |
+
+**Cost estimate** (not billing evidence): about $0.19–0.20 at the gpt-5.5 list prices checked on 2026-10-19. That is input $5/1M ≈ $0.12, output $30/1M ≈ $0.04, and web search $10/1k calls × 3–4 ≈ $0.03–0.04. Whether all four items were billed calls is unknown.
+
+**Not verified**
+- **Football facts.** The fixture (FC Barcelona – Deportivo Alavés, 2026-10-31 22:00 Kyiv) has not been checked independently against the official page.
+- **Unsupported claim.** The report states that the LALIGA site also confirms the fixture, but no citation annotation supports that statement.
+- **Cosmetic issues.** An extra blank line after the header and an English "Limitations" heading.
+- **Absence of a second OpenAI request after `/result`.** It is shown by the database. The owner's dashboard check was not recorded here.
+
+**Tool-limit discrepancy (4 output items vs `max_tool_calls = 3`)**
+- **What is known.**
+  - The API reference says `max_tool_calls` is "the maximum number of total calls to built-in tools that can be processed in a response… Any further attempts to call a tool by the model will be ignored".
+  - `web_search_call` items have statuses `in_progress | searching | completed | failed | incomplete` and actions `search | open_page | find_in_page`, so each of these actions is its own output item.
+  - The pricing page charges "$10.00 / 1k calls" for web search, but does not define a "call" or mention `open_page`/`find_in_page`.
+  - The 44 stored URLs come from `action.sources`, which only `search` actions carry, so at least one `search` action occurred.
+- **What is unknown.**
+  - The status and action of each of the four items, so whether a fourth item was an ignored attempt, a non-search action, or an executed search.
+  - How many searches were billed.
+  - Whether the limit was enforced. The echoed value proves only that the request carried it.
+- **Can existing evidence resolve it?** No. Per-item metadata was not stored for this run, so its telemetry is `not_recorded`, and the response was created with `store: false`. New instrumentation cannot reconstruct it. Only billing data attributable to this response could settle the billed count.
+
+### TRB-020 tool telemetry follow-up (2026-10-19)
+
+Instrumentation only; no paid call and no Telegram message.
+
+- **What is stored.** `research_tool_item` keeps one row per provider response ID and tool item ID: item type, latest reported status and `action.type` (verbatim, `null` when not reported), observation count, and first/last seen. Items without an ID are keyed `missing-id:<position>` and flagged. No queries, URLs, page content or raw responses are stored.
+- **When it is written.** Rows are written in fenced transactions for every snapshot: submit, each poll, and the cancellation result. `research_run.tool_telemetry_version = 1` marks runs with telemetry. Earlier runs keep `NULL` (`not_recorded`), and nothing is backfilled.
+- **Field meaning.** `tool_call_count` keeps its historical meaning: web_search_call output items in the final snapshot. Billable search count is always reported as unknown.
+- **Inspection.** `npm run ops:tool-telemetry -- --run <id>` (read-only). For run `0241a554-…` it reports `telemetry: not_recorded`, `webSearchCallOutputItemsFinalSnapshot: 4`, `billableSearchCount: null`.
+
+| Check | Command | Result |
+|---|---|---|
+| Migration | `prisma migrate dev --create-only`, `migrate deploy`, `migrate status`, `migrate diff --exit-code` against the dev DB | `20261019103519_trb_020_tool_item_telemetry` applied; "up to date"; "No difference detected" (exit 0). One earlier diff invocation with suppressed output exited 1; it was rerun twice and returned 0, cause not determined |
+| Static checks | `npm run format:check`, `npm run lint`, `npm run typecheck`, `npm run prisma:validate` | Pass |
+| Unit tests | `npm test` | 114 passed (10 files) |
+| Integration tests | `npm run test:integration` | 61 passed (6 files); 0 disposable databases left |
+| Build | `npm run build` | Pass |
+
+Telemetry tests:
+- **Unit (mapping).** Mixed `search`/`open_page`/`find_in_page` items; missing or unknown status and action kept as `null` or verbatim; a missing item ID; no query, URL or pattern retained.
+- **Integration (real PostgreSQL).**
+  - The same item across three polls is counted once and progresses `in_progress` → `searching` → `completed`.
+  - `failed`/`incomplete` items stay distinguishable from completed ones.
+  - An item omitted by a later snapshot is retained, and reported values are not overwritten by missing ones.
+  - Telemetry survives a worker takeover, and the stale worker's late observation is rejected by fencing.
+  - Telemetry persists for an execution that ended UNCERTAIN, including the cancellation snapshot.
+  - A legacy run without telemetry reports `not_recorded` (unknown, not zero); a rejected submission reports recorded with 0 items.
+
 ## Release checklist
 
 - Exact model/tool compatibility verified in official docs and an authorized sample.

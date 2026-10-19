@@ -28,3 +28,15 @@ describe('FakeResearchProvider', () => {
     });
   });
 });
+
+describe('FakeResearchProvider tool items', () => {
+  it('reports one completed search item per simulated search', async () => {
+    const provider = new FakeResearchProvider();
+    const done = await provider.retrieve((await provider.submit(request)).id);
+    expect(done.toolItems).toHaveLength(done.webSearchCalls);
+    expect(new Set(done.toolItems.map((item) => item.itemId)).size).toBe(done.webSearchCalls);
+    expect(
+      done.toolItems.every((item) => item.status === 'completed' && item.actionType === 'search'),
+    ).toBe(true);
+  });
+});

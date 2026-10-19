@@ -139,9 +139,10 @@ export function mapResponse(response: Response): ProviderSnapshot {
     : 'failed';
   const textParts: ProviderSnapshot['textParts'] = [];
   const sources: ProviderSnapshot['sources'] = [];
+  const toolItems: ProviderSnapshot['toolItems'] = [];
   let webSearchCalls = 0;
 
-  for (const item of response.output ?? []) {
+  for (const [position, item] of (response.output ?? []).entries()) {
     if (item.type === 'message') {
       for (const content of item.content) {
         if (content.type !== 'output_text') continue;
@@ -164,6 +165,15 @@ export function mapResponse(response: Response): ProviderSnapshot {
     } else if (item.type === 'web_search_call') {
       webSearchCalls += 1;
       const action = item.action as { type?: string; sources?: { url?: string }[] } | undefined;
+      // Diagnostics only: identifiers, status and action type; never queries or URLs.
+      const raw = item as { id?: unknown; status?: unknown };
+      toolItems.push({
+        itemId: typeof raw.id === 'string' && raw.id ? raw.id : null,
+        position,
+        type: item.type,
+        status: typeof raw.status === 'string' ? raw.status : null,
+        actionType: typeof action?.type === 'string' ? action.type : null,
+      });
       for (const source of action?.sources ?? []) {
         if (typeof source.url === 'string') sources.push({ url: source.url });
       }
@@ -178,6 +188,7 @@ export function mapResponse(response: Response): ProviderSnapshot {
     model: response.model ?? null,
     textParts,
     webSearchCalls,
+    toolItems,
     sources,
     usage: usage
       ? {

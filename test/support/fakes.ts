@@ -53,6 +53,7 @@ export function snapshot(
     model: 'test-model',
     textParts: [],
     webSearchCalls: 0,
+    toolItems: [],
     sources: [],
     usage: null,
     incompleteReason: null,

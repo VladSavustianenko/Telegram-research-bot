@@ -43,6 +43,16 @@ export class FakeResearchProvider implements ResearchProvider {
       model: 'simulated',
       textParts: completed ? fixture.parts : [],
       webSearchCalls: completed ? fixture.searches : 0,
+      // Simulated items carry the same diagnostic shape as real ones.
+      toolItems: completed
+        ? Array.from({ length: fixture.searches }, (_, index) => ({
+            itemId: `${id}_ws_${index + 1}`,
+            position: index,
+            type: 'web_search_call',
+            status: 'completed',
+            actionType: 'search',
+          }))
+        : [],
       sources: [],
       usage: completed
         ? {

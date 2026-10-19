@@ -116,7 +116,7 @@ export async function startHarness(
 
 export async function resetDatabase(prisma: PrismaService): Promise<void> {
   await prisma.$executeRawUnsafe(
-    'TRUNCATE research_reconciliation, delivery_part, delivery, research_run, telegram_update RESTART IDENTITY CASCADE',
+    'TRUNCATE research_tool_item, research_reconciliation, delivery_part, delivery, research_run, telegram_update RESTART IDENTITY CASCADE',
   );
 }
 

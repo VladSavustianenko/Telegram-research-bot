@@ -88,23 +88,30 @@ model ResearchRun {
   leaseUntil   DateTime? @map("lease_until") @db.Timestamptz(3)
   fencingToken Int       @default(0) @map("fencing_token")
 
-  startedAt      DateTime?               @map("started_at") @db.Timestamptz(3)
-  completedAt    DateTime?               @map("completed_at") @db.Timestamptz(3)
-  outcome        ResearchOutcome?
+  startedAt            DateTime?               @map("started_at") @db.Timestamptz(3)
+  completedAt          DateTime?               @map("completed_at") @db.Timestamptz(3)
+  outcome              ResearchOutcome?
   /// Original provider text, before rendering.
-  reportText     String?                 @map("report_text")
+  reportText           String?                 @map("report_text")
   /// Provider url_citation annotations with resolved code-point offsets.
-  citations      Json?
+  citations            Json?
   /// URLs reported as consulted by web_search_call actions.
-  sources        Json?
-  warnings       Json?
-  usage          Json?
-  toolCallCount  Int?                    @map("tool_call_count")
-  failureCode    String?                 @map("failure_code")
+  sources              Json?
+  warnings             Json?
+  usage                Json?
+  /// Historical meaning (unchanged): number of web_search_call output items in the
+  /// final known snapshot (maximum over snapshots). An observation, not a count of
+  /// executed or billable searches.
+  toolCallCount        Int?                    @map("tool_call_count")
+  /// Null: per-item tool telemetry was not recorded for this run (it predates it).
+  /// 1: observed items are recorded in research_tool_item during execution.
+  toolTelemetryVersion Int?                    @map("tool_telemetry_version")
+  toolItems            ResearchToolItem[]
+  failureCode          String?                 @map("failure_code")
   /// Set only by operator reconciliation of an UNCERTAIN run; the run keeps its
   /// state, failure code, response ID and usage as evidence.
-  reconciledAt   DateTime?               @map("reconciled_at") @db.Timestamptz(3)
-  reconciliation ResearchReconciliation?
+  reconciledAt         DateTime?               @map("reconciled_at") @db.Timestamptz(3)
+  reconciliation       ResearchReconciliation?
 
   createdAt  DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt  DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
@@ -196,4 +203,28 @@ model ResearchReconciliation {
   createdAt  DateTime                 @default(now()) @map("created_at") @db.Timestamptz(3)
 
   @@map("research_reconciliation")
+}
+
+/// Diagnostic record of one observed built-in tool output item (TRB-020 follow-up).
+/// One row per (provider response, item); repeated observations update status and
+/// action type instead of adding rows. No queries, URLs or page content.
+model ResearchToolItem {
+  runId          String      @map("run_id") @db.Uuid
+  run            ResearchRun @relation(fields: [runId], references: [id])
+  responseId     String      @map("response_id")
+  /// Provider item ID, or "missing-id:<position>" when the provider omitted it.
+  itemKey        String      @map("item_key")
+  itemIdReported Boolean     @map("item_id_reported")
+  itemType       String      @map("item_type")
+  /// Latest reported status, verbatim; null when never reported.
+  status         String?
+  /// Latest reported action.type, verbatim; null when never reported.
+  actionType     String?     @map("action_type")
+  observations   Int         @default(1)
+  firstSeenAt    DateTime    @default(now()) @map("first_seen_at") @db.Timestamptz(3)
+  lastSeenAt     DateTime    @default(now()) @map("last_seen_at") @db.Timestamptz(3)
+
+  @@id([responseId, itemKey])
+  @@index([runId])
+  @@map("research_tool_item")
 }

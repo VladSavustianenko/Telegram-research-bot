@@ -1,6 +1,6 @@
 # TRB-020 research slice: behaviour, recovery and live sample
 
-Status: implementation READY FOR REVIEW (review fixes of 2026-10-19 applied); authorized live sample PENDING. Everything below describes the code as implemented; nothing here has been observed against the real OpenAI or Telegram APIs.
+Status: implementation READY FOR REVIEW (review fixes of 2026-10-19 applied). Authorized live sample performed 2026-10-19: provider integration, delivery and `/result` passed; tool-limit verification unresolved (docs/VALIDATION.md). Everything below describes the code as implemented; nothing here has been observed against the real OpenAI or Telegram APIs.
 
 ## Behaviour
 
@@ -75,6 +75,22 @@ Reconciliation procedure (operator only; never contacts OpenAI or Telegram, neve
    `npm run ops:reconcile -- --run <id> --resolution <PROVIDER_CONFIRMED_TERMINAL|PROVIDER_REQUEST_ABSENT|OPERATOR_ACCEPTED_RISK> --operator <name> --note "<what was checked and the observed cost>"`
 4. The command locks the run and requires `state = UNCERTAIN` with no previous reconciliation. It then appends a `research_reconciliation` row and sets `research_run.reconciled_at`. The row is append-only (a trigger rejects UPDATE/DELETE) and holds the operator, resolution, note and an evidence snapshot: failure code, submission state, response ID, provider status, usage and timestamps.
 5. The run stays UNCERTAIN with its failure code, response ID and usage. Workers cannot reconcile, and a stale worker cannot change the run afterwards, because its fenced writes require `RUNNING`. Queued live work proceeds on the next worker tick.
+
+## Tool telemetry (diagnostic)
+
+Every provider snapshot's `web_search_call` items are recorded in `research_tool_item`:
+- **One row per item.** Rows are keyed by response ID and item ID. Repeated observations update the latest status and `action.type` instead of adding rows; missing values never overwrite reported ones, and omitted items are kept.
+- **Writes are fenced.** A stale worker records nothing.
+- **Content-free.** No queries, URLs or page content are stored.
+- **Marker.** `research_run.tool_telemetry_version` is `1` for runs with telemetry. It is `NULL` for older runs, which report `not_recorded` rather than zero.
+
+Terms:
+- **observed tool items:** distinct items;
+- **observed items by status/action:** their latest reported values;
+- **`tool_call_count`:** web_search_call output items in the final snapshot (historical meaning);
+- **billable search count:** unknown. Provider output does not state what is billed; only billing evidence can.
+
+Inspect with `npm run ops:tool-telemetry -- --run <id>` (read-only).
 
 ## Delivery
 

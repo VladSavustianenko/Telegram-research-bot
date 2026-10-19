@@ -36,6 +36,7 @@ import {
   type ResearchContext,
   type RunConfigSnapshot,
 } from './request-builder';
+import { TOOL_TELEMETRY_VERSION, recordToolItems } from './tool-telemetry';
 import { hasUnresolvedLiveUncertainty } from './uncertainty';
 
 export const RUN_LEASE_SECONDS = 60;
@@ -265,6 +266,8 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
     await this.fenced(this.prisma, claim, {
       submissionState: 'SUBMITTING',
       submittedAt,
+      // From here on, every provider snapshot's tool items are recorded (research_tool_item).
+      toolTelemetryVersion: TOOL_TELEMETRY_VERSION,
       requestSnapshot: execution.stored as unknown as Prisma.InputJsonValue,
     });
 
@@ -283,11 +286,14 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
     // Persist the response ID immediately; bounds are verified afterwards in poll()
     // and again after any recovery, so a crash in between cannot skip verification.
     try {
-      await this.fenced(this.prisma, claim, {
-        submissionState: 'SUBMITTED',
-        providerResponseId: first.id,
-        providerStatus: first.status,
-        providerModel: first.model,
+      await this.prisma.$transaction(async (tx) => {
+        await this.fenced(tx, claim, {
+          submissionState: 'SUBMITTED',
+          providerResponseId: first.id,
+          providerStatus: first.status,
+          providerModel: first.model,
+        });
+        await recordToolItems(tx, claim.id, first.id, first.toolItems);
       });
     } catch (error) {
       // Keep the ID in the log so an operator can reconcile the UNCERTAIN run.
@@ -333,7 +339,7 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
       try {
         latest = await provider.retrieve(responseId);
         known = mergeSnapshots(known, latest);
-        await this.recordProgress(claim, latest);
+        await this.observe(claim, responseId, latest);
       } catch (error) {
         if (error instanceof StaleLeaseError) throw error;
         if (error instanceof ProviderError && error.gone) {
@@ -364,6 +370,7 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
       return this.finishWithoutReport(execution, 'FAILED', code, known);
     }
     const cancelled = await this.cancelQuietly(execution, responseId);
+    if (cancelled) await this.observe(execution.claim, responseId, cancelled);
     const merged = mergeSnapshots(known, cancelled);
     return isTerminal(cancelled)
       ? this.finishWithoutReport(execution, 'FAILED', code, merged)
@@ -376,6 +383,7 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
     known: ProviderSnapshot | null,
   ): Promise<void> {
     const cancelled = await this.cancelQuietly(execution, responseId);
+    if (cancelled) await this.observe(execution.claim, responseId, cancelled);
     const merged = mergeSnapshots(known, cancelled);
     if (!isTerminal(cancelled)) {
       // Cancellation failed or did not confirm termination: the request may still run and bill.
@@ -500,11 +508,22 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
     };
   }
 
-  /** Newest provider status (and usage, when reported) while polling. */
-  private async recordProgress(claim: Claim, snapshot: ProviderSnapshot): Promise<void> {
-    await this.fenced(this.prisma, claim, {
-      providerStatus: snapshot.status,
-      ...(snapshot.usage ? { usage: snapshot.usage as unknown as Prisma.InputJsonValue } : {}),
+  /**
+   * Records one provider snapshot while the run is held: newest status, usage
+   * when reported, and its tool items. Fenced, so a stale worker records nothing.
+   */
+  private async observe(
+    claim: Claim,
+    responseId: string,
+    snapshot: ProviderSnapshot,
+  ): Promise<void> {
+    await this.prisma.$transaction(async (tx) => {
+      await this.fenced(tx, claim, {
+        providerStatus: snapshot.status,
+        toolTelemetryVersion: TOOL_TELEMETRY_VERSION,
+        ...(snapshot.usage ? { usage: snapshot.usage as unknown as Prisma.InputJsonValue } : {}),
+      });
+      await recordToolItems(tx, claim.id, responseId, snapshot.toolItems);
     });
   }
 

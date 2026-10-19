@@ -225,3 +225,81 @@ describe('classifyError', () => {
     expect(error.message).not.toContain('secret-ish');
   });
 });
+
+describe('mapResponse tool item diagnostics', () => {
+  it('keeps ID, status and action type of every web_search_call, verbatim', () => {
+    const mapped = mapResponse(
+      response({
+        output: [
+          {
+            type: 'web_search_call',
+            id: 'ws_1',
+            status: 'completed',
+            action: { type: 'search', query: 'secret query', sources: [] },
+          },
+          {
+            type: 'web_search_call',
+            id: 'ws_2',
+            status: 'completed',
+            action: { type: 'open_page', url: 'https://a.example/' },
+          },
+          {
+            type: 'web_search_call',
+            id: 'ws_3',
+            status: 'failed',
+            action: { type: 'find_in_page', pattern: 'x', url: 'https://a.example/' },
+          },
+          { type: 'web_search_call', id: 'ws_4', status: 'incomplete' },
+          {
+            type: 'web_search_call',
+            status: 'brand_new_status',
+            action: { type: 'brand_new_action' },
+          },
+          { type: 'web_search_call', id: 'ws_6' },
+          { type: 'message', id: 'msg', role: 'assistant', status: 'completed', content: [] },
+        ],
+      }),
+    );
+    expect(mapped.webSearchCalls).toBe(6);
+    expect(mapped.toolItems).toEqual([
+      {
+        itemId: 'ws_1',
+        position: 0,
+        type: 'web_search_call',
+        status: 'completed',
+        actionType: 'search',
+      },
+      {
+        itemId: 'ws_2',
+        position: 1,
+        type: 'web_search_call',
+        status: 'completed',
+        actionType: 'open_page',
+      },
+      {
+        itemId: 'ws_3',
+        position: 2,
+        type: 'web_search_call',
+        status: 'failed',
+        actionType: 'find_in_page',
+      },
+      {
+        itemId: 'ws_4',
+        position: 3,
+        type: 'web_search_call',
+        status: 'incomplete',
+        actionType: null,
+      },
+      {
+        itemId: null,
+        position: 4,
+        type: 'web_search_call',
+        status: 'brand_new_status',
+        actionType: 'brand_new_action',
+      },
+      { itemId: 'ws_6', position: 5, type: 'web_search_call', status: null, actionType: null },
+    ]);
+    // Diagnostics never carry queries, URLs or patterns.
+    expect(JSON.stringify(mapped.toolItems)).not.toMatch(/secret query|https:|pattern/);
+  });
+});

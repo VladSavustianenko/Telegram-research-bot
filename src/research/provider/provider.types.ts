@@ -56,12 +56,35 @@ export interface EchoedBounds {
   webSearchTool: boolean;
 }
 
+/**
+ * Diagnostic metadata of one built-in tool output item, as observed in one
+ * snapshot. Values are reported as-is: unknown statuses or action types are
+ * kept verbatim and missing ones are null (never assumed "completed"/"search").
+ * No queries, URLs or page content are kept here.
+ */
+export interface ObservedToolItem {
+  /** Provider item ID; null when the provider omitted it. */
+  itemId: string | null;
+  /** Position in the snapshot's output list (identifies items without an ID). */
+  position: number;
+  /** Output item type, e.g. "web_search_call". */
+  type: string;
+  status: string | null;
+  actionType: string | null;
+}
+
 export interface ProviderSnapshot {
   id: string;
   status: ProviderStatus;
   model: string | null;
   textParts: ProviderTextPart[];
+  /**
+   * Number of web_search_call output items in this snapshot. An observation,
+   * not a count of executed or billable searches.
+   */
   webSearchCalls: number;
+  /** Per-item diagnostics for the web_search_call items in this snapshot. */
+  toolItems: ObservedToolItem[];
   sources: { url: string; title?: string }[];
   usage: ProviderUsage | null;
   incompleteReason: string | null;
