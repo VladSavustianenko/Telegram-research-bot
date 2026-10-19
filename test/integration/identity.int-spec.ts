@@ -246,12 +246,14 @@ describe('TRB-030 identity, invitations and authorization (fakes, real PostgreSQ
     });
 
     it('lets exactly one of two concurrent redeemers win', async () => {
+      // Two processes with their own connection pools, as in a deployment overlap.
+      const other = await start();
       for (let round = 0; round < 5; round += 1) {
         const token = await invite();
         const [first, second] = [5000 + round * 2, 5001 + round * 2];
         await Promise.all([
           h.post(privateMessage(`/start ${token}`, first)),
-          h.post(privateMessage(`/start ${token}`, second)),
+          other.post(privateMessage(`/start ${token}`, second)),
         ]);
         const created = await h.prisma.appUser.count({
           where: { telegramUserId: { in: [BigInt(first), BigInt(second)] } },

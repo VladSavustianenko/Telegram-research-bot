@@ -88,6 +88,22 @@ export function mayRedeemInvitation(user: UserAccessView | null, config: Env): b
 }
 
 /**
+ * Delivery of run-related messages (reports, explicit resends, run status
+ * notices), rechecked before each part with the current configuration. Returns
+ * the suppression code, or null. Replies that are not about a run (help,
+ * invitation-required, onboarding prompts) are not subject to this rule.
+ * Only account access counts: losing the administrator role does not hide the
+ * saved reports of a user who is still a member, and onboarding is not required.
+ */
+export function runDeliveryDenial(owner: UserAccessView | null, config: Env): string | null {
+  if (!owner) return 'OWNER_UNRESOLVED';
+  const access = accountAccess(owner, config);
+  if (access === 'SUSPENDED') return 'RECIPIENT_SUSPENDED';
+  if (access === 'NONE') return 'ACCESS_REVOKED';
+  return null;
+}
+
+/**
  * Execution-time recheck before a new provider submission. Returns the
  * cancellation code, or null when submission may proceed. Onboarding is an
  * admission gate only; it is not rechecked here.

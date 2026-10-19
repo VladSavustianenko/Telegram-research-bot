@@ -1,6 +1,6 @@
 # TRB-030: identity, invitations, onboarding and authorization
 
-Status: READY FOR REVIEW. Validated with fake providers, a recording Telegram sender and real PostgreSQL only; nothing here was exercised against the real Telegram API.
+Status: READY FOR REVIEW (review fixes for commit 6540e6a applied 2026-10-19: durable suppression, current access at delivery). Validated with fake providers, a recording Telegram sender and real PostgreSQL only; nothing here was exercised against the real Telegram API.
 
 ## Identity
 
@@ -130,7 +130,7 @@ All actions are idempotent under replay: redemption, invitation creation, time-z
 
 - **`research_run.user_id`** is the owner. A trigger requires it to match `requested_by_telegram_user_id` and forbids changing it once set.
 - **Scoped access.** `/result` looks up the run with `id AND user_id = <authenticated user>`. A foreign ID and a nonexistent ID produce the same reply ("Запуск не знайдено.") and no `RESEND` delivery. Administrators cannot read other users' results either.
-- **Delivery.** Deliveries are linked to runs. The delivery worker suppresses run-related deliveries whose owner is suspended or unresolved.
+- **Delivery.** Deliveries are linked to runs. Before each part of a run-related delivery, the delivery worker rechecks the owner's current account access (see [Delivery-time access](#delivery-time-access)).
 
 ## Suspension
 
@@ -138,27 +138,70 @@ All actions are idempotent under replay: redemption, invitation creation, time-z
 
 In one transaction, under the target's row lock:
 - status `SUSPENDED`, `suspended_at` set, `revision` incremented;
-- QUEUED runs become `CANCELLED / USER_SUSPENDED`. They were never submitted, so no provider request exists;
-- `PENDING` and `RETRYABLE_FAILURE` deliveries of the user's runs become `SUPPRESSED / RECIPIENT_SUSPENDED`;
+- every `QUEUED` or `RUNNING` run of the user gets a **durable decision**, `research_run.delivery_suppressed_at`;
+- `QUEUED` runs become `CANCELLED / USER_SUSPENDED`. They were never submitted, so no provider request exists;
+- every unfinished delivery of the user's runs (`PENDING`, `RETRYABLE_FAILURE` or `SENDING`) gets a **durable decision**, `delivery.suppressed_at`. Waiting ones become `SUPPRESSED / RECIPIENT_SUSPENDED`; one being sent keeps its state until the worker stops it before its next part;
 - a `USER_SUSPENDED` audit event with counts: cancelled runs, suppressed deliveries and running runs.
 
-Afterwards:
+### Durable suppression
+
+The decisions are stored on the affected run and delivery rows, not derived from the user's current status, and **nothing clears them**: reactivation, restarts and recovery leave them in place. A check constraint requires every `SUPPRESSED` delivery to carry its decision.
+
+| Affected work | Effect of the decision |
+|---|---|
+| Queued run | Cancelled; its acknowledgment is suppressed |
+| Running request | Polling requests provider cancellation (it checks the run's decision, so it also does after an early reactivation). Response ID, usage and telemetry are kept. Confirmed `cancelled`: `CANCELLED / USER_SUSPENDED`. `completed` with confirmed bounds: the report is stored (SUCCEEDED). No terminal answer: `UNCERTAIN / SUSPENDED_CANCEL_UNCONFIRMED`, which for a live run blocks live work until reconciliation |
+| Report or status message created later by that run | Created directly as `SUPPRESSED`, with its parts stored |
+| Waiting delivery | `SUPPRESSED` immediately |
+| Delivery being sent | The worker reads `suppressed_at` in the transaction that marks the next part `SENDING`, and finishes `SUPPRESSED`. Parts already `SENT` keep their Telegram message ID |
+| Delivery being sent when the worker dies | Lease recovery: a part that was in flight becomes `UNKNOWN` and the delivery `UNKNOWN`, never retried automatically. With no part in flight, the delivery becomes `SUPPRESSED` instead of `PENDING` |
+
+**Coordination with report creation.** Suspension first sets the run decision, then suppresses deliveries in a later statement. The worker's completion transaction locks the run row (fenced update), then reads the decision and creates the report delivery:
+- **Suspension first.** If the suspension updates the run first, the completion waits for its commit and then sees the decision.
+- **Completion first.** If the completion holds the row first, the suspension waits for its commit. The later delivery statement then sees, and suppresses, the new `PENDING` report.
+
+Either way no automatically deliverable report remains for the affected work. The integration test pauses the completion transaction while it holds the run row and makes a second process's suspension wait on it.
+
+### Reactivation and explicit resend
+
+`/admin reactivate <Telegram ID>` restores `ACTIVE` and appends `USER_REACTIVATED`. Cancelled runs and suppressed deliveries stay as they are: no backlog is delivered automatically (SPEC §2).
+- **Explicit resend.** The reactivated user may request `/result <run-id>` for their own run. It creates a **new** `RESEND` delivery from the stored report parts. The stored decisions do not apply to it, because they are attached to the earlier rows. The suppressed automatic delivery is not reopened, and the provider is not called.
+- **New research** admitted after reactivation is delivered normally.
+
+While suspended:
 - **Admission.** New research, `/result`, invitations and buttons are refused. Admission reads the user under the same row lock, so it is serialised with suspension.
 - **Execution recheck.** Before any new submission, the worker reads the owner `FOR SHARE` in the transaction that records `SUBMITTING`.
   - A suspended owner gets `CANCELLED / USER_SUSPENDED` with zero provider calls. The same applies to an unresolved owner (`OWNER_UNRESOLVED`) and an owner who lost access (`ACCESS_REVOKED`).
   - Either the suspension commits first, and the run is cancelled, or `SUBMITTING` commits first, and the request goes out.
-- **In-flight requests.** While polling, the worker checks the owner on every iteration. When the owner is suspended, it requests provider cancellation. The run keeps its response ID, usage and telemetry:
-  - provider confirms `cancelled`: `CANCELLED / USER_SUSPENDED`;
-  - provider returns `completed` with confirmed bounds: the report is **stored** (SUCCEEDED) but not delivered;
-  - cancellation fails or is not terminal: `UNCERTAIN / SUSPENDED_CANCEL_UNCONFIRMED`. For a live run, this blocks live work until reconciliation, as for any unresolved live UNCERTAIN run.
-- **Delivery.** Before each part, the delivery worker suppresses deliveries of runs whose owner is suspended.
 - **Preserved.** Saved results, provider evidence, tool telemetry and reconciliation records are kept.
-
-`/admin reactivate <Telegram ID>` restores `ACTIVE` and appends `USER_REACTIVATED`. Cancelled runs and suppressed deliveries stay as they are, so no backlog is delivered (SPEC §2).
 
 **Race boundaries** (documented, not eliminated):
 - **Submission.** A suspension committed just after `SUBMITTING` lets that one request reach the provider. Cancellation is requested on the next poll, about `OPENAI_POLL_INTERVAL_MS` later, and the request may still incur cost.
-- **Delivery.** A suspension committed between the delivery worker's check and the Telegram call can let one message part through. Later parts are suppressed.
+- **Delivery.** A part already marked `SENDING` before the suspension committed may still be delivered; it cannot be retracted. If the outcome is confirmed, the part is `SENT`; if it is ambiguous, `UNKNOWN`. No later part starts.
+
+**Legacy limitation.** Before migration `20261019120153_trb_030_durable_suppression`, suspension stored no per-run or per-delivery decision. The migration:
+- gives already `SUPPRESSED` deliveries a decision timestamp;
+- records the decision for the `QUEUED`/`RUNNING` runs and `SENDING` deliveries of users who are **suspended at migration time**.
+
+Work affected by an earlier suspension that was already reactivated left no evidence and cannot be reconstructed. Its waiting deliveries were already `SUPPRESSED` (terminal), but a report created later by a run that was in flight then is not covered.
+
+Operational handling: before applying the migration, check `audit_event` for `USER_REACTIVATED`. For each reactivated user, inspect their runs that completed after the suspension. The development database had no suspension events.
+
+## Delivery-time access
+
+Before each part of a **run-related** delivery (automatic report, explicit resend, run status notice), the delivery worker reloads the run's owner and applies `runDeliveryDenial` with the current configuration:
+- **Unresolved owner:** `OWNER_UNRESOLVED`.
+- **Suspended:** `RECIPIENT_SUSPENDED`.
+- **No account:** `ACCESS_REVOKED`. For example, an administrator removed from `ADMIN_TELEGRAM_IDS` who never redeemed an invitation; this holds even if the stored role is still `ADMIN`, because `isAdministrator` requires the current configuration.
+
+A denial ends the delivery `SUPPRESSED` with that code and a decision timestamp, so it is final even if access is restored later.
+
+Only account access counts:
+- A former administrator who redeemed an invitation is still a member and keeps receiving their own reports and resends.
+- Onboarding is not required.
+- The separate administrator-only rule for **new live research** (admission and submission) is unaffected.
+
+Replies that are not about a run (help, invitation-required, onboarding prompts, administrator replies, invitation links) are not subject to this rule.
 
 ## Research access before TRB-050
 
@@ -186,6 +229,8 @@ Afterwards:
   Operator resolution: invite that Telegram user (redemption links their runs) or add the ID to `ADMIN_TELEGRAM_IDS`. Do not assign owners manually.
 - **Preserved unchanged:** reports, delivery parts, tool telemetry, reconciliation audit and UNCERTAIN evidence. An unreconciled live UNCERTAIN run of an unowned identity still blocks live work.
 - **Administrators must onboard.** After the upgrade, existing administrators must confirm a time zone (`/start`) before using `/research` again.
+
+The follow-up migration `20261019120153_trb_030_durable_suppression` adds `research_run.delivery_suppressed_at` and `delivery.suppressed_at` (nullable; see [Durable suppression](#durable-suppression) for its handling of existing rows and its legacy limitation) and the check `delivery_suppressed_has_decision`.
 
 Verified against a database containing representative TRB-020 records (`test/integration/identity-migration.int-spec.ts`) and applied to the local development database (docs/VALIDATION.md).
 

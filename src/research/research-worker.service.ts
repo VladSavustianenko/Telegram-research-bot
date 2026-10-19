@@ -61,8 +61,6 @@ interface Execution {
   claim: Claim;
   provider: ResearchProvider;
   stored: StoredSnapshot;
-  /** Run owner; null for an unlinked TRB-020 run (never submitted). */
-  ownerId: string | null;
 }
 
 /** The lease was lost to another worker; this worker must stop touching the run. */
@@ -235,7 +233,7 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
   ): Promise<void> {
     const run = await this.prisma.researchRun.findUniqueOrThrow({ where: { id: claim.id } });
     const stored = run.requestSnapshot as unknown as StoredSnapshot;
-    const execution: Execution = { claim, provider, stored, ownerId: run.userId };
+    const execution: Execution = { claim, provider, stored };
 
     // Never switch providers silently (e.g. a run admitted as live must not get fake results).
     if (stored.config.providerKind !== provider.kind) {
@@ -432,13 +430,13 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
     return this.finishWithoutReport(execution, 'FAILED', 'DEADLINE_EXCEEDED', merged);
   }
 
+  /** The run's durable suspension decision, or a currently suspended owner. */
   private async ownerSuspended(execution: Execution): Promise<boolean> {
-    if (!execution.ownerId) return false;
-    const owner = await this.prisma.appUser.findUnique({
-      where: { id: execution.ownerId },
-      select: { status: true },
+    const run = await this.prisma.researchRun.findUnique({
+      where: { id: execution.claim.id },
+      select: { deliverySuppressedAt: true, user: { select: { status: true } } },
     });
-    return owner?.status === 'SUSPENDED';
+    return run?.deliverySuppressedAt != null || run?.user?.status === 'SUSPENDED';
   }
 
   /**
@@ -526,7 +524,15 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
         leaseUntil: null,
       });
       // Report is committed together with its delivery; sending happens afterwards.
-      await createDelivery(tx, { kind: 'REPORT', chatId: run.chatId, runId: claim.id, parts });
+      // The suspension decision is read after this transaction locked the run row,
+      // so a concurrent suspension is either seen here or sees this delivery.
+      await createDelivery(tx, {
+        kind: 'REPORT',
+        chatId: run.chatId,
+        runId: claim.id,
+        parts,
+        suppressed: run.deliverySuppressedAt !== null,
+      });
     });
     this.logger.log({
       message: 'Research succeeded',
@@ -562,7 +568,14 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
           : state === 'CANCELLED'
             ? messages.runCancelled(claim.id, failureCode)
             : messages.runFailed(claim.id, failureCode);
-      await createStatusDelivery(tx, run.chatId, text, claim.id);
+      await createStatusDelivery(
+        tx,
+        run.chatId,
+        text,
+        claim.id,
+        undefined,
+        run.deliverySuppressedAt !== null,
+      );
     });
     const log = { message: `Research ${state.toLowerCase()}`, runId: claim.id, failureCode };
     if (state === 'UNCERTAIN' && !simulated) {
@@ -602,12 +615,12 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
     });
   }
 
-  /** Fenced update; returns the run's destination for follow-up writes. */
+  /** Fenced update; returns the run's destination and suspension decision for follow-up writes. */
   private async fenced(
     client: Tx | PrismaService,
     claim: Claim,
     data: Prisma.ResearchRunUpdateManyMutationInput,
-  ): Promise<{ chatId: bigint }> {
+  ): Promise<{ chatId: bigint; deliverySuppressedAt: Date | null }> {
     const result = await client.researchRun.updateMany({
       where: { id: claim.id, fencingToken: claim.fencingToken, state: 'RUNNING' },
       data,
@@ -615,7 +628,7 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
     if (result.count !== 1) throw new StaleLeaseError();
     return client.researchRun.findUniqueOrThrow({
       where: { id: claim.id },
-      select: { chatId: true },
+      select: { chatId: true, deliverySuppressedAt: true },
     });
   }
 

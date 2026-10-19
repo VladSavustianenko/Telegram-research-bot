@@ -316,6 +316,57 @@ Not run:
 - **CI on a hosted runner.**
 - **Live Telegram check of buttons, deep links and callback acknowledgements.** It needs owner authorization and real messages; `answerCallbackQuery` and `reply_markup` are verified only against the grammY types.
 
+### TRB-030 review fixes (2026-10-19, reviewed commit 6540e6a)
+
+Finding 1: reactivation could release accumulated reports. Finding 2: revoked account access did not block report delivery. Mock validation only: fake provider, recording Telegram sender, real disposable PostgreSQL. No OpenAI request, no Telegram message, no deployment. Behaviour: docs/IDENTITY.md, "Durable suppression", "Reactivation and explicit resend" and "Delivery-time access".
+
+Root causes:
+1. **Finding 1.** Suppression existed only as the state of deliveries that were waiting at suspension time, plus a check of the owner's *current* status at send time.
+   - A report created later by in-flight research, or the remaining parts of a delivery already `SENDING`, were not marked.
+   - After reactivation the status check passed again.
+   - The fix stores a durable decision on runs (`delivery_suppressed_at`) and deliveries (`suppressed_at`). Reactivation never clears it. Report creation reads it under the run's row lock; the delivery worker reads it when it marks each part `SENDING`, and when it recovers expired leases.
+2. **Finding 2.** The delivery worker checked only `user_id IS NULL` and `status = SUSPENDED`. It now applies the centralized `runDeliveryDenial` (account access with the current configuration) before each run-related part.
+
+| Check | Command | Result |
+|---|---|---|
+| Reproduction before fix | new `test/integration/identity-delivery.int-spec.ts` run with `src/` from 6540e6a (`git stash`) | 7 failed, 1 passed. The passing test checks preserved behaviour: an invited former administrator still receives their reports |
+| Static checks | `npm run format:check`, `npm run lint`, `npm run typecheck`, `npm run prisma:validate` | Pass |
+| Unit tests | `npm test` | 149 passed (11 files) |
+| Integration tests | `npm run test:integration` | 90 passed (9 files); 0 disposable databases left |
+| Build | `npm run build` | Pass |
+| Migration, dev DB | `prisma migrate deploy`, `migrate status`, `migrate diff --exit-code` | `20261019120153_trb_030_durable_suppression` applied without reset; "up to date"; "No difference detected" (exit 0). The dev DB had no suspended users, no suspension events and no `SUPPRESSED` deliveries, so the backfill changed no rows |
+
+Regression scenarios (`identity-delivery.int-spec.ts`; synchronisation through provider and sender hooks and PostgreSQL lock waits, no sleeps):
+- **Finding 1.**
+  - **Cancellation returns completed.** The owner is suspended during an in-flight run, and the cancellation answer is `completed`. The report, response ID and usage are stored. After reactivation the REPORT stays `SUPPRESSED`, and zero reports are sent.
+  - **Explicit resend.** `/result` after reactivation sends exactly the stored parts as a new `RESEND`; the REPORT stays `SUPPRESSED` and there is no new submission.
+  - **New research.** Research admitted after reactivation is delivered (`SENT`).
+  - **Completion seen by the poll.** Suspended, then the poll sees completion and the owner is reactivated before delivery: the report is suppressed.
+  - **Multipart send in flight.** Suspension and reactivation happen while Telegram handles part 1. Part 1 stays `SENT` with its message ID; the remaining parts stay `PENDING`, the delivery becomes `SUPPRESSED`, and one report part is sent in total.
+  - **Restart.** One delivery is between parts and another has part 0 `SENDING`; suspension, then reactivation; leases expire and a new application instance recovers. The first becomes `SUPPRESSED` with its `SENT` part kept. The second becomes `UNKNOWN` with its part `UNKNOWN`, never retried. Zero report sends.
+  - **Concurrent suspension and report creation.**
+    - An external transaction holds the report's unique slot, so the worker's completion transaction pauses while holding the run row.
+    - A second application instance's suspension waits on that row; two lock waiters are observed in `pg_stat_activity`.
+    - Then the slot is released. The report is `SUPPRESSED` after reactivation and nothing is sent.
+- **Finding 2.**
+  - **No invitation.** A former administrator without an invitation, with configuration excluding them: the pending REPORT, the queued RESEND and three run-related status messages all become `SUPPRESSED / ACCESS_REVOKED`, and zero messages are sent. The invitation-required reply to `/start` is still sent.
+  - **Stale role.** The same with the stored role reset to `ADMIN`: nothing sent.
+  - **Invited former administrator.** Becomes MEMBER and receives the report and the resend.
+  - **Existing protections.** Unresolved-owner and suspended-owner tests in `identity.int-spec.ts` and `identity-migration.int-spec.ts` still pass.
+- **Migration** (`identity-migration.int-spec.ts`).
+  - The TRB-020 → TRB-030 test now applies all later migrations; its rows are unchanged.
+  - New backfill test on a database at the first TRB-030 migration: the decision is recorded only for a currently suspended user's running run and `SENDING` delivery. An already `SUPPRESSED` delivery gets its timestamp. An active user's work is untouched, no state changes, and clearing the decision of a `SUPPRESSED` delivery violates `delivery_suppressed_has_decision`.
+- **Unit.** `runDeliveryDenial`: unresolved, suspended, revoked (stale role or not), an invited former administrator, an administrator, and onboarding not required.
+
+Also found while testing:
+- **Request timing.** supertest sends a request only when it is awaited, so the race test starts it explicitly.
+- **Shared pool.** In one application instance, a second interactive transaction did not reach PostgreSQL while the first was waiting on a lock. Both pool connections were checked out, but only one appeared in `pg_stat_activity`. The race test therefore suspends through a second instance, and the concurrent-redemption test in `identity.int-spec.ts` now uses two instances. The cause inside Prisma or the adapter was not investigated. Correctness does not depend on it, but an earlier single-instance concurrency test may have been serialised in the application rather than in PostgreSQL.
+
+Remaining limitations:
+- **External send race.** A part already marked `SENDING`, and handed to Telegram, may be delivered after a suspension; it is not retracted. Its outcome is recorded as `SENT` or `UNKNOWN`.
+- **Earlier suspensions.** Suspensions that were already reactivated before the migration left no per-work evidence and are not reconstructed (docs/IDENTITY.md, "Legacy limitation").
+- **Not run:** Docker smoke (Dockerfile and dependencies unchanged), CI, and live Telegram.
+
 ## Release checklist
 
 - Exact model/tool compatibility verified in official docs and an authorized sample.

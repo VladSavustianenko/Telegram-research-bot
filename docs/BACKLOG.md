@@ -32,7 +32,7 @@ Implement single-use invitations, admin bootstrap, user onboarding, zone confirm
 
 Acceptance: expired/replayed invitations fail; two concurrent redemptions yield one winner; foreign callback IDs cannot expose content or mutate records; non-admin access to admin actions fails; group updates create no research; duplicate Telegram updates do not duplicate actions.
 
-Status: READY FOR REVIEW (2026-10-19). Mock validation only: fake provider, recording Telegram sender, real PostgreSQL; no live Telegram or OpenAI check. Behaviour: docs/IDENTITY.md. Evidence: docs/VALIDATION.md, "TRB-030 evidence". Live research remains administrator-only until TRB-050 is accepted.
+Status: READY FOR REVIEW (2026-10-19; review fixes for commit 6540e6a applied 2026-10-19). Mock validation only: fake provider, recording Telegram sender, real PostgreSQL; no live Telegram or OpenAI check. Behaviour: docs/IDENTITY.md. Evidence: docs/VALIDATION.md, "TRB-030 evidence" and "TRB-030 review fixes". Live research remains administrator-only until TRB-050 is accepted.
 
 ## TRB-040 — Task CRUD and durable dialogs
 

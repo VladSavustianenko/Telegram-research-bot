@@ -5,6 +5,7 @@ import {
   adminOperationDenial,
   isAdministrator,
   mayRedeemInvitation,
+  runDeliveryDenial,
   researchAdmissionDenial,
   submissionDenial,
   userOperationDenial,
@@ -82,6 +83,22 @@ describe('authorization rules', () => {
     );
     expect(mayRedeemInvitation(user({ status: 'SUSPENDED', invitedAt: null }), config)).toBe(false);
     expect(mayRedeemInvitation(admin(), config)).toBe(false);
+  });
+
+  it('applies current account access to run-related delivery', () => {
+    expect(runDeliveryDenial(null, config)).toBe('OWNER_UNRESOLVED');
+    expect(runDeliveryDenial(user({ status: 'SUSPENDED' }), config)).toBe('RECIPIENT_SUSPENDED');
+    // Removed from ADMIN_TELEGRAM_IDS without an invitation, stored role stale or not.
+    expect(runDeliveryDenial(admin({ telegramUserId: 3003n }), config)).toBe('ACCESS_REVOKED');
+    expect(runDeliveryDenial(user({ telegramUserId: 3003n, invitedAt: null }), config)).toBe(
+      'ACCESS_REVOKED',
+    );
+    // A former administrator who is an invited member keeps their saved reports.
+    expect(
+      runDeliveryDenial(admin({ telegramUserId: 3003n, invitedAt: new Date() }), config),
+    ).toBeNull();
+    expect(runDeliveryDenial(admin(), config)).toBeNull();
+    expect(runDeliveryDenial(user({ onboardingState: 'AWAITING_TIME_ZONE' }), config)).toBeNull();
   });
 
   it('rechecks eligibility before submission', () => {

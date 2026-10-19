@@ -13,6 +13,7 @@ import { WorkerLoop } from '../common/worker-loop';
 import { APP_CONFIG } from '../config/config.module';
 import type { Env } from '../config/env.schema';
 import { PrismaService } from '../database/prisma.service';
+import { runDeliveryDenial } from '../identity/authorization';
 import {
   INVITATION_TOKEN_PLACEHOLDER,
   deriveInvitationToken,
@@ -47,9 +48,13 @@ class StaleDeliveryLease extends Error {}
  * - Telegram error responses are definite (retry with backoff or give up).
  * - Network failures/timeouts, and crashes while SENDING, make the part
  *   UNKNOWN: no automatic resend; the user can request an explicit /result.
- * - Before each part, a delivery about a run whose owner is suspended, or not
- *   resolved (an unlinked TRB-020 run), becomes SUPPRESSED. A suspension
- *   committed after that check can let one part through.
+ * - Before each part of a run-related delivery, the owner's current account
+ *   access is rechecked (runDeliveryDenial, current configuration): suspended,
+ *   revoked or unresolved owners get SUPPRESSED.
+ * - A durable suppression decision (delivery.suppressed_at, set by suspension)
+ *   is checked in the transaction that marks the next part SENDING, so no part
+ *   starts after the decision commits. The part already handed to Telegram may
+ *   complete; it keeps its acknowledgement (SENT) or becomes UNKNOWN.
  * - INVITATION deliveries store a placeholder; the token is derived just before sending.
  */
 @Injectable()
@@ -115,9 +120,10 @@ export class DeliveryWorker implements OnApplicationBootstrap, OnModuleDestroy {
   /** A worker died while SENDING: any in-flight part has an unknown outcome. */
   private async recoverExpired(): Promise<void> {
     await this.prisma.$transaction(async (tx) => {
-      const expired = await tx.$queryRaw<{ id: string }[]>`
-        SELECT id FROM delivery WHERE state = 'SENDING' AND lease_until < now() FOR UPDATE SKIP LOCKED`;
-      for (const { id } of expired) {
+      const expired = await tx.$queryRaw<{ id: string; suppressedAt: Date | null }[]>`
+        SELECT id, suppressed_at AS "suppressedAt" FROM delivery
+         WHERE state = 'SENDING' AND lease_until < now() FOR UPDATE SKIP LOCKED`;
+      for (const { id, suppressedAt } of expired) {
         const unknown = await tx.deliveryPart.updateMany({
           where: { deliveryId: id, state: 'SENDING' },
           data: { state: 'UNKNOWN' },
@@ -125,8 +131,15 @@ export class DeliveryWorker implements OnApplicationBootstrap, OnModuleDestroy {
         await tx.delivery.update({
           where: { id },
           data: {
-            state: unknown.count > 0 ? 'UNKNOWN' : 'PENDING',
-            lastErrorCode: unknown.count > 0 ? 'INTERRUPTED_WHILE_SENDING' : null,
+            // An ambiguous part stays UNKNOWN (never retried); otherwise a suppression
+            // decision taken while it was being sent makes it final.
+            state: unknown.count > 0 ? 'UNKNOWN' : suppressedAt ? 'SUPPRESSED' : 'PENDING',
+            lastErrorCode:
+              unknown.count > 0
+                ? 'INTERRUPTED_WHILE_SENDING'
+                : suppressedAt
+                  ? 'RECIPIENT_SUSPENDED'
+                  : null,
             leaseOwner: null,
             leaseUntil: null,
             fencingToken: { increment: 1 },
@@ -155,15 +168,22 @@ export class DeliveryWorker implements OnApplicationBootstrap, OnModuleDestroy {
           'PART_NOT_SENDABLE',
         );
       }
-      const ineligible = await this.ineligibleOwner(claim);
-      if (ineligible) {
-        this.logger.log({ message: 'Delivery suppressed', deliveryId: claim.id, code: ineligible });
-        return this.finish(claim, 'SUPPRESSED', ineligible);
+      const denial = await this.ownerDenial(claim);
+      if (denial) {
+        this.logger.log({ message: 'Delivery suppressed', deliveryId: claim.id, code: denial });
+        return this.finish(claim, 'SUPPRESSED', denial, true);
       }
       const html = await this.payload(claim, part.html);
       if (html === null)
         return this.finish(claim, 'PERMANENT_FAILURE', 'INVITATION_TOKEN_UNAVAILABLE');
-      await this.fencedPart(claim, part.ordinal, { state: 'SENDING' });
+      if (!(await this.beginPart(claim, part.ordinal))) {
+        this.logger.log({
+          message: 'Delivery suppressed',
+          deliveryId: claim.id,
+          code: 'RECIPIENT_SUSPENDED',
+        });
+        return this.finish(claim, 'SUPPRESSED', 'RECIPIENT_SUSPENDED');
+      }
 
       let messageId: number;
       try {
@@ -224,26 +244,57 @@ export class DeliveryWorker implements OnApplicationBootstrap, OnModuleDestroy {
     claim: Claim,
     state: 'SENT' | 'UNKNOWN' | 'PERMANENT_FAILURE' | 'SUPPRESSED',
     code: string | null,
+    /** Records a new suppression decision (an existing one is kept). */
+    newDecision = false,
   ): Promise<void> {
     const result = await this.prisma.delivery.updateMany({
       where: { id: claim.id, fencingToken: claim.fencingToken, state: 'SENDING' },
-      data: { state, lastErrorCode: code, leaseOwner: null, leaseUntil: null },
+      data: {
+        state,
+        lastErrorCode: code,
+        leaseOwner: null,
+        leaseUntil: null,
+        ...(newDecision ? { suppressedAt: new Date() } : {}),
+      },
     });
     if (result.count !== 1) throw new StaleDeliveryLease();
   }
 
-  /** Suppression code for a run-related delivery whose owner may not receive it, else null. */
-  private async ineligibleOwner(claim: Claim): Promise<string | null> {
-    const rows = await this.prisma.$queryRaw<{ userId: string | null; status: string | null }[]>`
-      SELECT r.user_id AS "userId", u.status::text AS status
-        FROM delivery d
-        JOIN research_run r ON r.id = d.run_id
-        LEFT JOIN app_user u ON u.id = r.user_id
-       WHERE d.id = ${claim.id}::uuid`;
-    const owner = rows[0];
-    if (!owner) return null; // not about a run (replies, invitations)
-    if (owner.userId === null) return 'OWNER_UNRESOLVED';
-    return owner.status === 'SUSPENDED' ? 'RECIPIENT_SUSPENDED' : null;
+  /**
+   * Suppression code for a run-related delivery whose owner may not receive it
+   * now (centralized account rules, current configuration), else null.
+   * Replies that are not about a run are not checked.
+   */
+  private async ownerDenial(claim: Claim): Promise<string | null> {
+    const delivery = await this.prisma.delivery.findUnique({
+      where: { id: claim.id },
+      select: { run: { select: { user: true } } },
+    });
+    if (!delivery?.run) return null;
+    return runDeliveryDenial(delivery.run.user, this.config);
+  }
+
+  /**
+   * Marks the next part SENDING unless a suppression decision exists. The lease
+   * row is locked by the same statement that reads the decision, so a
+   * concurrent suspension either commits first (nothing more is sent) or waits
+   * until this part is SENDING (the documented one-part race).
+   */
+  private async beginPart(claim: Claim, ordinal: number): Promise<boolean> {
+    return this.prisma.$transaction(async (tx) => {
+      const rows = await tx.$queryRaw<{ suppressedAt: Date | null }[]>`
+        UPDATE delivery SET lease_until = now() + ${DELIVERY_LEASE_SECONDS} * interval '1 second'
+         WHERE id = ${claim.id}::uuid AND fencing_token = ${claim.fencingToken} AND state = 'SENDING'
+        RETURNING suppressed_at AS "suppressedAt"`;
+      const lease = rows[0];
+      if (!lease) throw new StaleDeliveryLease();
+      if (lease.suppressedAt) return false;
+      await tx.deliveryPart.update({
+        where: { deliveryId_ordinal: { deliveryId: claim.id, ordinal } },
+        data: { state: 'SENDING' },
+      });
+      return true;
+    });
   }
 
   /**

@@ -84,7 +84,13 @@ const SNAPSHOT_QUERIES = {
 };
 
 /** Columns added by TRB-030; removed before comparing with pre-migration rows. */
-const NEW_COLUMNS = ['user_id', 'invitation_id', 'reply_markup'];
+const NEW_COLUMNS = [
+  'user_id',
+  'invitation_id',
+  'reply_markup',
+  'suppressed_at',
+  'delivery_suppressed_at',
+];
 
 async function snapshotTables(client: Client): Promise<Record<string, unknown[]>> {
   const result: Record<string, unknown[]> = {};
@@ -116,13 +122,17 @@ describe('TRB-030 migration on a database with TRB-020 records', () => {
     const migrations = readdirSync(MIGRATIONS)
       .filter((name) => /^\d{14}_/.test(name))
       .sort();
-    expect(migrations.at(-1)).toBe(TRB_030);
-    for (const name of migrations.slice(0, -1)) {
+    // Everything before TRB-030, then the TRB-020 records, then TRB-030 and later.
+    const firstTrb030 = migrations.indexOf(TRB_030);
+    expect(firstTrb030).toBeGreaterThan(0);
+    for (const name of migrations.slice(0, firstTrb030)) {
       await client.query(readFileSync(join(MIGRATIONS, name, 'migration.sql'), 'utf8'));
     }
     await client.query(TRB_020_RECORDS);
     before = await snapshotTables(client);
-    await client.query(readFileSync(join(MIGRATIONS, TRB_030, 'migration.sql'), 'utf8'));
+    for (const name of migrations.slice(firstTrb030)) {
+      await client.query(readFileSync(join(MIGRATIONS, name, 'migration.sql'), 'utf8'));
+    }
   });
 
   afterAll(async () => {
@@ -225,5 +235,81 @@ describe('TRB-030 migration on a database with TRB-020 records', () => {
     ).toEqual([R3, R4, R5]);
     expect(await h.prisma.auditEvent.count({ where: { kind: 'INVITATION_REDEEMED' } })).toBe(1);
     expect(h.provider.calls.submit).toBe(0);
+  });
+});
+
+describe('TRB-030 durable-suppression migration on a database with suspended users', () => {
+  const serverUrl = new URL(inject('databaseUrl'));
+  const database = disposableDatabaseName();
+  const databaseUrl = withDatabase(serverUrl, database);
+  let client: Client;
+
+  beforeAll(async () => {
+    const admin = new Client({ connectionString: withDatabase(serverUrl, 'postgres') });
+    await admin.connect();
+    await admin.query(`CREATE DATABASE "${database}"`);
+    await admin.end();
+    client = new Client({ connectionString: databaseUrl });
+    await client.connect();
+    const migrations = readdirSync(MIGRATIONS)
+      .filter((name) => /^\d{14}_/.test(name))
+      .sort();
+    const suppression = migrations.findIndex((name) =>
+      name.endsWith('_trb_030_durable_suppression'),
+    );
+    expect(suppression).toBeGreaterThan(migrations.indexOf(TRB_030));
+    for (const name of migrations.slice(0, suppression)) {
+      await client.query(readFileSync(join(MIGRATIONS, name, 'migration.sql'), 'utf8'));
+    }
+    // A suspended member with a running run (one delivery being sent) and an
+    // already-suppressed delivery; an active member with a queued run.
+    await client.query(`
+      INSERT INTO app_user (id, telegram_user_id, private_chat_id, role, status, onboarding_state, time_zone,
+                            invited_at, onboarded_at, suspended_at, updated_at) VALUES
+        ('00000000-0000-4000-8000-0000000000b1', 3003, 3003, 'MEMBER', 'SUSPENDED', 'COMPLETED', 'Europe/Kyiv',
+         now(), now(), now(), now()),
+        ('00000000-0000-4000-8000-0000000000b2', 3004, 3004, 'MEMBER', 'ACTIVE', 'COMPLETED', 'Europe/Kyiv',
+         now(), now(), NULL, now());
+      INSERT INTO research_run (id, user_id, requested_by_telegram_user_id, chat_id, source_update_id, state, prompt,
+                                provider_kind, request_snapshot, updated_at) VALUES
+        ('${R1}', '00000000-0000-4000-8000-0000000000b1', 3003, 3003, 1, 'RUNNING', 'p', 'fake', '{}', now()),
+        ('${R2}', '00000000-0000-4000-8000-0000000000b2', 3004, 3004, 2, 'QUEUED', 'p', 'fake', '{}', now());
+      INSERT INTO delivery (id, run_id, kind, chat_id, state, last_error_code, updated_at) VALUES
+        ('${REPORT}', '${R1}', 'STATUS', 3003, 'SENDING', NULL, now()),
+        ('${RESEND}', '${R1}', 'STATUS', 3003, 'SUPPRESSED', 'RECIPIENT_SUSPENDED', now()),
+        ('${REPORT_R4}', '${R2}', 'STATUS', 3004, 'SENDING', NULL, now());
+    `);
+    for (const name of migrations.slice(suppression)) {
+      await client.query(readFileSync(join(MIGRATIONS, name, 'migration.sql'), 'utf8'));
+    }
+  });
+
+  afterAll(async () => {
+    await client?.end();
+    const admin = new Client({ connectionString: withDatabase(serverUrl, 'postgres') });
+    await admin.connect();
+    await admin.query(`DROP DATABASE IF EXISTS "${database}" WITH (FORCE)`);
+    await admin.end();
+  });
+
+  it('records the decision for currently suspended users only, without changing states', async () => {
+    const runs = await client.query(
+      'SELECT id, state, delivery_suppressed_at IS NOT NULL AS decided FROM research_run ORDER BY id',
+    );
+    expect(runs.rows).toEqual([
+      { id: R1, state: 'RUNNING', decided: true },
+      { id: R2, state: 'QUEUED', decided: false },
+    ]);
+    const deliveries = await client.query(
+      'SELECT id, state, suppressed_at IS NOT NULL AS decided FROM delivery ORDER BY id',
+    );
+    expect(deliveries.rows).toEqual([
+      { id: REPORT, state: 'SENDING', decided: true },
+      { id: RESEND, state: 'SUPPRESSED', decided: true },
+      { id: REPORT_R4, state: 'SENDING', decided: false },
+    ]);
+    await expect(
+      client.query(`UPDATE delivery SET suppressed_at = NULL WHERE id = '${RESEND}'`),
+    ).rejects.toThrow(/delivery_suppressed_has_decision/);
   });
 });

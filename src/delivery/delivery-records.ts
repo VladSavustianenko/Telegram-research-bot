@@ -20,6 +20,8 @@ export async function createDelivery(
     runId?: string;
     invitationId?: string;
     parts: readonly (string | DeliveryPartInput)[];
+    /** The run's durable suspension decision: the delivery is stored but never sent automatically. */
+    suppressed?: boolean;
   },
 ): Promise<string> {
   const delivery = await tx.delivery.create({
@@ -28,6 +30,9 @@ export async function createDelivery(
       chatId: input.chatId,
       runId: input.runId ?? null,
       invitationId: input.invitationId ?? null,
+      ...(input.suppressed
+        ? { state: 'SUPPRESSED', suppressedAt: new Date(), lastErrorCode: 'RECIPIENT_SUSPENDED' }
+        : {}),
       parts: {
         create: input.parts.map((part, ordinal) => {
           const { html, replyMarkup } = typeof part === 'string' ? { html: part } : part;
@@ -54,11 +59,13 @@ export function createStatusDelivery(
   text: string,
   runId?: string,
   replyMarkup?: InlineKeyboard,
+  suppressed = false,
 ): Promise<string> {
   return createDelivery(tx, {
     kind: 'STATUS',
     chatId,
     parts: [{ html: escapeHtml(text), ...(replyMarkup ? { replyMarkup } : {}) }],
     ...(runId ? { runId } : {}),
+    suppressed,
   });
 }

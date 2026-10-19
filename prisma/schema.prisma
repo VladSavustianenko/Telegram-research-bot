@@ -119,6 +119,11 @@ model ResearchRun {
   /// state, failure code, response ID and usage as evidence.
   reconciledAt         DateTime?               @map("reconciled_at") @db.Timestamptz(3)
   reconciliation       ResearchReconciliation?
+  /// Durable suspension decision (TRB-030): set when the owner is suspended while the
+  /// run is queued or running. Automatic deliveries for this run are created
+  /// SUPPRESSED and a running request gets a cancellation request. Never cleared,
+  /// so reactivation does not release this run's results; /result still works.
+  deliverySuppressedAt DateTime?               @map("delivery_suppressed_at") @db.Timestamptz(3)
 
   createdAt  DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt  DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
@@ -169,6 +174,9 @@ model Delivery {
   leaseUntil    DateTime?      @map("lease_until") @db.Timestamptz(3)
   fencingToken  Int            @default(0) @map("fencing_token")
   lastErrorCode String?        @map("last_error_code")
+  /// Durable suppression decision: once set the delivery never sends another part
+  /// (a part already handed to Telegram may still complete). Never cleared.
+  suppressedAt  DateTime?      @map("suppressed_at") @db.Timestamptz(3)
   /// Set only for kind INVITATION.
   invitationId  String?        @map("invitation_id") @db.Uuid
   invitation    Invitation?    @relation(fields: [invitationId], references: [id], onDelete: Restrict)
