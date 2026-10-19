@@ -1,4 +1,4 @@
-import { Inject, Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
+import { Inject, Injectable, Logger, OnApplicationShutdown } from '@nestjs/common';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { Pool } from 'pg';
 import { APP_CONFIG } from '../config/config.module';
@@ -45,7 +45,7 @@ export interface PoolStats {
  * process can start (and report not-ready) while the database is unavailable.
  */
 @Injectable()
-export class PrismaService extends PrismaClient implements OnModuleDestroy {
+export class PrismaService extends PrismaClient implements OnApplicationShutdown {
   private readonly pool: Pool;
   private readonly shutdownTimeoutMs: number;
   private readonly logger: Logger;
@@ -71,11 +71,12 @@ export class PrismaService extends PrismaClient implements OnModuleDestroy {
   }
 
   /**
+   * Runs in the shutdown phase, after workers stopped in onModuleDestroy.
    * Waits for in-flight work to drain, but never longer than the shutdown
    * timeout: pool.end() waits for checked-out clients, which a stalled
    * operation would hold until its own timeout.
    */
-  async onModuleDestroy(): Promise<void> {
+  async onApplicationShutdown(): Promise<void> {
     const drained = (async () => {
       await this.$disconnect();
       await this.pool.end();

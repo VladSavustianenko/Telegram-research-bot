@@ -73,6 +73,40 @@ Finding 1 (test database guard bypass) and Finding 2 (readiness timeout left dat
 
 Limitations: a server that completes the handshake and then stops responding is bounded by the client-side read timeout (statement timeout + 5 s), not by the connect timeout. Different DNS names for the same remote server are not detected by the test guard.
 
+### TRB-020 evidence (2026-10-18, local Windows 11, Node 24.19.0, Docker 29.7.2)
+
+Mock validation only. No OpenAI request was made and no Telegram message was sent; all results come from fake provider and Telegram adapters, or from a container without internet access. Fake fixtures prove application behaviour, not search quality.
+
+| Check | Command | Result |
+|---|---|---|
+| Clean install | `npm ci` | Pass (498 packages; adds grammy 1.46.0, openai 7.27.0) |
+| Static checks | `npm run format:check`, `npm run lint`, `npm run typecheck`, `npm run prisma:validate` | Pass |
+| Unit tests | `npm test` | 110 passed (9 files) |
+| Integration tests | `npm run test:integration` against compose `postgres-test` | 34 passed (4 files, including TRB-010 suites); 0 disposable databases left |
+| Build | `npm run build` | Pass |
+| Docker smoke (fake mode) | image run with `NODE_ENV=production`, `TELEGRAM_MODE=webhook`, `RESEARCH_MODE=fake`, on an internal Docker network (database only, no internet) | Webhook with valid secret: 200 in 212 ms; same update_id again: 200, deduplicated (1 `telegram_update`, 1 run); wrong secret: 401. Run SUCCEEDED / FOUND / SUBMITTED, 2 tool calls. Both deliveries became UNKNOWN / TELEGRAM_NETWORK after one attempt, with no automatic resend. Token, webhook secret, prompt text and DB credentials absent from logs. `docker stop` exit 0 in 2.6 s |
+
+Scenarios covered by automated tests:
+- **Authorization:** non-admin, group chat, bot sender, chat/sender mismatch, admin ID in text from a non-admin.
+- **Webhook and ingress:** missing/wrong webhook secret (no rows written); duplicate and concurrent replay of one update creates one run.
+- **Acknowledgment:** sent while the provider call is still pending; the run is persisted (QUEUED) before the 200.
+- **Disabled research:** no run, no provider call. Live config without key, model or bounds fails validation without echoing secrets; `minimal` reasoning, a deadline over 540 s, and `RESEARCH_CONCURRENCY` ≠ 1 are rejected.
+- **Request contents:** `web_search` + `tool_choice: "required"`, `max_output_tokens`, `max_tool_calls`, `background`, `store: false`, no previous response or conversation, SDK `maxRetries: 0`.
+- **Unconfirmed bounds:** cancel + FAILED.
+- **Queue and concurrency:** queue bound under 6 concurrent requests with limit 2; one RUNNING run across two app instances.
+- **Report before delivery:** the report is checked in the DB at send time.
+- **Rendering:** escaping of injected HTML; unsafe or credentialed URLs dropped; citation links placed after claims; unannotated model links not clickable; long Cyrillic/emoji/ZWJ/flag reports split within 3900 UTF-16 units with balanced links and well-formed strings; truncation at 6 parts; deterministic output; all three dated fixtures (football, shopping, news) rendered.
+- **Classification:** missing citations, missing web search or missing outcome line → INCONCLUSIVE with warning.
+- **Failure paths:** incomplete output not delivered; deadline cancels; 4xx → FAILED and unknown → UNCERTAIN, both without retry.
+- **Delivery:** retry after 429 resumes from the failed part (part 1 not resent) with zero additional provider calls; ambiguous send → UNKNOWN, no automatic resend; explicit `/result` resends stored parts with no provider call; crash while SENDING → UNKNOWN; permanent 403 keeps the run SUCCEEDED; `/result` is owner-scoped.
+- **Recovery:** queued work after restart; NOT_SUBMITTED takeover; SUBMITTING → UNCERTAIN with zero provider calls; SUBMITTED resumes polling the saved ID; non-retrievable response → UNCERTAIN; a stale worker cannot finalize after takeover; provider change → FAILED.
+- **Logs:** no token, webhook secret, DB credentials or prompt text.
+
+Live sample: **PENDING**. Requires owner authorization (billed OpenAI request and real Telegram messages); procedure in docs/RESEARCH_SLICE.md. Not yet verified live:
+- that the selected model accepts `web_search` with `tool_choice: "required"`, `background: true`, `store: false` and `max_tool_calls`, and echoes `max_tool_calls`;
+- the unit of annotation offsets (the code handles code points and UTF-16);
+- actual source quality, latency and cost.
+
 ## Release checklist
 
 - Exact model/tool compatibility verified in official docs and an authorized sample.

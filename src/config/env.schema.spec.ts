@@ -104,3 +104,64 @@ describe('parseEnv', () => {
     ).not.toThrow();
   });
 });
+
+describe('feature modes (TRB-020)', () => {
+  it('keeps Telegram and research disabled by default', () => {
+    expect(parseEnv(base)).toMatchObject({ TELEGRAM_MODE: 'disabled', RESEARCH_MODE: 'disabled' });
+  });
+
+  it('requires credentials, model and finite bounds for live research, naming each variable', () => {
+    expect([...problemsOf({ ...base, RESEARCH_MODE: 'live' })].sort()).toEqual([
+      'OPENAI_API_KEY is required when RESEARCH_MODE=live',
+      'OPENAI_MODEL is required when RESEARCH_MODE=live',
+      'OUTPUT_TOKEN_LIMIT is required when RESEARCH_MODE=live',
+      'RUN_DEADLINE_SECONDS is required when RESEARCH_MODE=live',
+      'TOOL_CALL_LIMIT is required when RESEARCH_MODE=live',
+    ]);
+  });
+
+  it('rejects unenforceable or unsupported live settings without echoing secrets', () => {
+    const problems = problemsOf({
+      ...base,
+      RESEARCH_MODE: 'live',
+      OPENAI_API_KEY: 'sk-live-secret-value',
+      OPENAI_MODEL: 'm',
+      OUTPUT_TOKEN_LIMIT: '8',
+      TOOL_CALL_LIMIT: '2',
+      RUN_DEADLINE_SECONDS: '3600',
+      RESEARCH_CONCURRENCY: '2',
+    });
+    expect(problems.map((problem) => problem.split(' ')[0]).sort()).toEqual([
+      'OUTPUT_TOKEN_LIMIT',
+      'RESEARCH_CONCURRENCY',
+      'RUN_DEADLINE_SECONDS',
+    ]);
+    expect(problems.join('\n')).not.toContain('sk-live-secret-value');
+  });
+
+  it('requires token, administrators and a webhook secret for Telegram modes', () => {
+    expect([...problemsOf({ ...base, TELEGRAM_MODE: 'webhook' })].sort()).toEqual([
+      'ADMIN_TELEGRAM_IDS is required when TELEGRAM_MODE=webhook',
+      'TELEGRAM_BOT_TOKEN is required when TELEGRAM_MODE=webhook',
+      'TELEGRAM_WEBHOOK_SECRET is required when TELEGRAM_MODE=webhook',
+    ]);
+    expect(
+      problemsOf({
+        ...base,
+        NODE_ENV: 'production',
+        TELEGRAM_MODE: 'polling',
+        TELEGRAM_BOT_TOKEN: 't',
+        ADMIN_TELEGRAM_IDS: '1',
+      }),
+    ).toEqual(['TELEGRAM_MODE polling is for development only; use webhook in production']);
+  });
+
+  it('validates the research time zone', () => {
+    expect(problemsOf({ ...base, RESEARCH_TIME_ZONE: 'Mars/Base' })[0]).toMatch(
+      /^RESEARCH_TIME_ZONE /,
+    );
+    expect(parseEnv({ ...base, RESEARCH_TIME_ZONE: 'America/New_York' }).RESEARCH_TIME_ZONE).toBe(
+      'America/New_York',
+    );
+  });
+});

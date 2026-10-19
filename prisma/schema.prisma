@@ -15,3 +15,156 @@ generator client {
 datasource db {
   provider = "postgresql"
 }
+
+// ---------------------------------------------------------------------------
+// TRB-020 prototype slice: inbound update deduplication, research runs and
+// Telegram delivery progress. Constraints Prisma cannot express (partial
+// unique indexes) are added in the SQL migration.
+
+enum TelegramUpdateDisposition {
+  RUN_ACCEPTED
+  RESULT_REQUESTED
+  REPLIED
+  REJECTED
+  IGNORED
+}
+
+/// One row per Telegram update_id; inserting it is the deduplication step.
+/// Stores no message text.
+model TelegramUpdate {
+  updateId         BigInt                    @id @map("update_id")
+  senderTelegramId BigInt?                   @map("sender_telegram_id")
+  chatType         String?                   @map("chat_type")
+  disposition      TelegramUpdateDisposition
+  reason           String?
+  runId            String?                   @map("run_id") @db.Uuid
+  receivedAt       DateTime                  @default(now()) @map("received_at") @db.Timestamptz(3)
+
+  @@map("telegram_update")
+}
+
+enum ResearchRunState {
+  QUEUED
+  RUNNING
+  SUCCEEDED
+  FAILED
+  UNCERTAIN
+}
+
+/// Whether a (potentially billed) provider request may exist for this run.
+enum SubmissionState {
+  NOT_SUBMITTED
+  SUBMITTING
+  SUBMITTED
+}
+
+enum ResearchOutcome {
+  FOUND
+  PARTIAL
+  NO_MATCHES
+  INCONCLUSIVE
+}
+
+model ResearchRun {
+  id                        String           @id @default(uuid()) @db.Uuid
+  requestedByTelegramUserId BigInt           @map("requested_by_telegram_user_id")
+  /// Destination derived from the authorized private chat of the request.
+  chatId                    BigInt           @map("chat_id")
+  sourceUpdateId            BigInt           @unique @map("source_update_id")
+  state                     ResearchRunState @default(QUEUED)
+  prompt                    String
+  /// Provider kind fixed at admission ("fake" or "openai"); never switched silently.
+  providerKind              String           @map("provider_kind")
+  /// Immutable request snapshot: policy version, model, bounds, context dates.
+  requestSnapshot           Json             @map("request_snapshot")
+
+  submissionState    SubmissionState @default(NOT_SUBMITTED) @map("submission_state")
+  submittedAt        DateTime?       @map("submitted_at") @db.Timestamptz(3)
+  providerResponseId String?         @unique @map("provider_response_id")
+  providerStatus     String?         @map("provider_status")
+  providerModel      String?         @map("provider_model")
+
+  leaseOwner   String?   @map("lease_owner")
+  leaseUntil   DateTime? @map("lease_until") @db.Timestamptz(3)
+  fencingToken Int       @default(0) @map("fencing_token")
+
+  startedAt     DateTime?        @map("started_at") @db.Timestamptz(3)
+  completedAt   DateTime?        @map("completed_at") @db.Timestamptz(3)
+  outcome       ResearchOutcome?
+  /// Original provider text, before rendering.
+  reportText    String?          @map("report_text")
+  /// Provider url_citation annotations with resolved code-point offsets.
+  citations     Json?
+  /// URLs reported as consulted by web_search_call actions.
+  sources       Json?
+  warnings      Json?
+  usage         Json?
+  toolCallCount Int?             @map("tool_call_count")
+  failureCode   String?          @map("failure_code")
+
+  createdAt  DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt  DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deliveries Delivery[]
+
+  @@index([state, createdAt])
+  @@map("research_run")
+}
+
+enum DeliveryKind {
+  STATUS
+  REPORT
+  RESEND
+}
+
+enum DeliveryState {
+  PENDING
+  SENDING
+  SENT
+  RETRYABLE_FAILURE
+  UNKNOWN
+  PERMANENT_FAILURE
+}
+
+enum DeliveryPartState {
+  PENDING
+  SENDING
+  SENT
+  UNKNOWN
+  FAILED
+}
+
+model Delivery {
+  id            String        @id @default(uuid()) @db.Uuid
+  runId         String?       @map("run_id") @db.Uuid
+  run           ResearchRun?  @relation(fields: [runId], references: [id])
+  kind          DeliveryKind
+  chatId        BigInt        @map("chat_id")
+  state         DeliveryState @default(PENDING)
+  attempts      Int           @default(0)
+  nextAttemptAt DateTime      @default(now()) @map("next_attempt_at") @db.Timestamptz(3)
+  leaseOwner    String?       @map("lease_owner")
+  leaseUntil    DateTime?     @map("lease_until") @db.Timestamptz(3)
+  fencingToken  Int           @default(0) @map("fencing_token")
+  lastErrorCode String?       @map("last_error_code")
+  createdAt     DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+  parts         DeliveryPart[]
+
+  @@index([state, nextAttemptAt])
+  @@map("delivery")
+}
+
+/// Immutable rendered payload; only state and Telegram metadata change.
+model DeliveryPart {
+  deliveryId        String            @map("delivery_id") @db.Uuid
+  delivery          Delivery          @relation(fields: [deliveryId], references: [id])
+  ordinal           Int
+  html              String
+  contentHash       String            @map("content_hash")
+  state             DeliveryPartState @default(PENDING)
+  telegramMessageId BigInt?           @map("telegram_message_id")
+  sentAt            DateTime?         @map("sent_at") @db.Timestamptz(3)
+
+  @@id([deliveryId, ordinal])
+  @@map("delivery_part")
+}

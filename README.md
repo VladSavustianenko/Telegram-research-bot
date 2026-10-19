@@ -1,6 +1,6 @@
 # Telegram Research Bot — implementation brief
 
-Version: 1.0 · 2026-10-18 · Documentation package plus project foundation (TRB-010, awaiting owner review).
+Version: 1.0 · 2026-10-18 · Documentation package, project foundation (TRB-010, DONE) and first research-to-Telegram slice (TRB-020, ready for review; live sample pending).
 
 Build a private-beta, multi-user Telegram bot that runs user-authored research prompts manually or on a schedule, uses OpenAI web search, and delivers sourced results. Deploy one NestJS application and PostgreSQL on Railway.
 
@@ -42,7 +42,7 @@ curl localhost:3000/health/live    # 200 while the process runs
 curl localhost:3000/health/ready   # 200 when the database is reachable, otherwise 503
 ```
 
-Invalid or missing required configuration stops startup with a list of the offending variable names (values are never printed). Only `DATABASE_URL` is required for the foundation; Telegram, OpenAI and budget variables become required in the backlog items that use them.
+Invalid or missing required configuration stops startup with a list of the offending variable names (values are never printed). Only `DATABASE_URL` is always required. `TELEGRAM_MODE` and `RESEARCH_MODE` default to `disabled`; enabling either makes its variables required (see `.env.example`). `RESEARCH_MODE=live` additionally requires the OpenAI key, an explicitly selected model and finite bounds, and fails startup clearly when any is missing. USD budget variables are parsed but not enforced before TRB-050.
 
 Database operations are bounded by `DATABASE_CONNECT_TIMEOUT_MS` (connection and pool acquisition, default 5000), `DATABASE_STATEMENT_TIMEOUT_MS` (server-side statement timeout, default 30000; a client-side read timeout 5 s longer is the backstop) and `DATABASE_SHUTDOWN_TIMEOUT_MS` (maximum wait for in-flight work on shutdown, default 5000). Readiness shares one in-flight database probe and answers within 2 s.
 
@@ -57,6 +57,12 @@ Checks:
 | `docker build -t telegram-research-bot .` | Production image; `node dist/main.js` as non-root user |
 
 The dev database uses port 5434 so that it does not collide with a locally installed PostgreSQL on 5432. CI (`.github/workflows/ci.yml`) runs the same checks against a PostgreSQL service container, with no secrets and no paid external calls.
+
+### Research prototype (TRB-020)
+
+Administrator-only, private-chat commands: `/research <prompt>` (acknowledges with a run ID; the sourced report arrives separately) and `/result <run-id>` (resends the stored report, never researches again). Webhook at `POST /telegram/webhook` (secret header required) or development polling. Research and delivery run in database-backed in-process workers, one research request at a time.
+
+To try it without cost, use `RESEARCH_MODE=fake`: simulated, clearly labelled results from dated synthetic fixtures. Real Telegram delivery still needs a bot token and is an operator action. Behaviour, recovery policy, enforced and unenforced cost controls, deferred items and the authorized live-sample procedure are in [docs/RESEARCH_SLICE.md](docs/RESEARCH_SLICE.md).
 
 Prisma owns the `public` schema and its migrations in `prisma/migrations`; pg-boss will own a separate `pgboss` schema (TRB-060). The generated Prisma client is written to `src/generated/prisma` (not committed).
 

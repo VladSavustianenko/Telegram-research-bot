@@ -15,9 +15,34 @@ async function bootstrap(): Promise<void> {
 
   await app.listen(config.PORT, '0.0.0.0');
   logger.log(
-    { message: 'Application started', port: config.PORT, env: config.NODE_ENV },
+    {
+      message: 'Application started',
+      port: config.PORT,
+      env: config.NODE_ENV,
+      telegramMode: config.TELEGRAM_MODE,
+      researchMode: config.RESEARCH_MODE,
+      backgroundWorkers: config.BACKGROUND_WORKERS,
+    },
     'Bootstrap',
   );
+  if (config.RESEARCH_MODE === 'live') {
+    logger.warn(
+      {
+        message: 'LIVE research enabled: requests to OpenAI are billed',
+        model: config.OPENAI_MODEL,
+        outputTokenLimit: config.OUTPUT_TOKEN_LIMIT,
+        toolCallLimit: config.TOOL_CALL_LIMIT,
+        runDeadlineSeconds: config.RUN_DEADLINE_SECONDS,
+      },
+      'Bootstrap',
+    );
+  }
+  if (
+    config.RUN_MAX_ESTIMATED_COST_USD !== undefined ||
+    config.USER_MONTHLY_BUDGET_USD !== undefined
+  ) {
+    logger.warn({ message: 'USD budget settings are not enforced before TRB-050' }, 'Bootstrap');
+  }
 }
 
 bootstrap().catch((error: unknown) => {

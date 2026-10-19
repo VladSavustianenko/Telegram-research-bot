@@ -10,7 +10,7 @@ Create NestJS/TypeScript project, compatible pinned dependencies, Prisma setup, 
 
 Acceptance: clean install/build succeeds; documented local startup works; invalid required configuration fails clearly; production secrets are absent; unit and integration test DBs are isolated.
 
-Status: READY FOR REVIEW (2026-10-18; review fixes applied). Awaiting owner acceptance. Evidence: docs/VALIDATION.md, "TRB-010 evidence" and "TRB-010 review fixes".
+Status: DONE — accepted by the owner on 2026-10-18 after review of commit 548884f95f9818a894c065712696d0dcc7eb5085. Evidence: docs/VALIDATION.md, "TRB-010 evidence" and "TRB-010 review fixes".
 
 ## TRB-020 — First research-to-Telegram slice
 
@@ -19,6 +19,8 @@ Depends on: 010.
 Implement an administrator-only private-chat prototype command, OpenAI provider adapter with required web search, stored run/result and safe sourced delivery. Initially manual runs only. Fake provider is the default test fixture; paid live execution is an explicit operator action.
 
 Acceptance: one command can produce one persisted report with clickable claim-linked citations; processing does not block webhook acknowledgment; unsupported/missing provider config fails safely; no report is labelled live-tested without a live run. Compare fixtures and a small authorized sample before expanding integration.
+
+Status: DONE (2026-10-18). Authorized live sample: PENDING (procedure in docs/RESEARCH_SLICE.md). Not DONE until the owner accepts the implementation and the live sample is completed. Evidence: docs/VALIDATION.md, "TRB-020 evidence".
 
 ## TRB-030 — Invitations, identity and authorization
 
