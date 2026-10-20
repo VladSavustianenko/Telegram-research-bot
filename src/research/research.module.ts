@@ -1,6 +1,8 @@
 import { Module } from '@nestjs/common';
 import { APP_CONFIG } from '../config/config.module';
 import type { Env } from '../config/env.schema';
+import { QueueService } from '../queue/queue.service';
+import { OutboxDispatcher } from './outbox-dispatcher';
 import { FakeResearchProvider } from './provider/fake.provider';
 import { OpenAiResearchProvider } from './provider/openai.provider';
 import { RESEARCH_PROVIDER, type ResearchProvider } from './provider/provider.types';
@@ -17,11 +19,18 @@ export function createResearchProvider(config: Env): ResearchProvider | null {
   });
 }
 
+/**
+ * Research execution (docs/QUEUE.md): the pg-boss queue, the outbox
+ * dispatcher with its recovery sweep, and the worker that executes runs.
+ * pg-boss is the only path that leads to a provider submission.
+ */
 @Module({
   providers: [
+    QueueService,
+    OutboxDispatcher,
     ResearchWorker,
     { provide: RESEARCH_PROVIDER, inject: [APP_CONFIG], useFactory: createResearchProvider },
   ],
-  exports: [ResearchWorker],
+  exports: [ResearchWorker, QueueService, OutboxDispatcher],
 })
 export class ResearchModule {}

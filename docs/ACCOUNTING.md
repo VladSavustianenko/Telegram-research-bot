@@ -203,24 +203,26 @@ Provider-terminal reconciliation and financial resolution are separate:
 2. Read the project's usage or billing for it in the OpenAI dashboard. Dashboard ingestion is delayed and per-request attribution may be ambiguous; record what was actually seen.
 3. Run the command with that amount and a note.
 
-## Execution: outbox and the current worker
+## Execution: outbox and queue (TRB-060)
 
-Admission writes a `RESEARCH_EXECUTE` outbox event. Until TRB-060 connects pg-boss, the existing in-process DB-backed worker is the **only** execution path:
-- **Claim.** Its claim statement selects QUEUED runs that have a pending event and marks the event `dispatched_at` in the same statement (data-modifying CTE). No separate dispatcher exists, so nothing can submit twice.
-- **Cancellation.** Cancelling a queued run marks its event `cancelled_at`.
-- **Requeue.** The fail-closed "return to queue" path makes the event pending again.
-- **Unchanged:** restart recovery, leases and fencing, persisted response IDs and no automatic resubmission of unknown submissions.
-- **Before a live submission** the worker also requires the run's reservation to be RESERVED (`ACCOUNTING_MISSING` otherwise, with no provider call).
-
-**TRB-060 boundary.** A dispatcher will publish pending events to pg-boss with the run ID as job key and mark them dispatched. The worker will consume jobs, deduplicating in the database (claim is conditional on QUEUED), instead of scanning. The event's `dispatched_at` semantics change from "claimed by the worker" to "published".
+Admission writes a `RESEARCH_EXECUTE` outbox event, the run's admission evidence. Since TRB-060 the outbox dispatcher publishes due events to pg-boss in the same transaction that sets `dispatched_at`, which now means "published", not "claimed". A pg-boss job only asks a worker to inspect the run. Everything is described in [QUEUE.md](QUEUE.md); for accounting it means:
+- **Cancellation.** Cancelling a queued run marks its pending events `cancelled_at`. A job published earlier finds the run CANCELLED and does nothing.
+- **Before a live submission** the worker requires the current attempt's reservation to be RESERVED (`ACCOUNTING_MISSING` otherwise, with no provider call).
+- **Per-attempt reservations.** `budget_reservation` is unique per `(run_id, attempt_no)`.
+  - Attempt 1 is reserved at admission.
+  - Another provider submission is made only after an HTTP 429 refusal (the request was not accepted) and only when `RESEARCH_SUBMISSION_RETRY_LIMIT` allows it (default 0). It needs its own authorization (owner, live gate, both budgets) and a new reservation with the run's accepted pricing.
+  - The refused attempt's reservation is released. A settled or released reservation is never reused.
+- **Recovery moves nothing.** Polling, takeover after a crash and queue redelivery never create or release reservations. Queue expiry or job failure proves nothing about provider cost.
+- **Operator tools.** `settleRun` and `resolveRun` address the run's latest reservation unless an attempt is named. `ops:accounting --list` shows `attemptNo`.
 
 ## Lifecycle
 
-| Action | Queued runs | Running runs | Deliveries |
+| Action | Queued runs (also a run waiting for a retry: its current attempt's reservation is released) | Running runs | Deliveries |
 |---|---|---|---|
 | Task pause | CANCELLED `TASK_PAUSED`; reservation released; event cancelled | May finish and deliver (SPEC §4) | Unchanged |
 | Task delete | CANCELLED `TASK_DELETED`; released; event cancelled | Continue (no provider cancellation); results stored, delivery suppressed (`TASK_DELETED`) | Unfinished deliveries of the task's runs suppressed |
 | User suspension (TRB-030) | CANCELLED `USER_SUSPENDED`; released; event cancelled | Provider cancellation requested; accounting per outcome | Durable suppression (unchanged) |
+| Maximum queue wait (TRB-060) | CANCELLED `QUEUE_WAIT_EXCEEDED` after `RESEARCH_QUEUE_MAX_WAIT_SECONDS`; released; events cancelled; owner told | — | Status message (suppressed if the run's delivery is) |
 | Task edit | Not affected: runs keep their snapshot | — | — |
 
 ## `/usage`

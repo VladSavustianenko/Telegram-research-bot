@@ -153,8 +153,10 @@ describe('research-to-Telegram slice (fake provider and Telegram, real PostgreSQ
         }),
       );
       // The two losing ticks finish while the winner is still waiting at the provider.
-      await vi.waitFor(() => expect(settled).toBe(2));
-      expect(h.provider.calls.submit + second.provider.calls.submit).toBe(1);
+      await vi.waitFor(() => {
+        expect(settled).toBe(2);
+        expect(h.provider.calls.submit + second.provider.calls.submit).toBe(1);
+      });
       expect(await h.prisma.researchRun.count({ where: { state: 'RUNNING' } })).toBe(1);
       expect(await h.prisma.researchRun.count({ where: { state: 'QUEUED' } })).toBe(1);
 

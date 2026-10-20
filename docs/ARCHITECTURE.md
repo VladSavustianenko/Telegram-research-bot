@@ -38,6 +38,8 @@ Scheduler polls due rows (proposed interval: 30 seconds), locks bounded batches 
 
 The outbox dispatcher publishes to pg-boss with a stable run ID, then marks dispatched. A crash between these steps may publish again; consumers must deduplicate in the database. Never write a business record in Prisma and assume a separate queue send is atomic. Use the outbox even if pg-boss supports transactions unless the exact shared transaction adapter is proven.
 
+Implementation note (TRB-060, clarification): admission still writes only the outbox event. The dispatcher publishes it through pg-boss's own Prisma adapter inside the transaction that marks it dispatched, which an integration test verifies. The job ID is the outbox event ID, so repeated publication of one event is also a no-op. Consumers deduplicate in the database regardless. Details are in QUEUE.md.
+
 ## 4. Execution and recovery
 
 Run states: QUEUED → RUNNING → SUCCEEDED / FAILED / CANCELLED. Cancellation before dispatch releases unused reservation. Scheduled skips are ScheduleEvent records, not misleading successful runs. SUCCEEDED carries a content outcome; delivery state remains independent.

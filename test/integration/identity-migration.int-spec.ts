@@ -97,6 +97,9 @@ const NEW_COLUMNS = [
   'admitted_day',
   'admitted_month',
   'delivery_suppression_reason',
+  // TRB-060
+  'current_attempt_no',
+  'next_attempt_at',
 ];
 
 async function snapshotTables(client: Client): Promise<Record<string, unknown[]>> {
@@ -160,6 +163,53 @@ describe('TRB-030 migration on a database with TRB-020 records', () => {
     expect((await client.query('SELECT count(*)::int AS n FROM app_user')).rows[0]).toEqual({
       n: 0,
     });
+  });
+
+  it('backfills one attempt per submitted run from its own fields (TRB-060)', async () => {
+    const attempts = await client.query(
+      `SELECT run_id, attempt_no, submission_state::text, outcome::text, provider_response_id,
+              usage, tool_call_count, failure_code, submitted_at, completed_at
+         FROM research_attempt ORDER BY run_id`,
+    );
+    const at = (value: string) => new Date(value);
+    expect(attempts.rows).toEqual([
+      {
+        run_id: R1,
+        attempt_no: 1,
+        submission_state: 'SUBMITTED',
+        outcome: 'PROVIDER_TERMINAL',
+        provider_response_id: 'resp_live_1',
+        usage: { inputTokens: 23358 },
+        tool_call_count: 3,
+        failure_code: null,
+        submitted_at: at('2026-10-19T10:54:57Z'),
+        completed_at: at('2026-10-19T10:55:19Z'),
+      },
+      expect.objectContaining({
+        run_id: R2,
+        submission_state: 'SUBMITTING',
+        outcome: 'UNCERTAIN',
+        provider_response_id: null,
+        failure_code: 'SUBMISSION_INTERRUPTED',
+      }),
+      expect.objectContaining({
+        run_id: R3,
+        submission_state: 'SUBMITTED',
+        outcome: 'UNCERTAIN',
+        provider_response_id: 'resp_live_3',
+        failure_code: 'DEADLINE_CANCEL_UNCONFIRMED',
+      }),
+      expect.objectContaining({ run_id: R4, outcome: 'PROVIDER_TERMINAL', usage: null }),
+    ]);
+    // The queued run never reached submission: no attempt, no invented reservation or event.
+    for (const table of ['budget_reservation', 'outbox_event', 'usage_ledger']) {
+      expect((await client.query(`SELECT count(*)::int AS n FROM ${table}`)).rows[0]).toEqual({
+        n: 0,
+      });
+    }
+    expect(
+      (await client.query('SELECT DISTINCT current_attempt_no FROM research_run')).rows,
+    ).toEqual([{ current_attempt_no: 1 }]);
   });
 
   it('links runs by Telegram identity, fails closed for unknown owners and preserves evidence', async () => {

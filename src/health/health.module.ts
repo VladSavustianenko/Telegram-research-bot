@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { ResearchModule } from '../research/research.module';
 import { HealthController } from './health.controller';
 import {
   DEFAULT_READINESS_TIMEOUT_MS,
@@ -7,6 +8,7 @@ import {
 } from './health.service';
 
 @Module({
+  imports: [ResearchModule],
   controllers: [HealthController],
   providers: [
     HealthService,

@@ -32,9 +32,9 @@ The destination is always the authorized private chat of the request, stored on 
 
 ## Research execution
 
-`ResearchWorker` (in-process loop, database-backed):
+`ResearchWorker` (since TRB-060 a pg-boss job handler; queue, claim order, attempts and retries are in [QUEUE.md](QUEUE.md)):
 
-1. Claims the oldest eligible QUEUED run with `UPDATE … FOR UPDATE SKIP LOCKED`, setting `RUNNING`, a 60 s lease and an incremented `fencing_token`. A partial unique index (`research_run_single_running`) guarantees at most one RUNNING run globally, even with several processes. Live runs are not eligible while an unreconciled live run is UNCERTAIN (see [Fail-closed uncertainty](#fail-closed-uncertainty-and-operator-reconciliation)).
+1. Claims an eligible QUEUED run (since TRB-060: the least recently served user first) with `UPDATE … FOR UPDATE SKIP LOCKED`, setting `RUNNING`, a 60 s lease and an incremented `fencing_token`. A partial unique index (`research_run_single_running`) guarantees at most one RUNNING run globally, even with several processes. Live runs are not eligible while an unreconciled live run is UNCERTAIN (see [Fail-closed uncertainty](#fail-closed-uncertainty-and-operator-reconciliation)).
 2. Builds the request: versioned policy (`research-policy-2026-10-18.1`), the prompt between markers, and an explicit context (UTC time, local time and offset in `RESEARCH_TIME_ZONE`, Monday–Sunday week, queue delay). Stores the exact request in `request_snapshot` and sets `submission_state = SUBMITTING` before calling the provider.
 3. OpenAI adapter (`openai@7.27.0`, Responses API): `tools: [{type: "web_search"}]`, `tool_choice: "required"`, `max_output_tokens`, `max_tool_calls`, `background: true`, `store: false`, `include: ["web_search_call.action.sources"]`, optional `reasoning.effort`. No `previous_response_id` or conversation. SDK retries are disabled (`maxRetries: 0`); each HTTP call has `OPENAI_HTTP_TIMEOUT_MS`. No Structured Outputs and no second model call.
 4. Saves the response ID (`SUBMITTED`) immediately, before any verification.
@@ -55,7 +55,9 @@ The destination is always the authorized private chat of the request, stored on 
 
 Run states: QUEUED → RUNNING → SUCCEEDED | FAILED | UNCERTAIN | CANCELLED. CANCELLED was added by TRB-030: suspension, an owner who is unresolved or lost access, or live research by a non-administrator. Before submission no provider request exists; after a confirmed provider cancellation the evidence is kept. The content outcome (FOUND, PARTIAL, NO_MATCHES, INCONCLUSIVE) is separate, and so is the delivery state.
 
-## Recovery policy (prototype)
+## Recovery policy
+
+TRB-060 keeps these rules and adds queue redelivery, attempts and wake-ups ([QUEUE.md](QUEUE.md#recovery-policy)).
 
 | Situation | Behaviour |
 |---|---|
@@ -63,9 +65,9 @@ Run states: QUEUED → RUNNING → SUCCEEDED | FAILED | UNCERTAIN | CANCELLED. C
 | RUNNING, lease expired, `NOT_SUBMITTED` | Taken over (new fencing token) and executed; nothing was sent. |
 | RUNNING, lease expired, `SUBMITTING` (request may have reached OpenAI, no response ID saved) | `UNCERTAIN / SUBMISSION_INTERRUPTED`. Never resubmitted automatically; user notified. |
 | RUNNING, lease expired, `SUBMITTED` | Polling resumes with the saved response ID; never resubmitted. If the response can no longer be retrieved (HTTP 404, e.g. after the ~10 min background retention of `store: false`), the run becomes `UNCERTAIN / RESPONSE_NOT_RETRIEVABLE`. |
-| Submit returns 4xx | `FAILED` (not accepted, not retried). |
+| Submit returns 4xx | `FAILED` (not accepted). Since TRB-060 a 429 rate-limit refusal may get a new attempt with its own reservation when `RESEARCH_SUBMISSION_RETRY_LIMIT` > 0 (default 0). |
 | Submit times out, connection error or 5xx | `UNCERTAIN` (may be billed); not retried. |
-| Graceful shutdown while polling | Lease released immediately; the next process resumes polling. |
+| Graceful shutdown while polling | Lease released and a wake-up written in one transaction; the next process resumes polling. |
 | A worker whose lease was taken over | All its writes are fenced by `(id, fencing_token, state = RUNNING)`; they fail and it stops. A response ID it receives too late is logged for reconciliation. |
 | RUNNING, lease expired, `SUBMITTED`, bounds not yet verified | The first poll result is verified like a fresh submission (see step 5). |
 | Deadline or bounds-failure cancellation fails or is not confirmed | `UNCERTAIN`; the response ID, newest status and usage are kept. |
@@ -157,7 +159,7 @@ Entering a budget amount without turning on "Enforce a hard limit" leaves only n
 |---|---|
 | TRB-030 | Implemented (READY FOR REVIEW, docs/IDENTITY.md): invitations, user records, onboarding, per-user serialization. The inbox still stores no payload. |
 | TRB-050 | Budget reservations, pricing snapshots, usage ledger, quotas, retries with fresh reservation |
-| TRB-060 | pg-boss with outbox, attempts table, configurable retry policy, fair dispatch, process roles |
+| TRB-060 | Done in TRB-060 (READY FOR REVIEW): pg-boss with outbox, attempts table, bounded retry policy, fair dispatch. Process roles remain for TRB-100 |
 | TRB-080 | Full-text document fallback, history, blocked-destination handling that pauses automatic work |
 | TRB-090 | Retention cleanup: prompts and reports are currently stored without automatic purge |
 | TRB-100 | Webhook registration runbook, migration release step (the runtime image has no Prisma CLI), deployment |

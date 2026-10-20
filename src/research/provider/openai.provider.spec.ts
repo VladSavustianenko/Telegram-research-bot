@@ -6,6 +6,7 @@ import { parseEnv } from '../../config/env.schema';
 import {
   buildCreateBody,
   classifyError,
+  retryAfterMs,
   mapResponse,
   openAiClientOptions,
   OpenAiResearchProvider,
@@ -216,6 +217,33 @@ describe('classifyError', () => {
     ]) {
       expect(classifyError(error, 'submit').certainty).toBe('unknown');
     }
+  });
+
+  it('marks only a rate-limited submission as retryable, with its Retry-After (TRB-060)', () => {
+    const limited = (code: string | undefined, headers: Record<string, string>) =>
+      classifyError(
+        APIError.generate(429, { error: { code } }, undefined, new Headers(headers)),
+        'submit',
+      );
+    expect(limited('rate_limit_exceeded', { 'retry-after': '7' }).retryAfterMs).toBe(7_000);
+    expect(limited(undefined, { 'retry-after-ms': '1500' }).retryAfterMs).toBe(1_500);
+    expect(limited('rate_limit_exceeded', {}).retryAfterMs).toBeNull();
+    // Exhausted quota is not a transient refusal.
+    expect(limited('insufficient_quota', { 'retry-after': '7' }).retryAfterMs).toBeUndefined();
+    // Other refusals, and a 429 while polling, are never retried as submissions.
+    expect(classifyError(apiError(400), 'submit').retryAfterMs).toBeUndefined();
+    expect(classifyError(apiError(429), 'poll').retryAfterMs).toBeUndefined();
+    // Ambiguous outcomes are never retryable.
+    expect(classifyError(apiError(503), 'submit').retryAfterMs).toBeUndefined();
+  });
+
+  it('parses Retry-After as seconds or an HTTP date and ignores garbage', () => {
+    const now = Date.parse('2026-10-20T12:00:00Z');
+    expect(retryAfterMs(new Headers({ 'retry-after': 'Tue, 20 Oct 2026 12:00:30 GMT' }), now)).toBe(
+      30_000,
+    );
+    expect(retryAfterMs(new Headers({ 'retry-after': 'soon' }), now)).toBeNull();
+    expect(retryAfterMs(undefined, now)).toBeNull();
   });
 
   it('marks a 404 while polling as gone and keeps messages out of the code', () => {

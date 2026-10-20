@@ -60,7 +60,7 @@ The dev database uses port 5434 so that it does not collide with a locally insta
 
 ### Research prototype (TRB-020)
 
-Private-chat commands for users with completed onboarding (TRB-030): `/research <prompt>` (acknowledges with a run ID; the sourced report arrives separately) and `/result <run-id>` (resends the stored report, never researches again). Webhook at `POST /telegram/webhook` (secret header required) or development polling. Research and delivery run in database-backed in-process workers, one research request at a time. An unresolved UNCERTAIN live run (a billed request may still be active) blocks further live research until an operator reconciles it with `npm run ops:reconcile`. Before any live use, enable an OpenAI project hard spend limit with "Enforce a hard limit" turned on; spend alerts alone do not stop traffic, and application budgets are not enforced before TRB-050.
+Private-chat commands for users with completed onboarding (TRB-030): `/research <prompt>` (acknowledges with a run ID; the sourced report arrives separately) and `/result <run-id>` (resends the stored report, never researches again). Webhook at `POST /telegram/webhook` (secret header required) or development polling. Research runs through a PostgreSQL-backed pg-boss queue (TRB-060) and delivery through a database-backed worker, one research request at a time. An unresolved UNCERTAIN live run (a billed request may still be active) blocks further live research until an operator reconciles it with `npm run ops:reconcile`. Before any live use, enable an OpenAI project hard spend limit with "Enforce a hard limit" turned on; spend alerts alone do not stop traffic, and application budgets (TRB-050) are local estimates, not a provider ceiling.
 
 To try it without cost, use `RESEARCH_MODE=fake`: simulated, clearly labelled results from dated synthetic fixtures. Real Telegram delivery still needs a bot token and is an operator action. Behaviour, recovery policy, enforced and unenforced cost controls, deferred items and the authorized live-sample procedure are in [docs/RESEARCH_SLICE.md](docs/RESEARCH_SLICE.md).
 
@@ -70,7 +70,7 @@ Administrators come from `ADMIN_TELEGRAM_IDS`; everyone else needs a single-use 
 - **Invite.** `/admin invite` sends a link that expires after 7 days by default. It needs `INVITATION_TOKEN_SECRET`.
 - **Onboard.** New users open the link and confirm a time zone (Europe/Kyiv is suggested). Administrators onboard with `/start` and confirm a time zone too.
 - **Suspend.** `/admin suspend <Telegram ID>` and `/admin reactivate <Telegram ID>` manage access.
-- **Live research** remains administrator-only until TRB-050.
+- **Live research** remains administrator-only.
 
 Commands, token handling, suspension semantics and the migration of existing runs are in [docs/IDENTITY.md](docs/IDENTITY.md).
 
@@ -78,7 +78,7 @@ Commands, token handling, suspension semantics and the migration of existing run
 
 - **Commands.** `/tasks`, `/new` and `/cancel` manage saved research tasks: name, prompt, a manual, daily or weekly schedule, and their own time zone.
 - **Dialogs.** Guided steps with Back and Cancel, persisted drafts (24 h), revision-checked edits, pause, resume and confirmed soft delete.
-- **Not executed yet.** Saving or changing a task never starts research. Scheduled execution comes in TRB-070, and running a task from its card in TRB-050/060.
+- **Execution.** Saving or changing a task never starts research. "Запустити зараз" on a task card runs it once (TRB-050); scheduled execution comes in TRB-070.
 
 Details: [docs/TASKS.md](docs/TASKS.md).
 
@@ -93,7 +93,17 @@ Details: [docs/TASKS.md](docs/TASKS.md).
 
 Details: [docs/ACCOUNTING.md](docs/ACCOUNTING.md).
 
-Prisma owns the `public` schema and its migrations in `prisma/migrations`; pg-boss will own a separate `pgboss` schema (TRB-060). The generated Prisma client is written to `src/generated/prisma` (not committed).
+### Queue execution and recovery (TRB-060)
+
+- **Queue.** Admission writes an outbox event; a dispatcher publishes it to pg-boss in the same database transaction that marks it dispatched. pg-boss is the only path to a provider submission.
+- **Jobs inspect, never authorize.** A job only asks a worker to inspect a run. Leases with fencing tokens, submission states and reservations in the database decide what happens; duplicate or late jobs do nothing.
+- **Recovery.** A saved response ID is resumed after a crash or restart; a submission without a saved ID becomes UNCERTAIN and is never resubmitted automatically.
+- **Fairness.** One run at a time globally; the least recently served user goes first.
+- **Retries.** A new provider submission is made only after an HTTP 429 refusal, when `RESEARCH_SUBMISSION_RETRY_LIMIT` allows it (default 0), with its own reservation.
+
+Details, retry matrix, rollout and operator procedures: [docs/QUEUE.md](docs/QUEUE.md).
+
+Prisma owns the `public` schema and its migrations in `prisma/migrations`; pg-boss owns a separate schema (`QUEUE_SCHEMA`, default `pgboss`), which the application installs at startup (TRB-060). The generated Prisma client is written to `src/generated/prisma` (not committed).
 
 ## Reference documentation
 

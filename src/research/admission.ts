@@ -9,10 +9,14 @@ import type { AppUser } from '../generated/prisma/client';
 import { researchAdmissionDenial } from '../identity/authorization';
 import { snapshotRunConfig } from './request-builder';
 import { hasUnresolvedLiveUncertainty } from './uncertainty';
+import { EXECUTE_EVENT } from './wake';
 
-/** Postgres advisory lock key serialising research admission (all capacity checks). */
-const ADMISSION_LOCK_KEY = 20_020;
-export const EXECUTE_EVENT = 'RESEARCH_EXECUTE';
+/**
+ * Postgres advisory lock key serialising research admission and retry
+ * authorization (all capacity and budget checks).
+ */
+export const ADMISSION_LOCK_KEY = 20_020;
+export { EXECUTE_EVENT };
 
 export interface AdmissionOutcome {
   disposition: 'RUN_ACCEPTED' | 'REPLIED' | 'REJECTED';
@@ -36,7 +40,8 @@ export type AdmissionSource =
  *     accounting configuration and checks user and global monthly budgets
  *     against current exposure plus the new reservation;
  *  6. creates the run with its immutable snapshot, the reservation and its
- *     ledger entry, the execution outbox event and the acknowledgement.
+ *     ledger entry, the execution outbox event and the acknowledgement. The
+ *     outbox dispatcher later publishes the event to pg-boss (docs/QUEUE.md).
  * A rejection creates no run, reservation or outbox event (only a reply).
  */
 export async function admitResearch(

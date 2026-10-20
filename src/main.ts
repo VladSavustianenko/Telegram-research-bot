@@ -22,6 +22,7 @@ async function bootstrap(): Promise<void> {
       telegramMode: config.TELEGRAM_MODE,
       researchMode: config.RESEARCH_MODE,
       backgroundWorkers: config.BACKGROUND_WORKERS,
+      queueSchema: config.QUEUE_SCHEMA,
     },
     'Bootstrap',
   );
@@ -36,12 +37,6 @@ async function bootstrap(): Promise<void> {
       },
       'Bootstrap',
     );
-  }
-  if (
-    config.RUN_MAX_ESTIMATED_COST_USD !== undefined ||
-    config.USER_MONTHLY_BUDGET_USD !== undefined
-  ) {
-    logger.warn({ message: 'USD budget settings are not enforced before TRB-050' }, 'Bootstrap');
   }
 }
 

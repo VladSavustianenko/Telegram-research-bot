@@ -17,6 +17,16 @@ import { z } from 'zod';
  */
 export const MAX_RUN_DEADLINE_SECONDS = 540;
 
+/**
+ * Research run lease (TRB-060, docs/QUEUE.md). Each provider HTTP call must end
+ * well inside it, so that a live worker is never taken over during a call.
+ */
+export const RUN_LEASE_SECONDS = 60;
+export const MAX_OPENAI_HTTP_TIMEOUT_MS = (RUN_LEASE_SECONDS * 1_000) / 2;
+
+/** Upper bound of a provider-supplied or configured submission retry delay. */
+export const MAX_SUBMISSION_RETRY_DELAY_SECONDS = 300;
+
 /** Minimum value the Responses API accepts for max_output_tokens. */
 export const MIN_OUTPUT_TOKEN_LIMIT = 16;
 
@@ -156,8 +166,38 @@ export const envSchema = z
     RESEARCH_PROMPT_MAX_CHARS: positiveIntWithDefault(8_000),
     // Maximum QUEUED + RUNNING research runs; further requests are rejected.
     RESEARCH_QUEUE_LIMIT: positiveIntWithDefault(3),
-    // In-process database-backed workers. Tests disable them and drive ticks directly.
+    // In-process background components: the pg-boss research worker, the outbox
+    // dispatcher, the delivery worker and Telegram polling. Tests disable them and
+    // drive ticks directly.
     BACKGROUND_WORKERS: z.preprocess(emptyAsUnset, z.enum(['on', 'off']).default('on')),
+    // PostgreSQL schema owned by pg-boss (TRB-060, docs/QUEUE.md); never the Prisma schema.
+    QUEUE_SCHEMA: z.preprocess(
+      emptyAsUnset,
+      z
+        .string()
+        .regex(/^[a-z_][a-z0-9_]{0,62}$/, 'must be a lower-case PostgreSQL identifier')
+        .refine((name) => name !== 'public', 'must not be the application schema')
+        .default('pgboss'),
+    ),
+    // Delay before a run that could not start (capacity, fairness, live gate) is inspected again.
+    RESEARCH_CAPACITY_RETRY_SECONDS: positiveIntWithDefault(15),
+    // A queued run not started within this time is cancelled and its reservation released.
+    RESEARCH_QUEUE_MAX_WAIT_SECONDS: positiveIntWithDefault(3_600),
+    // Additional provider submissions allowed per run, only after a refusal that proves the
+    // previous request was not accepted (HTTP 429 rate limit). Each needs its own
+    // reservation. 0 (default) disables automatic resubmission.
+    RESEARCH_SUBMISSION_RETRY_LIMIT: z
+      .preprocess(
+        emptyAsUnset,
+        z.string().regex(/^\d+$/, 'must be a non-negative integer').transform(Number).optional(),
+      )
+      .default(0)
+      .refine((limit) => limit <= 2, 'must be at most 2'),
+    // Delay before such a resubmission when the provider sends no Retry-After.
+    RESEARCH_SUBMISSION_RETRY_DELAY_SECONDS: positiveIntWithDefault(30).refine(
+      (seconds) => seconds <= MAX_SUBMISSION_RETRY_DELAY_SECONDS,
+      `must be at most ${MAX_SUBMISSION_RETRY_DELAY_SECONDS}`,
+    ),
     WORKER_POLL_INTERVAL_MS: positiveIntWithDefault(2_000),
     OPENAI_POLL_INTERVAL_MS: positiveIntWithDefault(3_000),
 
@@ -167,7 +207,10 @@ export const envSchema = z
     // Optional; only sent when set. "minimal" is rejected: web search does not support it.
     OPENAI_REASONING_EFFORT: optional(z.enum(['none', 'low', 'medium', 'high', 'xhigh'])),
     // Timeout of each HTTP call to OpenAI (create/retrieve/cancel), not the run deadline.
-    OPENAI_HTTP_TIMEOUT_MS: positiveIntWithDefault(30_000),
+    OPENAI_HTTP_TIMEOUT_MS: positiveIntWithDefault(30_000).refine(
+      (ms) => ms <= MAX_OPENAI_HTTP_TIMEOUT_MS,
+      `must be at most ${MAX_OPENAI_HTTP_TIMEOUT_MS} (half of the research run lease)`,
+    ),
 
     // Run bounds sent to the provider (TRB-020). Not proven caps on billed usage.
     RESEARCH_CONCURRENCY: optional(positiveInt),

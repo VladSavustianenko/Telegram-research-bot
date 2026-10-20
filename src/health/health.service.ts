@@ -1,11 +1,12 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../database/prisma.service';
+import { QueueService } from '../queue/queue.service';
 
 export type CheckStatus = 'up' | 'down';
 
 export interface ReadinessReport {
   status: 'ok' | 'error';
-  checks: { config: CheckStatus; database: CheckStatus };
+  checks: { config: CheckStatus; database: CheckStatus; queue: CheckStatus | 'disabled' };
 }
 
 /** Maximum time a readiness response waits for the database probe. */
@@ -14,7 +15,9 @@ export const DEFAULT_READINESS_TIMEOUT_MS = 2_000;
 
 /**
  * Readiness checks. Never calls paid external APIs (OpenAI, Telegram).
- * Worker readiness is added when workers exist (TRB-060).
+ * `queue` (TRB-060) is the in-process state of the pg-boss queue, with no
+ * extra query: "disabled" without a research provider (always ready), "up"
+ * once started, "down" while starting, retrying or stopped (not ready).
  *
  * At most one database probe is in flight: concurrent and repeated requests
  * share it, so a stalled database cannot accumulate probes. The probe itself is
@@ -28,14 +31,17 @@ export class HealthService {
 
   constructor(
     private readonly prisma: PrismaService,
+    private readonly queueService: QueueService,
     @Inject(READINESS_TIMEOUT_MS) private readonly timeoutMs: number,
   ) {}
 
   async readiness(): Promise<ReadinessReport> {
     const database = await this.checkDatabase();
+    const status = this.queueService.status;
+    const queue = status === 'disabled' ? 'disabled' : status === 'up' ? 'up' : 'down';
     // Configuration is validated before the application starts, so a running process has valid config.
-    const checks = { config: 'up', database } as const;
-    return { status: database === 'up' ? 'ok' : 'error', checks };
+    const checks = { config: 'up', database, queue } as const;
+    return { status: database === 'up' && queue !== 'down' ? 'ok' : 'error', checks };
   }
 
   private async checkDatabase(): Promise<CheckStatus> {

@@ -43,7 +43,7 @@ describe('health endpoints', () => {
     const server = httpServer(await start(new FakePrisma()));
     await request(server)
       .get('/health/ready')
-      .expect(200, { status: 'ok', checks: { config: 'up', database: 'up' } });
+      .expect(200, { status: 'ok', checks: { config: 'up', database: 'up', queue: 'disabled' } });
   });
 
   it('returns 503 without leaking error details when the database fails', async () => {
@@ -51,7 +51,10 @@ describe('health endpoints', () => {
     prisma.queryRaw.mockRejectedValue(new Error('connect ECONNREFUSED postgresql://user:pw@db'));
     const server = httpServer(await start(prisma));
     const response = await request(server).get('/health/ready').expect(503);
-    expect(response.body).toEqual({ status: 'error', checks: { config: 'up', database: 'down' } });
+    expect(response.body).toEqual({
+      status: 'error',
+      checks: { config: 'up', database: 'down', queue: 'disabled' },
+    });
     expect(JSON.stringify(response.body)).not.toContain('ECONNREFUSED');
   });
 

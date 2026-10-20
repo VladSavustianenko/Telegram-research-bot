@@ -55,7 +55,10 @@ describe('TRB-050 admission, quotas and accounting (scripted provider, real Post
     harness.post(privateMessage(`/research ${text}`, from)).expect(200);
   const runs = () => h.prisma.researchRun.findMany({ orderBy: { createdAt: 'asc' } });
   const reservationOf = (runId: string) =>
-    h.prisma.budgetReservation.findUniqueOrThrow({ where: { runId } });
+    h.prisma.budgetReservation.findFirstOrThrow({
+      where: { runId },
+      orderBy: { attemptNo: 'desc' },
+    });
   const ledgerOf = (runId: string) =>
     h.prisma.usageLedger.findMany({ where: { runId }, orderBy: { createdAt: 'asc' } });
   const ledgerSum = async (runId: string) =>

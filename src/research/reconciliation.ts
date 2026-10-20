@@ -1,4 +1,5 @@
 import type { PrismaService } from '../database/prisma.service';
+import { wakeQueuedRuns } from './wake';
 
 export const RESOLUTIONS = [
   'PROVIDER_CONFIRMED_TERMINAL',
@@ -56,6 +57,8 @@ export function listUnresolved(prisma: PrismaService): Promise<UnresolvedRun[]> 
  * reconciled_at: the run stays UNCERTAIN with its failure code, response ID and
  * usage, and is never resubmitted. Workers cannot call this, and a stale worker
  * cannot alter the run afterwards (its fenced writes require state RUNNING).
+ * Queued runs are woken in the same transaction, so live work that waited for
+ * the block to lift is inspected at once.
  */
 export async function reconcileUncertainRun(
   prisma: PrismaService,
@@ -115,6 +118,7 @@ export async function reconcileUncertainRun(
       data: { reconciledAt: new Date() },
     });
     if (updated.count !== 1) throw new ReconciliationError('CONCURRENT_CHANGE');
+    await wakeQueuedRuns(tx, 'RECONCILED');
     return { runId: run.id, reconciliationId: record.id };
   });
 }

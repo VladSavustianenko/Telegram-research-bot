@@ -117,11 +117,32 @@ export function classifyError(error: unknown, phase: 'submit' | 'poll'): Provide
       typeof error.code === 'string' ? `_${error.code.replace(/[^a-z0-9_]/gi, '')}` : '';
     const code = `OPENAI_HTTP_${error.status}${apiCode}`.slice(0, 80);
     if (error.status >= 400 && error.status < 500) {
-      return new ProviderError(code, 'not_accepted', phase === 'poll' && error.status === 404);
+      // A rate-limited submission was refused and may be retried later (docs/QUEUE.md);
+      // exhausted quota or billing problems are not retryable.
+      const retryable =
+        phase === 'submit' && error.status === 429 && error.code !== 'insufficient_quota';
+      return new ProviderError(
+        code,
+        'not_accepted',
+        phase === 'poll' && error.status === 404,
+        retryable ? retryAfterMs(error.headers as Headers | undefined) : undefined,
+      );
     }
     return new ProviderError(code, 'unknown');
   }
   return new ProviderError('OPENAI_UNEXPECTED', 'unknown');
+}
+
+/** Retry-After as milliseconds (retry-after-ms, or retry-after in seconds or as an HTTP date). */
+export function retryAfterMs(headers: Headers | undefined, now = Date.now()): number | null {
+  const millis = Number(headers?.get('retry-after-ms'));
+  if (Number.isFinite(millis) && millis >= 0 && headers?.get('retry-after-ms')) return millis;
+  const value = headers?.get('retry-after');
+  if (!value) return null;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1_000;
+  const date = Date.parse(value);
+  return Number.isNaN(date) ? null : Math.max(0, date - now);
 }
 
 const STATUSES: readonly ProviderStatus[] = [

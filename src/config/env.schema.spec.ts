@@ -165,3 +165,41 @@ describe('feature modes (TRB-020)', () => {
     );
   });
 });
+
+describe('queue execution settings (TRB-060)', () => {
+  it('uses a separate pg-boss schema and conservative retry defaults', () => {
+    expect(parseEnv(base)).toMatchObject({
+      QUEUE_SCHEMA: 'pgboss',
+      RESEARCH_CAPACITY_RETRY_SECONDS: 15,
+      RESEARCH_QUEUE_MAX_WAIT_SECONDS: 3_600,
+      RESEARCH_SUBMISSION_RETRY_LIMIT: 0,
+      RESEARCH_SUBMISSION_RETRY_DELAY_SECONDS: 30,
+    });
+  });
+
+  it('rejects unsafe queue and retry settings', () => {
+    expect(
+      problemsOf({
+        ...base,
+        QUEUE_SCHEMA: 'public',
+        RESEARCH_SUBMISSION_RETRY_LIMIT: '3',
+        RESEARCH_SUBMISSION_RETRY_DELAY_SECONDS: '301',
+        OPENAI_HTTP_TIMEOUT_MS: '30001',
+      }).map((problem) => problem.split(' ')[0]),
+    ).toEqual([
+      'QUEUE_SCHEMA',
+      'RESEARCH_SUBMISSION_RETRY_LIMIT',
+      'RESEARCH_SUBMISSION_RETRY_DELAY_SECONDS',
+      'OPENAI_HTTP_TIMEOUT_MS',
+    ]);
+    expect(problemsOf({ ...base, QUEUE_SCHEMA: 'Bad-Name' })).toEqual([
+      'QUEUE_SCHEMA must be a lower-case PostgreSQL identifier',
+    ]);
+    expect(problemsOf({ ...base, RESEARCH_SUBMISSION_RETRY_LIMIT: '-1' })).toEqual([
+      'RESEARCH_SUBMISSION_RETRY_LIMIT must be a non-negative integer',
+    ]);
+    expect(
+      parseEnv({ ...base, RESEARCH_SUBMISSION_RETRY_LIMIT: '2' }).RESEARCH_SUBMISSION_RETRY_LIMIT,
+    ).toBe(2);
+  });
+});

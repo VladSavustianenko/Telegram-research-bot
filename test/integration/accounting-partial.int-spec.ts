@@ -73,7 +73,10 @@ describe('TRB-050 partial usage accounting (scripted provider, real PostgreSQL)'
     harness.post(privateMessage(`/research ${text}`, from)).expect(200);
   const onlyRun = () => h.prisma.researchRun.findFirstOrThrow({ orderBy: { createdAt: 'asc' } });
   const reservationOf = (runId: string) =>
-    h.prisma.budgetReservation.findUniqueOrThrow({ where: { runId } });
+    h.prisma.budgetReservation.findFirstOrThrow({
+      where: { runId },
+      orderBy: { attemptNo: 'desc' },
+    });
   const ledgerOf = (runId: string) =>
     h.prisma.usageLedger.findMany({ where: { runId }, orderBy: { createdAt: 'asc' } });
   const lastReason = async () =>

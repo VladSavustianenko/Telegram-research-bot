@@ -596,6 +596,77 @@ Regression scenarios (synthetic prices, scripted responses, real PostgreSQL):
 
 **Not run:** Docker smoke (no configuration change), CI, live requests.
 
+### TRB-050 acceptance (2026-10-20)
+
+The owner accepted TRB-050 after review of commit `b6933460a1140d2845d725caf23b3643f70ae4c6`: the implementation plus the partial-usage review fix recorded above. The sections above are left as recorded. Live research remains administrator-only.
+
+### TRB-060 evidence (2026-10-20, local Windows 11, Node 24.19.0, PostgreSQL 17, pg-boss 12.37.0)
+
+Mock validation only. Scripted providers stand in for OpenAI and a recording sender for Telegram: no network call to either, no deployment, no commit. Prices are synthetic. Local `.env` keeps `TELEGRAM_MODE=disabled` and `RESEARCH_MODE=disabled`. Behaviour: docs/QUEUE.md.
+
+| Check | Command | Result |
+|---|---|---|
+| Static checks | `npm run format:check`, `npm run lint`, `npm run typecheck`, `npm run prisma:validate` | Pass |
+| Unit tests | `npm test` | 189 passed (14 files) |
+| Integration tests | `npm run test:integration` (real PostgreSQL, real pg-boss in each run's disposable database) | 186 passed (14 files: 27 new TRB-060 scenarios, 1 new migration test, all earlier suites); 0 disposable databases left |
+| Build | `npm run build` | Pass |
+| Dependency | `npm install --save-exact pg-boss@12.37.0` | Pinned; lockfile updated. Engines `node >=22.12.0`; depends on `pg ^8.23.1`, deduplicated with the project's `pg@8.23.1`. ESM-only package loaded from the CommonJS build via `require(esm)`, verified with the compiled output |
+| Migration, isolated DB | global setup (`migrate deploy`, then pg-boss schema install); `identity-migration.int-spec.ts` applies all migrations after TRB-020 to a database with TRB-020 records | Pass. One attempt per submitted run, copied from the run's fields. Outcomes: SUCCEEDED with a response ID → PROVIDER_TERMINAL; both UNCERTAIN runs → UNCERTAIN; the queued run gets no attempt. No reservation, ledger entry or outbox event is invented; every run has `current_attempt_no = 1` |
+| Migration, dev DB | `migrate deploy`, `migrate status`, `migrate diff --exit-code` | `20261020120000_trb_060_queue_execution` applied without reset; "up to date"; "No difference detected" (exit 0). MD5 over the run evidence (id, state, submission state, response ID, usage, failure code, completion) and over deliveries is identical before and after. Of the 3 historical runs, the 2 SUCCEEDED got PROVIDER_TERMINAL attempts, and the FAILED one (`OPENAI_HTTP_401_invalid_api_key`, SUBMITTING without an ID) got NOT_ACCEPTED. No reservations, ledger entries or outbox events existed or were created |
+| Operator command | `node dist/ops/accounting.js --list` against the dev DB | `[]`, exit 0 |
+| Mutation check | Each guard removed in turn, `queue-execution.int-spec.ts` rerun (script outside the repository) | 9 of 9 caught after one test was strengthened. Guards: dispatcher skips finished runs; publication inside the transaction; takeover requires an expired lease; fair claim order; budget authorization of a retry; retry limit; shutdown hand-over wake-up; recovery sweep wakes expired leases; retry delay in the claim. The last one initially survived, because no job arrived before the delay. The retry test now wakes the run early and checks that it is re-deferred to the retry time without a submission |
+| Docker smoke | `docker build`; container from the production image against a disposable database on the test server, `RESEARCH_MODE=fake`, `TELEGRAM_MODE=disabled`, `BACKGROUND_WORKERS=on`, no credentials; one run inserted as admission writes it (run + `RESEARCH_EXECUTE` event) | Image built. Readiness `{"status":"ok","checks":{"config":"up","database":"up","queue":"up"}}`. pg-boss installed its schema at startup. The run SUCCEEDED through the dispatcher and the pg-boss worker: one attempt (SUBMITTED, PROVIDER_TERMINAL), event dispatched, one `research-execute` job completed. Its report delivery stayed PENDING because Telegram was disabled. `docker stop` ended gracefully in 3 s with exit code 0 and no error log lines. Database dropped afterwards |
+
+Scenarios (`test/integration/queue-execution.int-spec.ts`, 27 tests). Overlap is synchronized deterministically through scripted provider gates, a PostgreSQL row lock held by a separate session, and SQL that moves leases, deferrals and job expiry into the past. No timing-based assertions:
+- **Outbox → pg-boss.**
+  - Admission committed, process closed before the dispatcher ran: after a restart the event is published once (job ID = event ID) and executed once.
+  - A publication inside a transaction that fails before its acknowledgement leaves no job and a pending event. The next dispatch publishes once, and a repeated publication of the same event returns `null` (no second job).
+  - With one event row-locked by a third session, two concurrent dispatchers publish the other two once each; after the lock is released, the third is published once. Jobs equal events.
+  - Cancelled work (paused task) and a wake-up of a finished run are never published.
+- **Duplicate jobs.** Two jobs for a queued run, a duplicate during execution (live lease: no action) and a job for the finished run (no action): one submission, one report delivery, ledger RESERVE + SETTLE, fencing token 1.
+- **Crash recovery and fencing.**
+  - A worker that died after claiming but before the submission intent: the recovery sweep wakes the run, it is taken over (fencing token 2) and executed once. One attempt, PROVIDER_TERMINAL; reservation SETTLED.
+  - A worker frozen inside the provider call, with retries enabled: the takeover records UNCERTAIN `SUBMISSION_INTERRUPTED`; the attempt stays SUBMITTING/UNCERTAIN; the reservation is UNRESOLVED at the full 284 000. When the frozen call then returns a response ID, it is logged but cannot be recorded. No resubmission follows, and live admission is refused.
+  - Shutdown while polling: the lease is released with a `SHUTDOWN_HANDOVER` wake-up. A new instance resumes polling the same response ID with zero submissions and no new reservation (ledger RESERVE + SETTLE, one attempt).
+  - Stale worker: after a takeover completes the run, the stale worker's late answer writes nothing (one report, one settlement, fencing token 2).
+  - pg-boss job expiry during provider work (`supervise` after moving `started_on` back): the redelivered job finds the live lease and does nothing; one submission and one report.
+- **Retries and accounting.**
+  - Connection failure, timeout and HTTP 500 are never resubmitted with retries enabled: UNCERTAIN, UNRESOLVED.
+  - A 429 with the default limit 0: FAILED, NOT_ACCEPTED attempt, RELEASED.
+  - With limit 1, a 429 with Retry-After 5 s:
+    - the run is requeued as attempt 2 with `next_attempt_at` within 5 s and a new RESERVED reservation, while attempt 1 is RELEASED;
+    - an early job does not claim it before the delay;
+    - after the delay the identical stored request is resubmitted and SUCCEEDED, with ledger 1 RESERVE, 1 RELEASE, 2 RESERVE, 2 SETTLE;
+    - one run counts against the quota.
+  - Two refusals with limit 1: FAILED after 2 submissions, both reservations RELEASED at 0.
+  - A retry that the global budget no longer allows, after another user's run overran to 2 060 000: FAILED `…;RETRY_REFUSED:GLOBAL_BUDGET_EXHAUSTED`, no second reservation.
+  - Pausing a task whose run waits for its retry releases attempt 2's reservation once.
+- **Lifecycle while queued.** Pausing or deleting a task after its job was published, and suspending a member after their job was published, gives CANCELLED with the reason, zero submissions and one RELEASE; the late job completes without action.
+- **Fairness and capacity.**
+  - User A queues 3 runs, then user B queues 1: execution order a1, b1, a2, a3.
+  - A capacity-denied job writes a deferred wake-up more than 10 s ahead and is not re-run before then. Completion of the running run makes the wake-up due at once, and the waiting run then succeeds.
+  - Simulated work proceeds while an unreconciled live UNCERTAIN run blocks live work.
+- **Background workers and shutdown.** With `BACKGROUND_WORKERS=on`, work runs through `boss.work()` and the dispatcher loop. Closing the application while it polls returns within 15 s and hands the run over; a second application completes it with one submission in total and one report.
+- **Readiness** reports `queue: up` with no provider or Telegram call.
+
+Other new tests:
+- **Unit.** Env validation (queue schema, retry bounds, the HTTP timeout limited to half the lease); 429 classification (retryable only on submit and not for `insufficient_quota`); Retry-After as seconds, milliseconds and an HTTP date; retry delay bounds.
+
+Earlier suites adapted:
+- Reservation lookups now address the run's latest attempt.
+- Expected readiness bodies include `queue`.
+- The migration test ignores the two new run columns.
+- The concurrent-worker test waits for the winner's submission as well as the two losing ticks. Their completion order changed, because a capacity-denied job now completes after writing a deferral.
+- Operator reconciliation now wakes queued runs, so the reconciliation test resumes queued live work without waiting for the deferral.
+
+Remaining limitations:
+- **Exactly-once.** Provider execution is not exactly-once (docs/QUEUE.md, "Guarantees").
+- **Concurrency.** One research request runs at a time globally.
+- **Shutdown window.** A platform drain window shorter than `OPENAI_HTTP_TIMEOUT_MS + 5 s` can turn an in-flight submission into UNCERTAIN.
+- **Resubmission off.** Automatic resubmission is disabled by default.
+- **Rollout.** Rollout requires that old and new workers do not overlap.
+- **Not run:** CI, any live OpenAI request or Telegram message, Railway deployment.
+
 ## Release checklist
 
 - Exact model/tool compatibility verified in official docs and an authorized sample.

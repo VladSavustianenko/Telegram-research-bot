@@ -16,6 +16,11 @@ import { estimateRun, pricingHash, type ReservationPolicy } from './pricing';
  * so a replay changes nothing. Ledger amounts are changes of exposure and sum
  * to the reservation's exposure. Callers run these inside the transaction
  * that finalizes the run (fenced), so a stale worker cannot settle or release.
+ *
+ * TRB-060: a run has one reservation per provider submission attempt
+ * (attempt_no). Attempt 1 is reserved at admission; a further attempt is
+ * reserved only by an explicit retry authorization (docs/QUEUE.md). Without an
+ * attempt number, functions address the run's latest reservation.
  */
 
 type Entry = {
@@ -63,10 +68,20 @@ async function writeEntries(tx: Tx, reservation: ReservationRow, entries: Entry[
   }
 }
 
-async function lockReservation(tx: Tx, runId: string): Promise<ReservationRow | null> {
-  await tx.$queryRaw`SELECT 1 AS locked FROM budget_reservation WHERE run_id = ${runId}::uuid FOR UPDATE`;
+async function lockReservation(
+  tx: Tx,
+  runId: string,
+  attemptNo?: number,
+): Promise<ReservationRow | null> {
+  const [locked] = await tx.$queryRaw<{ id: string }[]>`
+    SELECT id FROM budget_reservation
+     WHERE run_id = ${runId}::uuid AND (${attemptNo ?? null}::int IS NULL OR attempt_no = ${attemptNo ?? null}::int)
+     ORDER BY attempt_no DESC
+     LIMIT 1
+       FOR UPDATE`;
+  if (!locked) return null;
   return tx.budgetReservation.findUnique({
-    where: { runId },
+    where: { id: locked.id },
     select: {
       id: true,
       runId: true,
@@ -106,15 +121,25 @@ export async function exposureMicros(tx: Tx, month: string, userId?: string): Pr
   return result._sum.exposureMicros ?? 0n;
 }
 
-/** Admission: the reservation and its RESERVE entry (inside the admission transaction). */
+/**
+ * The reservation of one attempt and its RESERVE entry: attempt 1 inside the
+ * admission transaction, a later attempt inside its retry authorization.
+ */
 export async function reserve(
   tx: Tx,
-  input: { runId: string; userId: string; month: string; policy: ReservationPolicy },
+  input: {
+    runId: string;
+    userId: string;
+    month: string;
+    policy: ReservationPolicy;
+    attemptNo?: number;
+  },
 ): Promise<void> {
   const reserved = BigInt(input.policy.reservedMicros);
   const reservation = await tx.budgetReservation.create({
     data: {
       runId: input.runId,
+      attemptNo: input.attemptNo ?? 1,
       userId: input.userId,
       periodMonth: input.month,
       reservedMicros: reserved,
@@ -139,7 +164,7 @@ export async function reserve(
       kind: 'RESERVE',
       amount: reserved,
       key: `reserve:${reservation.id}`,
-      basis: { ...input.policy },
+      basis: { ...input.policy, attemptNo: input.attemptNo ?? 1 },
     },
   ]);
 }
@@ -195,15 +220,17 @@ export type SettlementResult =
   'NO_RESERVATION' | 'ALREADY_FINAL' | 'RELEASED' | 'SETTLED' | 'UNRESOLVED';
 
 /**
- * Finalizes a run's reservation once. A second call (replay, recovery) finds
- * the reservation no longer RESERVED and changes nothing.
+ * Finalizes the reservation of one attempt (default: the run's latest) once. A
+ * second call (replay, recovery) finds the reservation no longer RESERVED and
+ * changes nothing.
  */
 export async function settleRun(
   tx: Tx,
   runId: string,
   accounting: RunAccounting,
+  attemptNo?: number,
 ): Promise<SettlementResult> {
-  const reservation = await lockReservation(tx, runId);
+  const reservation = await lockReservation(tx, runId, attemptNo);
   if (!reservation) return 'NO_RESERVATION';
   if (reservation.status !== 'RESERVED') return 'ALREADY_FINAL';
   const reserved = reservation.reservedMicros;
@@ -338,8 +365,9 @@ export class AccountingResolutionError extends Error {
 /**
  * Operator resolution with an explicit confirmed amount (which may be 0 only
  * when the operator states it). Allowed once, for SETTLED or UNRESOLVED
- * reservations of finished runs. It does not change the run or its research
- * reconciliation.
+ * reservations of finished runs (the run's latest attempt: earlier attempts
+ * were refused by the provider and released). It does not change the run or
+ * its research reconciliation.
  */
 export async function resolveRun(
   tx: Tx,

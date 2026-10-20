@@ -29,7 +29,10 @@ describe('health against real PostgreSQL', () => {
     const started = await start(inject('databaseUrl'));
     await request(httpServer(started))
       .get('/health/ready')
-      .expect(200, { status: 'ok', checks: { config: 'up', database: 'up' } });
+      .expect(200, {
+        status: 'ok',
+        checks: { config: 'up', database: 'up', queue: 'disabled' },
+      });
 
     const prisma = started.get(PrismaService);
     const [row] = await prisma.$queryRaw<{ name: string }[]>`SELECT current_database() AS name`;

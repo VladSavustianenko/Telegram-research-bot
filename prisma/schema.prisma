@@ -1,6 +1,6 @@
 // Application schema. Prisma owns the `public` schema; pg-boss owns its own
-// `pgboss` schema (added in TRB-060) and is never managed by Prisma migrations.
-// Business models are introduced by later backlog items.
+// schema (QUEUE_SCHEMA, default `pgboss`; TRB-060), which the application
+// installs at startup and Prisma migrations never manage (docs/QUEUE.md).
 
 // moduleFormat and importFileExtension are explicit so that generation does not
 // depend on whether tsconfig.json is present (e.g. during `npm ci` in Docker).
@@ -136,7 +136,15 @@ model ResearchRun {
   /// Why delivery_suppressed_at was set: USER_SUSPENDED (also requests provider
   /// cancellation of a running request) or TASK_DELETED (delivery only).
   deliverySuppressionReason String?                 @map("delivery_suppression_reason")
-  reservation               BudgetReservation?
+  /// One reservation per provider submission attempt (TRB-060); attempt 1 is created at admission.
+  reservations              BudgetReservation[]
+  /// TRB-060: provider submission attempts. The run's own submission, response,
+  /// usage and lease fields describe its current attempt.
+  attempts                  ResearchAttempt[]
+  /// Number of the current submission attempt (1 unless a retry was authorized).
+  currentAttemptNo          Int                     @default(1) @map("current_attempt_no")
+  /// QUEUED for a retry: not claimable before this instant.
+  nextAttemptAt             DateTime?               @map("next_attempt_at") @db.Timestamptz(3)
   outboxEvents              OutboxEvent[]
 
   createdAt  DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
@@ -496,12 +504,14 @@ enum ReservationStatus {
   RESOLVED
 }
 
-/// One per accepted live run. Status changes are conditional (idempotent) and
+/// One per provider submission attempt of an accepted live run. Status changes are conditional (idempotent) and
 /// mirrored by append-only usage_ledger entries whose amounts sum to exposure.
 model BudgetReservation {
   id              String            @id @default(uuid()) @db.Uuid
-  runId           String            @unique @map("run_id") @db.Uuid
+  runId           String            @map("run_id") @db.Uuid
   run             ResearchRun       @relation(fields: [runId], references: [id], onDelete: Restrict)
+  /// The provider submission attempt this reservation funds (TRB-060); immutable.
+  attemptNo       Int               @default(1) @map("attempt_no")
   userId          String            @map("user_id") @db.Uuid
   user            AppUser           @relation(fields: [userId], references: [id], onDelete: Restrict)
   /// UTC month of admission; every later entry stays in this period.
@@ -525,6 +535,8 @@ model BudgetReservation {
   updatedAt       DateTime          @updatedAt @map("updated_at") @db.Timestamptz(3)
   ledger          UsageLedger[]
 
+  @@unique([runId, attemptNo])
+  @@index([runId])
   @@index([userId, periodMonth])
   @@index([periodMonth])
   @@map("budget_reservation")
@@ -561,9 +573,11 @@ model UsageLedger {
   @@map("usage_ledger")
 }
 
-/// Durable execution request written in the admission transaction. Until TRB-060
-/// connects pg-boss, the in-process research worker consumes RESEARCH_EXECUTE
-/// events directly when it claims the run (dispatched_at), in one statement.
+/// Durable request to inspect and advance a run (docs/QUEUE.md). RESEARCH_EXECUTE
+/// is written by admission and is the run's admission evidence; RESEARCH_WAKE
+/// re-wakes a run (deferral, retry, recovery). The dispatcher publishes due events
+/// to pg-boss and sets dispatched_at in the same transaction. At most one
+/// undispatched event per run (partial unique index).
 model OutboxEvent {
   id           String      @id @default(uuid()) @db.Uuid
   operationKey String      @unique @map("operation_key")
@@ -572,9 +586,52 @@ model OutboxEvent {
   run          ResearchRun @relation(fields: [runId], references: [id], onDelete: Restrict)
   payload      Json
   createdAt    DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+  /// Not published before this instant (deferred wake-ups).
+  availableAt  DateTime    @default(now()) @map("available_at") @db.Timestamptz(3)
   dispatchedAt DateTime?   @map("dispatched_at") @db.Timestamptz(3)
   cancelledAt  DateTime?   @map("cancelled_at") @db.Timestamptz(3)
 
   @@index([runId])
   @@map("outbox_event")
+}
+
+// ---------------------------------------------------------------------------
+// TRB-060: provider submission attempts.
+
+/// How a provider submission attempt ended; null while it is open.
+enum AttemptOutcome {
+  /// The provider reported a terminal status for the response.
+  PROVIDER_TERMINAL
+  /// The provider refused the request (HTTP 4xx); nothing was started or billed.
+  NOT_ACCEPTED
+  /// The request may still exist or bill (unknown submission, unconfirmed cancellation).
+  UNCERTAIN
+}
+
+/// One provider submission of a run, created with the submission intent before
+/// the call. Polling or a queue redelivery resumes the same attempt; only a new
+/// provider submission creates another one (with its own reservation).
+model ResearchAttempt {
+  id                 String          @id @default(uuid()) @db.Uuid
+  runId              String          @map("run_id") @db.Uuid
+  run                ResearchRun     @relation(fields: [runId], references: [id], onDelete: Restrict)
+  attemptNo          Int             @map("attempt_no")
+  submissionState    SubmissionState @map("submission_state")
+  outcome            AttemptOutcome?
+  /// Run fencing token of the worker that recorded the submission intent.
+  fencingToken       Int             @map("fencing_token")
+  workerId           String?         @map("worker_id")
+  submittedAt        DateTime?       @map("submitted_at") @db.Timestamptz(3)
+  providerResponseId String?         @unique @map("provider_response_id")
+  providerStatus     String?         @map("provider_status")
+  providerModel      String?         @map("provider_model")
+  usage              Json?
+  toolCallCount      Int?            @map("tool_call_count")
+  failureCode        String?         @map("failure_code")
+  completedAt        DateTime?       @map("completed_at") @db.Timestamptz(3)
+  createdAt          DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([runId, attemptNo])
+  @@map("research_attempt")
 }

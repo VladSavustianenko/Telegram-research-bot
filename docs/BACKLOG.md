@@ -59,7 +59,7 @@ Acceptance note (owner, 2026-10-19, from the TRB-020 live evidence):
 - **Explicit policy.** Unknown usage and potential overruns need a documented policy, for example a reservation margin for extra searches, retention of unknown amounts and reconciliation against billing evidence. It must be accepted before live research is opened to members.
 - **Until then,** live research stays administrator-only (TRB-030).
 
-Status: READY FOR REVIEW (2026-10-19; review fix for commit 6ddcc3e applied 2026-10-20: partial usage). Mock validation only: scripted providers (no network), synthetic prices, real PostgreSQL; no live request. Behaviour: docs/ACCOUNTING.md. Evidence: docs/VALIDATION.md, "TRB-050 evidence" and "TRB-050 review fix". The acceptance note above is implemented, as follows:
+Status: DONE — accepted by the owner on 2026-10-20 after review of commit b6933460a1140d2845d725caf23b3643f70ae4c6 (implementation and the partial-usage review fix for 6ddcc3e). Mock validation only: scripted providers (no network), synthetic prices, real PostgreSQL; no live request. Behaviour: docs/ACCOUNTING.md. Evidence: docs/VALIDATION.md, "TRB-050 evidence", "TRB-050 review fix" and "TRB-050 acceptance". The acceptance note above is implemented, as follows:
 - reservations do not trust `max_tool_calls`: the search allowance must exceed it;
 - observed searches are not treated as billed, and the uncovered allowance stays held;
 - unknown cost stays exposed until an explicit operator resolution.
@@ -73,6 +73,11 @@ Depends on: 020, 050.
 Connect outbox to pg-boss. Implement lease/fencing, research attempts, asynchronous response tracking where supported, bounded retries/deadlines, fair dispatch and restart recovery.
 
 Acceptance: replayed jobs cannot execute a terminal run again; crash after business commit still dispatches; known provider response resumes after restart; unknown submission is not automatically resubmitted; stale workers cannot finalize; partial/incomplete responses are not delivered as complete; suspended/deleted work is suppressed with correct accounting.
+
+Status: READY FOR REVIEW (2026-10-20). Mock validation only: scripted providers (no network), recording Telegram sender, real PostgreSQL and real pg-boss 12.37.0; Docker smoke with the fake provider; no live request or Telegram message. Behaviour: docs/QUEUE.md. Evidence: docs/VALIDATION.md, "TRB-060 evidence".
+- **Not exactly-once.** Exactly-once provider execution is not claimed: a submission interrupted before its response ID was saved is UNCERTAIN and never resubmitted.
+- **Retries off by default.** Automatic resubmission after a rate-limit refusal is implemented but disabled (`RESEARCH_SUBMISSION_RETRY_LIMIT=0`); enabling it is an owner decision.
+- **Rollout.** The old and new execution mechanisms must not overlap (docs/QUEUE.md, "Migration and rollout").
 
 ## TRB-070 — Persistent scheduling and time semantics
 

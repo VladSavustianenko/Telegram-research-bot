@@ -8,6 +8,8 @@ import { CLOCK } from '../../src/common/clock';
 import { parseEnv } from '../../src/config/env.schema';
 import { PrismaService } from '../../src/database/prisma.service';
 import { DeliveryWorker } from '../../src/delivery/delivery-worker.service';
+import { QueueService } from '../../src/queue/queue.service';
+import { OutboxDispatcher } from '../../src/research/outbox-dispatcher';
 import { RESEARCH_PROVIDER } from '../../src/research/provider/provider.types';
 import { ResearchWorker } from '../../src/research/research-worker.service';
 import { TELEGRAM_SENDER } from '../../src/telegram/telegram-sender';
@@ -54,6 +56,8 @@ export interface Harness {
   app: INestApplication;
   prisma: PrismaService;
   research: ResearchWorker;
+  queue: QueueService;
+  dispatcher: OutboxDispatcher;
   delivery: DeliveryWorker;
   provider: ScriptedProvider;
   sender: RecordingSender;
@@ -112,6 +116,8 @@ export async function startHarness(
     app,
     prisma: app.get(PrismaService),
     research: app.get(ResearchWorker),
+    queue: app.get(QueueService),
+    dispatcher: app.get(OutboxDispatcher),
     delivery: app.get(DeliveryWorker),
     provider,
     sender,
@@ -137,8 +143,10 @@ export async function resetDatabase(
   options: { onboardedAdmins?: boolean } = {},
 ): Promise<void> {
   await prisma.$executeRawUnsafe(
-    'TRUNCATE usage_ledger, budget_reservation, pricing_version, outbox_event, task_draft, task, audit_event, invitation, research_tool_item, research_reconciliation, delivery_part, delivery, research_run, telegram_update, app_user RESTART IDENTITY CASCADE',
+    'TRUNCATE usage_ledger, budget_reservation, pricing_version, outbox_event, task_draft, task, audit_event, invitation, research_tool_item, research_reconciliation, research_attempt, delivery_part, delivery, research_run, telegram_update, app_user RESTART IDENTITY CASCADE',
   );
+  // Jobs of earlier tests (pg-boss's own schema, installed by the global setup).
+  await prisma.$executeRawUnsafe('TRUNCATE pgboss.job');
   if (options.onboardedAdmins === false) return;
   for (const id of [ADMIN_ID, OTHER_ADMIN_ID]) {
     await prisma.$executeRaw`

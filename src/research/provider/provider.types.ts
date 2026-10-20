@@ -106,6 +106,12 @@ export class ProviderError extends Error {
     readonly certainty: ProviderErrorCertainty,
     /** Provider resource definitely no longer exists (e.g. HTTP 404 on retrieve). */
     readonly gone = false,
+    /**
+     * Set only for a refused submission that may succeed later (HTTP 429 rate
+     * limit, not quota exhaustion): the provider's Retry-After in milliseconds,
+     * or null when it sent none. Undefined: not retryable.
+     */
+    readonly retryAfterMs?: number | null,
   ) {
     super(`Research provider error: ${code}`);
     this.name = 'ProviderError';

@@ -1,5 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { Client } from 'pg';
+import { PgBoss } from 'pg-boss';
 import type { TestProject } from 'vitest/node';
 import { assertSafeTestServerUrl, disposableDatabaseName, withDatabase } from './test-database';
 
@@ -30,6 +31,15 @@ export default async function setup(project: TestProject): Promise<() => Promise
   if (migrate.status !== 0) {
     await dropDatabase(serverUrl, database);
     throw new Error(`prisma migrate deploy failed:\n${migrate.stdout}\n${migrate.stderr}`);
+  }
+
+  // pg-boss installs its own schema, as the application does at startup (docs/QUEUE.md).
+  const boss = new PgBoss({ connectionString: databaseUrl, supervise: false, schedule: false });
+  boss.on('error', () => undefined);
+  try {
+    await boss.start();
+  } finally {
+    await boss.stop({ graceful: false });
   }
 
   project.provide('databaseUrl', databaseUrl);

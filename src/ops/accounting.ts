@@ -34,6 +34,7 @@ async function main(): Promise<number> {
         orderBy: { createdAt: 'asc' },
         select: {
           runId: true,
+          attemptNo: true,
           status: true,
           periodMonth: true,
           reservedMicros: true,
