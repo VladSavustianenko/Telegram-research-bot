@@ -87,7 +87,7 @@ Implement due-task polling, local occurrence computation, DST policies, single c
 
 Acceptance: daily/weekly schedules work in Europe/Kyiv and at least one additional DST zone; gap/overlap behavior matches SPEC; two schedulers create one occurrence; downtime causes at most one eligible catch-up; manual run does not shift future schedule; pause/edit cancels eligible queued jobs and releases reservations; budget denial cannot busy-loop.
 
-Status: READY FOR REVIEW (2026-10-20). Mock validation only: fake clock, scripted providers (no network), recording Telegram sender, real PostgreSQL and pg-boss; Docker smoke with the fake provider; no live request or Telegram message. Behaviour: docs/SCHEDULING.md. Evidence: docs/VALIDATION.md, "TRB-070 evidence". Existing active scheduled tasks are initialized to their next future occurrence, with no historical execution.
+Status: READY FOR REVIEW (2026-10-20). Mock validation only: fake clock, scripted providers (no network), recording Telegram sender, real PostgreSQL and pg-boss; Docker smoke with the fake provider; no live request or Telegram message. Behaviour: docs/SCHEDULING.md. Evidence: docs/VALIDATION.md, "TRB-070 evidence" and "TRB-070 review fixes" (review of commit 6225d2e, applied 2026-10-20: manual quota no longer applied to scheduled occurrences; prompt edits recompute the next occurrence). Existing active scheduled tasks are initialized to their next future occurrence, with no historical execution.
 
 ## TRB-080 — Reliable result delivery and history
 

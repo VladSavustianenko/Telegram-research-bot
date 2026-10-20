@@ -54,7 +54,7 @@ Results do not depend on the host time zone: tests run the same calculations wit
 - **One record per occurrence.** `schedule_event` is unique per `(task, occurrence_at)`, and scheduled runs are unique per `(task, occurrence_at)` (`research_run_scheduled_occurrence`). The one-active-run-per-task index still applies.
 - **Denials advance once.** Every refusal is recorded once and the schedule moves on, so nothing is retried on every pass.
 - **Infrastructure failure is not a skip.** A failing transaction rolls back completely: run, reservation, event and advance. The occurrence stays due and is retried on a later pass.
-- **Same controls for every occurrence.** On-time and catch-up occurrences use the identical admission call: owner access, live restricted to administrators, quotas (daily runs; the manual-run quota does not apply), budgets with reservation, live gate, active-run exclusion.
+- **Same controls for every occurrence.** On-time and catch-up occurrences use the identical admission call: owner access, live restricted to administrators, quotas (the total daily run quota; the manual-run quota applies only to /research and Run now, enforced in admission by source since the review fix), budgets with reservation, live gate, active-run exclusion.
 - **No acknowledgement.** A scheduled run is not acknowledged. Its report, or its failure status, is the message.
 - **Bounded work.** Each task costs one transaction per pass, whatever the outage length; counting missed occurrences is capped at 1 000. Intermediate historical occurrences are never admitted.
 
@@ -74,7 +74,7 @@ SPEC: at most one catch-up, for the latest missed occurrence, when it is no olde
 | Create (Save) | `next_run_at` = first future occurrence; nothing runs | — | — |
 | Pause | `next_run_at` cleared | Cancelled `TASK_PAUSED`, reservation released (TRB-050) | May finish and deliver |
 | Resume | First occurrence after now; missed ones are not replayed | — | — |
-| Prompt edit | Unchanged | Cancelled `TASK_EDITED`, released | Keeps its immutable snapshot |
+| Prompt edit | Replaced by the first occurrence of the existing schedule strictly after the edit; a pending past-due occurrence is dropped, never run later with the new prompt (paused and manual tasks keep none) | Cancelled `TASK_EDITED`, released | Keeps its immutable snapshot |
 | Schedule edit (kind, day, time, zone) | Recomputed from now (paused tasks stay without one) | Cancelled `TASK_EDITED`, released | Keeps its snapshot |
 | Name edit | Unchanged | Unchanged | Unchanged |
 | Delete | Cleared; never scheduled again | Cancelled `TASK_DELETED`, released | Continues; delivery suppressed (`TASK_DELETED`, durable) |

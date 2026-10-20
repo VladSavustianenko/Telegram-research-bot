@@ -561,6 +561,10 @@ describe('TRB-070 scheduling (fake clock, scripted provider, real PostgreSQL)', 
           orderBy: { createdAt: 'asc' },
         });
         expect(ledger.map((e) => e.kind)).toEqual(['RESERVE', 'RELEASE']);
+        // Pause clears the schedule; a prompt edit keeps the next future occurrence.
+        expect((await task(t.id)).nextRunAt).toEqual(
+          action === 'pause' ? null : at('2026-10-20T06:00:00Z'),
+        );
         expect(await l.research.tick()).toBe(false);
         expect(submissions()).toBe(0);
       },
@@ -644,6 +648,139 @@ describe('TRB-070 scheduling (fake clock, scripted provider, real PostgreSQL)', 
       expect(report).toContain(
         'Заплановано на: 2026-10-19 09:00 Europe/Kyiv — виконано із затримкою',
       );
+    });
+  });
+  describe('review fixes (commit 6225d2e)', () => {
+    /** Five manual runs admitted and finished today (counted, none active). */
+    async function fiveFinishedManualRuns(harness: Harness): Promise<void> {
+      harness.provider.onSubmit = (request) =>
+        Promise.resolve(snapshot(request, { id: `resp_${request.runId}` }));
+      for (let i = 0; i < 5; i += 1) {
+        await say(`/research manual ${i}`, ADMIN_ID, harness);
+        expect(await harness.research.tick()).toBe(true);
+      }
+      expect(
+        await h.prisma.researchRun.count({ where: { trigger: 'MANUAL', state: 'SUCCEEDED' } }),
+      ).toBe(5);
+    }
+    const counts = async () => ({
+      runs: await h.prisma.researchRun.count(),
+      reservations: await h.prisma.budgetReservation.count(),
+      events: await h.prisma.outboxEvent.count(),
+    });
+    const lastReason = async () =>
+      (await h.prisma.telegramUpdate.findFirst({ orderBy: { updateId: 'desc' } }))?.reason;
+    const savePrompt = async (taskId: string, revision: number, prompt: string) => {
+      await press(taskCallbackData(taskId, revision, 'ep'));
+      await say(prompt);
+      await press(button('Зберегти'));
+    };
+
+    it('admits a scheduled occurrence when only the manual quota is exhausted (Finding 1)', async () => {
+      const l = await start({ USER_DAILY_RUN_LIMIT: '10', USER_DAILY_MANUAL_RUN_LIMIT: '5' }, true);
+      await fiveFinishedManualRuns(l);
+      const t = await newTask();
+      clock.set('2026-10-19T06:00:10Z');
+      await l.scheduler.tick();
+      expect(await events(t.id)).toEqual([
+        expect.objectContaining({ disposition: 'ADMITTED', reason: 'ADMITTED' }),
+      ]);
+      const scheduled = await h.prisma.researchRun.findFirstOrThrow({
+        where: { trigger: 'SCHEDULED' },
+      });
+      expect(scheduled).toMatchObject({ state: 'QUEUED', occurrenceAt: T0, taskId: t.id });
+      expect(await h.prisma.outboxEvent.findMany({ where: { runId: scheduled.id } })).toEqual([
+        expect.objectContaining({
+          type: 'RESEARCH_EXECUTE',
+          dispatchedAt: null,
+          cancelledAt: null,
+        }),
+      ]);
+      expect(await h.prisma.budgetReservation.findMany({ where: { runId: scheduled.id } })).toEqual(
+        [expect.objectContaining({ status: 'RESERVED' })],
+      );
+      expect((await task(t.id)).nextRunAt).toEqual(at('2026-10-20T06:00:00Z'));
+    });
+
+    it('still refuses manual admissions at the manual quota, creating nothing (Finding 1)', async () => {
+      const l = await start({ USER_DAILY_RUN_LIMIT: '10', USER_DAILY_MANUAL_RUN_LIMIT: '5' }, true);
+      await fiveFinishedManualRuns(l);
+      const t = await newTask({ nextRunAt: at('2026-10-20T06:00:00Z') });
+      const before = await counts();
+      await say('/research one more', ADMIN_ID, l);
+      expect(await lastReason()).toBe('DAILY_MANUAL_LIMIT');
+      await press(taskCallbackData(t.id, 1, 'r'), ADMIN_ID, l);
+      expect(await lastReason()).toBe('DAILY_MANUAL_LIMIT');
+      expect(await counts()).toEqual(before);
+    });
+
+    it('refuses a scheduled occurrence at the total daily quota, creating nothing (Finding 1)', async () => {
+      const l = await start({ USER_DAILY_RUN_LIMIT: '5', USER_DAILY_MANUAL_RUN_LIMIT: '5' }, true);
+      await fiveFinishedManualRuns(l);
+      const t = await newTask();
+      const before = await counts();
+      clock.set('2026-10-19T06:00:10Z');
+      await l.scheduler.tick();
+      expect(await events(t.id)).toEqual([
+        expect.objectContaining({ disposition: 'SKIPPED_DENIED', reason: 'DAILY_RUN_LIMIT' }),
+      ]);
+      expect(await counts()).toEqual(before);
+    });
+
+    it('replaces a pending past-due occurrence on a prompt edit; no catch-up of it (Finding 2)', async () => {
+      const t = await newTask(); // due at 09:00, not processed yet
+      clock.set('2026-10-19T07:00:00Z'); // 10:00 Kyiv
+      const stale = {
+        id: t.id,
+        revision: t.revision,
+        nextRunAt: T0,
+        telegramUserId: BigInt(ADMIN_ID),
+      };
+      await savePrompt(t.id, 1, 'New prompt');
+      expect(await task(t.id)).toMatchObject({
+        prompt: 'New prompt',
+        revision: 2,
+        nextRunAt: at('2026-10-20T06:00:00Z'),
+      });
+      // A candidate captured before the edit cannot admit 09:00 or move the new value.
+      expect(await h.scheduler.processOccurrence(stale, clock.now())).toBe('STALE');
+      await h.scheduler.tick();
+      expect(await events(t.id)).toHaveLength(0);
+      expect(await runs()).toHaveLength(0);
+      expect((await task(t.id)).nextRunAt).toEqual(at('2026-10-20T06:00:00Z'));
+    });
+
+    it('keeps next_run_at null on prompt edits of paused and manual-only tasks (Finding 2)', async () => {
+      const paused = await newTask();
+      await press(taskCallbackData(paused.id, 1, 'p'));
+      clock.set('2026-10-19T07:00:00Z');
+      await savePrompt(paused.id, 2, 'Paused prompt');
+      expect(await task(paused.id)).toMatchObject({ prompt: 'Paused prompt', nextRunAt: null });
+
+      const manual = await h.prisma.task.create({
+        data: {
+          userId: await userId(),
+          name: 'Manual',
+          prompt: 'Manual prompt',
+          scheduleKind: 'MANUAL',
+          timeZone: 'Europe/Kyiv',
+        },
+      });
+      await savePrompt(manual.id, 1, 'Edited manual prompt');
+      expect(await task(manual.id)).toMatchObject({
+        prompt: 'Edited manual prompt',
+        nextRunAt: null,
+      });
+      expect(await runs()).toHaveLength(0);
+    });
+
+    it('does not shift the schedule on a name-only edit (Finding 2)', async () => {
+      const t = await newTask();
+      clock.set('2026-10-19T05:30:00Z');
+      await press(taskCallbackData(t.id, 1, 'en'));
+      await say('Renamed');
+      await press(button('Зберегти'));
+      expect(await task(t.id)).toMatchObject({ name: 'Renamed', revision: 2, nextRunAt: T0 });
     });
   });
 });

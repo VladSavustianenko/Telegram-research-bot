@@ -138,9 +138,12 @@ export async function admitResearch(
   if ((await tx.researchRun.count({ where: counted })) >= config.USER_DAILY_RUN_LIMIT) {
     return refuse('DAILY_RUN_LIMIT', messages.dailyRunLimit(config.USER_DAILY_RUN_LIMIT));
   }
+  // The manual-run quota applies to manual sources only (/research, Run now);
+  // scheduled occurrences count against the total daily quota above.
   if (
+    !scheduled &&
     (await tx.researchRun.count({ where: { ...counted, trigger: 'MANUAL' } })) >=
-    config.USER_DAILY_MANUAL_RUN_LIMIT
+      config.USER_DAILY_MANUAL_RUN_LIMIT
   ) {
     return refuse(
       'DAILY_MANUAL_LIMIT',

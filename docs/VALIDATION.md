@@ -735,6 +735,40 @@ Remaining limitations:
 - **History view.** No Telegram view of schedule history yet (TRB-080/090).
 - **Not run:** CI, any live OpenAI request or Telegram message, deployment.
 
+### TRB-070 review fixes (2026-10-20, reviewed commit 6225d2e)
+
+Mock validation only (fake clock, scripted providers with synthetic accounting, real PostgreSQL and pg-boss). No schema change.
+
+**Finding 1: the manual quota blocked scheduled runs.**
+- **Root cause.** `admitResearch` applied `USER_DAILY_MANUAL_RUN_LIMIT` to every source. A scheduled occurrence was refused with `DAILY_MANUAL_LIMIT` and permanently skipped.
+- **Fix.** The check runs only for manual sources (`/research` and Run now). Scheduled occurrences still pass the total daily quota, access, active-run, queue, budget and uncertainty checks in the same atomic admission. Which runs are counted is unchanged (runs cancelled before submission are excluded).
+
+**Finding 2: prompt edits kept a past-due occurrence.**
+- **Root cause.** `saveEdit` recomputed `next_run_at` only for the SCHEDULE section. A prompt saved at 10:00 for a task due at 09:00 left 09:00 in place, and the next pass admitted the new prompt as a catch-up for the old occurrence.
+- **Fix.** A successful PROMPT save sets `next_run_at` to the first occurrence of the task's existing schedule strictly after the edit time. It happens in the same conditional update as the prompt and revision; queued runs are cancelled and released in the same transaction. A SCHEDULE save uses the new schedule. Paused and manual tasks stay null, and a name edit leaves it unchanged.
+
+| Check | Command | Result |
+|---|---|---|
+| Reproduction before the fixes | the 6 new tests in `scheduling.int-spec.ts` ("review fixes") against the reviewed code | 2 failed for the reported reasons: the scheduled occurrence was `SKIPPED_DENIED` / `DAILY_MANUAL_LIMIT`, and `next_run_at` stayed 2026-10-19 06:00Z after the prompt edit. The other 4 passed: guarantees that already held, now covered |
+| Targeted after the fixes | `scheduling.int-spec.ts` | 30 passed |
+| Static checks | `npm run format:check`, `npm run lint`, `npm run typecheck`, `npm run prisma:validate` | Pass |
+| Unit tests | `npm test` | 203 passed (15 files) |
+| Integration tests | `npm run test:integration` | 216 passed (15 files); 0 disposable databases left |
+| Build | `npm run build` | Pass |
+
+Regression scenarios (real PostgreSQL; the 5 manual runs are live admissions with synthetic prices, executed by the scripted provider):
+1. **Manual quota exhausted, total quota available.** Daily limit 10, manual 5, 5 manual runs finished today, none active. The occurrence is `ADMITTED`: a SCHEDULED run QUEUED for 09:00 with a pending `RESEARCH_EXECUTE` event and a RESERVED reservation; the next run is tomorrow.
+2. **Manual sources still refused.** Under the same conditions `/research` and Run now are refused with `DAILY_MANUAL_LIMIT`, adding no run, reservation or outbox event.
+3. **Total quota exhausted.** With both limits at 5, the occurrence is `SKIPPED_DENIED` / `DAILY_RUN_LIMIT`, adding no run, reservation or outbox event.
+4. **Prompt edit at 10:00 with 09:00 pending.** The next run becomes tomorrow 09:00 (revision 2). A scheduler candidate captured before the edit returns `STALE`, and the next pass creates no event or run and keeps the new value.
+5. **Paused and manual tasks.** Prompt edits keep `next_run_at` null.
+6. **Name edit.** `next_run_at` is unchanged.
+7. **Reused coverage.**
+   - "cancels a queued scheduled run on prompt edit…" proves that after the scheduler admitted first, the edit cancels the run with ledger RESERVE + RELEASE exactly once and nothing executes; it now also asserts the next run.
+   - "keeps the running snapshot on edit…" proves that running research keeps its original prompt and request.
+
+**Not run:** Docker smoke (no dependency, schema or runtime configuration change since the TRB-070 smoke), mutation re-run, CI, live requests.
+
 ## Release checklist
 
 - Exact model/tool compatibility verified in official docs and an authorized sample.

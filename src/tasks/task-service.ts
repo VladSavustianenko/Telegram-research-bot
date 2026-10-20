@@ -653,11 +653,17 @@ async function saveEdit(ctx: TaskContext, draft: DraftRow): Promise<TaskOutcome>
     return previewOnly(ctx, draft, 'DRAFT_INCOMPLETE', 'Чернетка неповна; перевірте кроки.');
   }
   // The revision condition guarantees the task state read with the draft is current.
+  // A prompt or schedule edit replaces any pending occurrence with the first one
+  // strictly after now: the new schedule, or the task's existing one for a prompt
+  // edit, so a past-due occurrence is never run later with the new settings. Paused
+  // and manual tasks keep none. A name edit does not touch the schedule.
   const schedule =
-    draft.section === 'SCHEDULE'
+    draft.section === 'SCHEDULE' || draft.section === 'PROMPT'
       ? {
           nextRunAt: nextRunOf(
-            changes as Pick<Task, 'scheduleKind' | 'weekday' | 'localTime' | 'timeZone'>,
+            draft.section === 'SCHEDULE'
+              ? (changes as Pick<Task, 'scheduleKind' | 'weekday' | 'localTime' | 'timeZone'>)
+              : draft.task,
             draft.task.state,
             ctx.now,
           ),
