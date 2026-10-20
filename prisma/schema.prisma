@@ -138,7 +138,7 @@ model ResearchRun {
   /// so reactivation does not release this run's results; /result still works.
   deliverySuppressedAt      DateTime?               @map("delivery_suppressed_at") @db.Timestamptz(3)
   /// Why delivery_suppressed_at was set: USER_SUSPENDED (also requests provider
-  /// cancellation of a running request) or TASK_DELETED (delivery only).
+  /// cancellation of a running request), TASK_DELETED or CHAT_BLOCKED (delivery only).
   deliverySuppressionReason String?                 @map("delivery_suppression_reason")
   /// One reservation per provider submission attempt (TRB-060); attempt 1 is created at admission.
   reservations              BudgetReservation[]
@@ -187,8 +187,16 @@ enum DeliveryPartState {
   FAILED
 }
 
+/// TRB-080: a part is a text message or a full-text document (report fallback).
+enum DeliveryPartKind {
+  MESSAGE
+  DOCUMENT
+}
+
 model Delivery {
   id            String         @id @default(uuid()) @db.Uuid
+  /// TRB-080: creation order; deliveries to one chat are sent in this order.
+  seq           BigInt         @unique @default(autoincrement())
   runId         String?        @map("run_id") @db.Uuid
   run           ResearchRun?   @relation(fields: [runId], references: [id])
   kind          DeliveryKind
@@ -209,26 +217,57 @@ model Delivery {
   createdAt     DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt     DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
   parts         DeliveryPart[]
+  /// TRB-080: durable wake-ups published to the delivery queue (docs/DELIVERY.md).
+  events        DeliveryEvent[]
 
   @@index([state, nextAttemptAt])
   @@map("delivery")
 }
 
-/// Immutable rendered payload; only state and Telegram metadata change.
+/// Immutable rendered payload; only state and Telegram metadata change (a trigger
+/// rejects payload changes, TRB-080).
 model DeliveryPart {
   deliveryId        String            @map("delivery_id") @db.Uuid
   delivery          Delivery          @relation(fields: [deliveryId], references: [id])
   ordinal           Int
+  kind              DeliveryPartKind  @default(MESSAGE)
+  /// MESSAGE: the message HTML. DOCUMENT: the caption HTML.
   html              String
+  /// DOCUMENT only: generated file name and the complete UTF-8 file text.
+  fileName          String?           @map("file_name")
+  fileContent       String?           @map("file_content")
   /// Telegram inline keyboard (callback buttons only), or null.
   replyMarkup       Json?             @map("reply_markup")
   contentHash       String            @map("content_hash")
   state             DeliveryPartState @default(PENDING)
   telegramMessageId BigInt?           @map("telegram_message_id")
   sentAt            DateTime?         @map("sent_at") @db.Timestamptz(3)
+  /// Send intent: when the part was marked SENDING, right before the Telegram call.
+  sendStartedAt     DateTime?         @map("send_started_at") @db.Timestamptz(3)
+  /// Last classified failure of this part (Telegram error code), if any.
+  errorCode         String?           @map("error_code")
 
   @@id([deliveryId, ordinal])
   @@map("delivery_part")
+}
+
+/// Durable request to inspect and advance a delivery (TRB-080, docs/DELIVERY.md):
+/// the delivery dispatcher publishes due events to the delivery queue and sets
+/// dispatched_at in the same transaction; the event ID is the pg-boss job ID.
+/// At most one undispatched event per delivery (partial unique index).
+model DeliveryEvent {
+  id           String    @id @default(uuid()) @db.Uuid
+  deliveryId   String    @map("delivery_id") @db.Uuid
+  delivery     Delivery  @relation(fields: [deliveryId], references: [id], onDelete: Restrict)
+  reason       String
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  /// Not published before this instant (Retry-After, backoff).
+  availableAt  DateTime  @default(now()) @map("available_at") @db.Timestamptz(3)
+  dispatchedAt DateTime? @map("dispatched_at") @db.Timestamptz(3)
+  cancelledAt  DateTime? @map("cancelled_at") @db.Timestamptz(3)
+
+  @@index([deliveryId])
+  @@map("delivery_event")
 }
 
 enum ReconciliationResolution {
@@ -319,6 +358,11 @@ model AppUser {
   invitedAt          DateTime?           @map("invited_at") @db.Timestamptz(3)
   onboardedAt        DateTime?           @map("onboarded_at") @db.Timestamptz(3)
   suspendedAt        DateTime?           @map("suspended_at") @db.Timestamptz(3)
+  /// TRB-080: Telegram confirmed the private chat cannot receive messages (bot
+  /// blocked, account deactivated). Automatic research is paused; cleared only
+  /// when the user writes to the bot again (docs/DELIVERY.md).
+  chatBlockedAt      DateTime?           @map("chat_blocked_at") @db.Timestamptz(3)
+  chatBlockReason    String?             @map("chat_block_reason")
   createdAt          DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt          DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
   runs               ResearchRun[]
@@ -360,6 +404,10 @@ enum AuditEventKind {
   INVITATION_REDEEMED
   USER_SUSPENDED
   USER_REACTIVATED
+  /// TRB-080: Telegram confirmed the user's private chat is unavailable.
+  DESTINATION_BLOCKED
+  /// TRB-080: the user wrote to the bot again after a confirmed block.
+  DESTINATION_RESTORED
 }
 
 /// Append-only access audit (UPDATE and DELETE are rejected by a trigger).

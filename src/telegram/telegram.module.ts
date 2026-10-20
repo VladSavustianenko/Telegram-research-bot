@@ -8,7 +8,7 @@ import { TelegramWebhookController } from './webhook.controller';
 
 export function createTelegramSender(config: Env): GrammyTelegramSender | null {
   return config.TELEGRAM_MODE !== 'disabled' && config.TELEGRAM_BOT_TOKEN
-    ? new GrammyTelegramSender(config.TELEGRAM_BOT_TOKEN)
+    ? new GrammyTelegramSender(config.TELEGRAM_BOT_TOKEN, 15, config.TELEGRAM_API_ROOT)
     : null;
 }
 

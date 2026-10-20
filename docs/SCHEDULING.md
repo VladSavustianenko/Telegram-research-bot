@@ -132,4 +132,4 @@ Migration `20261020180000_trb_070_scheduling` is additive:
 - Scheduling granularity is the polling interval: a run starts up to `SCHEDULER_POLL_INTERVAL_SECONDS`, plus queue time, after its planned time.
 - One run executes at a time globally (TRB-060), so simultaneous occurrences queue behind each other and later ones may report a delay. A full queue (`RESEARCH_QUEUE_LIMIT`) or the active-run limit makes an occurrence `SKIPPED_DENIED`, by policy, not deferred.
 - Time zone rules are those of the runtime's ICU data. A zone rule change after `next_run_at` was computed applies from the following occurrence.
-- Operational history has no Telegram view yet (TRB-080/090).
+- Schedule events (skips, overlaps) have no Telegram view yet (TRB-090). Run history, including scheduled runs with planned and actual times, is shown since TRB-080 (docs/DELIVERY.md).

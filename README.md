@@ -60,7 +60,7 @@ The dev database uses port 5434 so that it does not collide with a locally insta
 
 ### Research prototype (TRB-020)
 
-Private-chat commands for users with completed onboarding (TRB-030): `/research <prompt>` (acknowledges with a run ID; the sourced report arrives separately) and `/result <run-id>` (resends the stored report, never researches again). Webhook at `POST /telegram/webhook` (secret header required) or development polling. Research runs through a PostgreSQL-backed pg-boss queue (TRB-060) and delivery through a database-backed worker, one research request at a time. An unresolved UNCERTAIN live run (a billed request may still be active) blocks further live research until an operator reconciles it with `npm run ops:reconcile`. Before any live use, enable an OpenAI project hard spend limit with "Enforce a hard limit" turned on; spend alerts alone do not stop traffic, and application budgets (TRB-050) are local estimates, not a provider ceiling.
+Private-chat commands for users with completed onboarding (TRB-030): `/research <prompt>` (acknowledges with a run ID; the sourced report arrives separately) and `/result <run-id>` (resends the stored report, never researches again). Webhook at `POST /telegram/webhook` (secret header required) or development polling. Research runs through a PostgreSQL-backed pg-boss queue (TRB-060) and delivery through a separate pg-boss queue (TRB-080), one research request at a time. An unresolved UNCERTAIN live run (a billed request may still be active) blocks further live research until an operator reconciles it with `npm run ops:reconcile`. Before any live use, enable an OpenAI project hard spend limit with "Enforce a hard limit" turned on; spend alerts alone do not stop traffic, and application budgets (TRB-050) are local estimates, not a provider ceiling.
 
 To try it without cost, use `RESEARCH_MODE=fake`: simulated, clearly labelled results from dated synthetic fixtures. Real Telegram delivery still needs a bot token and is an operator action. Behaviour, recovery policy, enforced and unenforced cost controls, deferred items and the authorized live-sample procedure are in [docs/RESEARCH_SLICE.md](docs/RESEARCH_SLICE.md).
 
@@ -102,6 +102,16 @@ Details: [docs/ACCOUNTING.md](docs/ACCOUNTING.md).
 - **Retries.** A new provider submission is made only after an HTTP 429 refusal, when `RESEARCH_SUBMISSION_RETRY_LIMIT` allows it (default 0), with its own reservation.
 
 Details, retry matrix, rollout and operator procedures: [docs/QUEUE.md](docs/QUEUE.md).
+
+### Delivery and history (TRB-080)
+
+- **Separate delivery queue.** Reports and messages are stored, with their delivery request, before anything is sent. A Telegram failure never triggers research, and resends cost no research quota.
+- **Ambiguous sends.** A confirmed part is never resent. A send whose outcome is unknown becomes `UNKNOWN` and is not retried automatically; exactly-once delivery is not claimed.
+- **Long reports.** A report longer than 6 messages arrives as a summary and a complete UTF-8 text file with the same numbered sources.
+- **History.** `/history` (new), and "Історія" / "Останній результат" on task cards, show runs, delivery states and estimated usage. A run card can resend the stored result (`/result <id>` still works).
+- **Blocked bot.** If Telegram confirms the bot was blocked, automatic research is paused (tasks paused, queued scheduled runs cancelled with their reservations released). Writing to the bot again restores the chat; tasks are resumed one by one.
+
+Details, state transitions, retry classification, document format and rollout: [docs/DELIVERY.md](docs/DELIVERY.md).
 
 Prisma owns the `public` schema and its migrations in `prisma/migrations`; pg-boss owns a separate schema (`QUEUE_SCHEMA`, default `pgboss`), which the application installs at startup (TRB-060). The generated Prisma client is written to `src/generated/prisma` (not committed).
 

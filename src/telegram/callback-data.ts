@@ -10,14 +10,22 @@
  *   t:<task id>:<revision>:<op>   act on the sender's task at <revision>
  *   tl:<page>                     task list page
  *   tn                            start creating a task
+ *   h:<scope>[:<o|n>:<run>]       run history (TRB-080): <scope> is a task ID or "*" (all
+ *                                 the sender's runs); o/n = the page older/newer than <run>
+ *   r:<run>:<scope>               the card of one of the sender's runs, opened from <scope>
+ *   rs:<run>                      explicit resend of the sender's stored result
+ * In h/r/rs, IDs are UUIDs in base64url form (22 characters) to fit the limit.
  */
 const MAX_CALLBACK_BYTES = 64;
 const TIME_ZONE_CALLBACK = /^tz:(0|[1-9]\d{0,8}):([A-Za-z][A-Za-z0-9_+\-/]{0,39})$/;
 const DRAFT_CALLBACK =
   /^d:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}):(0|[1-9]\d{0,8}):(b|x|k|s|r|n|km|kd|kw|w[1-7]|z)$/;
 const TASK_CALLBACK =
-  /^t:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}):([1-9]\d{0,8}):(v|en|ep|es|p|u|d|dy|r)$/;
+  /^t:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}):([1-9]\d{0,8}):(v|en|ep|es|p|u|d|dy|r|lr|h)$/;
 const LIST_CALLBACK = /^tl:(0|[1-9]\d{0,3})$/;
+const HISTORY_CALLBACK = /^h:(\*|[A-Za-z0-9_-]{22})(?::([on]):([A-Za-z0-9_-]{22}))?$/;
+const RUN_CALLBACK = /^r:([A-Za-z0-9_-]{22}):(\*|[A-Za-z0-9_-]{22})$/;
+const RESEND_CALLBACK = /^rs:([A-Za-z0-9_-]{22})$/;
 
 /**
  * Draft operations: b back, x cancel, k keep the current value, s save,
@@ -27,16 +35,27 @@ const LIST_CALLBACK = /^tl:(0|[1-9]\d{0,3})$/;
 export type DraftOp = 'b' | 'x' | 'k' | 's' | 'r' | 'n' | 'km' | 'kd' | 'kw' | `w${number}` | 'z';
 /**
  * Task operations: v view card, en/ep/es edit name/prompt/schedule, p pause,
- * u resume, d ask to delete, dy confirm deletion, r run now (manual admission).
+ * u resume, d ask to delete, dy confirm deletion, r run now (manual admission),
+ * lr latest result, h run history (TRB-080; read-only, like v).
  */
-export type TaskOp = 'v' | 'en' | 'ep' | 'es' | 'p' | 'u' | 'd' | 'dy' | 'r';
+export type TaskOp = 'v' | 'en' | 'ep' | 'es' | 'p' | 'u' | 'd' | 'dy' | 'r' | 'lr' | 'h';
+
+/** History scope: one task of the sender, or all the sender's runs. */
+export type HistoryScope = { taskId: string } | 'all';
+export interface HistoryCursor {
+  direction: 'older' | 'newer';
+  runId: string;
+}
 
 export type CallbackAction =
   | { kind: 'confirm_time_zone'; revision: number; zone: string }
   | { kind: 'draft'; draftId: string; version: number; op: DraftOp }
   | { kind: 'task'; taskId: string; revision: number; op: TaskOp }
   | { kind: 'task_list'; page: number }
-  | { kind: 'task_new' };
+  | { kind: 'task_new' }
+  | { kind: 'history'; scope: HistoryScope; cursor: HistoryCursor | null }
+  | { kind: 'run'; runId: string; scope: HistoryScope }
+  | { kind: 'resend'; runId: string };
 
 function bounded(data: string): string {
   if (Buffer.byteLength(data) > MAX_CALLBACK_BYTES) throw new Error('callback data too long');
@@ -69,6 +88,49 @@ export function taskListCallbackData(page: number): string {
 
 export const TASK_NEW_CALLBACK = 'tn';
 
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/** UUID → 22-character base64url (16 bytes). */
+export function compactId(uuid: string): string {
+  if (!UUID.test(uuid)) throw new Error('not a UUID');
+  return Buffer.from(uuid.replace(/-/g, ''), 'hex').toString('base64url');
+}
+
+/** 22-character base64url → UUID, or null for anything that is not exactly 16 canonical bytes. */
+export function expandId(compact: string): string | null {
+  if (!/^[A-Za-z0-9_-]{22}$/.test(compact)) return null;
+  const bytes = Buffer.from(compact, 'base64url');
+  if (bytes.length !== 16 || bytes.toString('base64url') !== compact) return null;
+  const hex = bytes.toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+const scopeToken = (scope: HistoryScope) => (scope === 'all' ? '*' : compactId(scope.taskId));
+
+function parseScope(token: string): HistoryScope | null {
+  if (token === '*') return 'all';
+  const taskId = expandId(token);
+  return taskId ? { taskId } : null;
+}
+
+export function historyCallbackData(
+  scope: HistoryScope,
+  cursor: HistoryCursor | null = null,
+): string {
+  const page = cursor
+    ? `:${cursor.direction === 'older' ? 'o' : 'n'}:${compactId(cursor.runId)}`
+    : '';
+  return bounded(`h:${scopeToken(scope)}${page}`);
+}
+
+export function runCallbackData(runId: string, scope: HistoryScope): string {
+  return bounded(`r:${compactId(runId)}:${scopeToken(scope)}`);
+}
+
+export function resendCallbackData(runId: string): string {
+  return bounded(`rs:${compactId(runId)}`);
+}
+
 export function parseCallbackData(data: string | null): CallbackAction | null {
   if (data === null || Buffer.byteLength(data) > MAX_CALLBACK_BYTES) return null;
   if (data === TASK_NEW_CALLBACK) return { kind: 'task_new' };
@@ -94,5 +156,29 @@ export function parseCallbackData(data: string | null): CallbackAction | null {
   }
   match = LIST_CALLBACK.exec(data);
   if (match) return { kind: 'task_list', page: Number(match[1]) };
+  match = HISTORY_CALLBACK.exec(data);
+  if (match) {
+    const scope = parseScope(match[1] ?? '');
+    if (!scope) return null;
+    if (!match[2]) return { kind: 'history', scope, cursor: null };
+    const runId = expandId(match[3] ?? '');
+    if (!runId) return null;
+    return {
+      kind: 'history',
+      scope,
+      cursor: { direction: match[2] === 'o' ? 'older' : 'newer', runId },
+    };
+  }
+  match = RUN_CALLBACK.exec(data);
+  if (match) {
+    const runId = expandId(match[1] ?? '');
+    const scope = parseScope(match[2] ?? '');
+    return runId && scope ? { kind: 'run', runId, scope } : null;
+  }
+  match = RESEND_CALLBACK.exec(data);
+  if (match) {
+    const runId = expandId(match[1] ?? '');
+    return runId ? { kind: 'resend', runId } : null;
+  }
   return null;
 }

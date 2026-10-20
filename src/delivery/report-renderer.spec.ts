@@ -2,8 +2,14 @@ import { describe, expect, it } from 'vitest';
 import { buildTextPart, FAKE_FIXTURES, type Segment } from '../research/provider/fake-fixtures';
 import { completed } from '../../test/support/fakes';
 import { extractReport, type ExtractedReport } from '../research/report';
-import { renderReport, type RenderableReport } from './report-renderer';
-import { MAX_REPORT_PARTS, TELEGRAM_PART_LIMIT } from './telegram-html';
+import {
+  renderReport,
+  renderReportMessages,
+  reportFileName,
+  type RenderableReport,
+  type ReportPart,
+} from './report-renderer';
+import { MAX_CAPTION_LENGTH, MAX_REPORT_PARTS, TELEGRAM_PART_LIMIT } from './telegram-html';
 
 const base = {
   runId: '11111111-2222-4333-8444-555555555555',
@@ -39,7 +45,7 @@ describe('renderReport', () => {
         ]),
       ]),
     );
-    const [html = ''] = renderReport(renderable(report));
+    const [html = ''] = renderReportMessages(renderable(report));
     expect(html).toContain('&lt;b&gt;bold&lt;/b&gt;');
     expect(html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
     expect(html).not.toContain('javascript:x">');
@@ -63,7 +69,7 @@ describe('renderReport', () => {
         ]),
       ]),
     );
-    const [html = ''] = renderReport(renderable(report));
+    const [html = ''] = renderReportMessages(renderable(report));
     expect(html).toContain(
       'Claim A <a href="https://a.example/">[1]</a>. Claim B <a href="https://b.example/">[2]</a>.',
     );
@@ -81,7 +87,7 @@ describe('renderReport', () => {
         ]),
       ]),
     );
-    const [html = ''] = renderReport(renderable(report));
+    const [html = ''] = renderReportMessages(renderable(report));
     expect(html).not.toContain('href="https://invented.example/');
     expect(html).toContain('[fake](https://invented.example/)');
   });
@@ -90,7 +96,7 @@ describe('renderReport', () => {
     const report = extractReport(
       completed([{ text: 'OUTCOME: FOUND\nNo sources', citations: [] }]),
     );
-    const [html = ''] = renderReport(renderable(report, { simulated: true }));
+    const [html = ''] = renderReportMessages(renderable(report, { simulated: true }));
     expect(html).toContain('СИМУЛЯЦІЯ');
     expect(html).toContain('невизначено');
     expect(html).toContain('Немає підтверджених посилань');
@@ -104,7 +110,8 @@ describe('renderReport', () => {
       segments.push(i % 5 === 4 ? '\n\n' : ' ');
     }
     const report = extractReport(completed([buildTextPart(segments)]));
-    const parts = renderReport(renderable(report));
+    const parts = renderReportMessages(renderable(report));
+    expect(renderReport(renderable(report)).every((part) => part.kind === 'MESSAGE')).toBe(true);
 
     expect(parts.length).toBeGreaterThan(1);
     expect(parts.length).toBeLessThanOrEqual(MAX_REPORT_PARTS);
@@ -129,21 +136,61 @@ describe('renderReport', () => {
     expect(parts.join('')).toContain(`<a href="https://s3.example/p/3">[4]</a>`);
   });
 
-  it('truncates visibly at the part limit and is deterministic', () => {
-    const report = extractReport(
-      completed([
-        buildTextPart([
-          'OUTCOME: FOUND\n',
-          'Довгий абзац. '.repeat(3_000),
-          { cite: { url: 'https://a.example/', title: 'A' } },
-        ]),
-      ]),
+  it('never truncates: a report beyond the part limit becomes a summary and a full document', () => {
+    const segments: Segment[] = ['OUTCOME: FOUND\n'];
+    for (let i = 0; i < 400; i += 1) {
+      segments.push(`Абзац ${i}: 👨‍👩‍👧‍👦 «Динамо» & <ціна> ${'текст '.repeat(10)}`);
+      segments.push({
+        cite: { url: `https://s${i % 9}.example/p?i=${i % 9}&x="y"`, title: `Джерело <${i % 9}>` },
+      });
+      segments.push(i % 3 === 2 ? '\n\n' : ' ');
+    }
+    const report = extractReport(completed([buildTextPart(segments)]));
+    const scheduledFor = new Date('2026-10-18T09:00:00Z');
+    const input = renderable(report, { simulated: true, scheduledFor });
+    expect(renderReportMessages(input).length).toBeGreaterThan(MAX_REPORT_PARTS);
+
+    const parts = renderReport(input);
+    expect(parts.map((part) => part.kind)).toEqual(['MESSAGE', 'DOCUMENT']);
+    const [summary, file] = parts as [ReportPart, Extract<ReportPart, { kind: 'DOCUMENT' }>];
+    expect(summary.html.length).toBeLessThanOrEqual(TELEGRAM_PART_LIMIT);
+    expect(summary.html).toContain('СИМУЛЯЦІЯ');
+    expect(summary.html).toContain('файлом нижче');
+    expect(summary.html.replace(ALLOWED_TAGS, '')).not.toMatch(/[<>]/);
+    expect(file.fileName).toBe(`report-${base.runId}.txt`);
+    expect(file.html.length).toBeLessThanOrEqual(MAX_CAPTION_LENGTH);
+    expect(file.html).toContain(base.runId);
+
+    const text = file.fileContent;
+    expect(text.isWellFormed()).toBe(true);
+    // Header: simulation label, run ID, actual check time, scheduled time and delay, outcome.
+    expect(text).toContain('СИМУЛЯЦІЯ');
+    expect(text).toContain(`Запуск: ${base.runId}`);
+    expect(text).toContain('Перевірено: 2026-10-18 15:00 Europe/Kyiv (2026-10-18 12:00 UTC)');
+    expect(text).toContain(
+      'Заплановано на: 2026-10-18 12:00 Europe/Kyiv — виконано із затримкою 180 хв',
     );
-    const first = renderReport(renderable(report));
-    expect(first).toHaveLength(MAX_REPORT_PARTS);
-    expect(first.at(-1)).toContain('Звіт обрізано');
-    expect(first.every((part) => part.length <= TELEGRAM_PART_LIMIT)).toBe(true);
-    expect(renderReport(renderable(report))).toEqual(first);
+    expect(text).toContain('Підсумок: знайдено');
+    // The complete report, verbatim (no escaping in plain text), each claim with its marker.
+    expect(report?.text).toBeTruthy();
+    for (let i = 0; i < 400; i += 1) {
+      expect(text).toContain(
+        `Абзац ${i}: 👨‍👩‍👧‍👦 «Динамо» & <ціна> ${'текст '.repeat(10)} [${(i % 9) + 1}]`,
+      );
+    }
+    // Source list maps every marker to its validated URL.
+    for (let n = 0; n < 9; n += 1) {
+      expect(text).toContain(
+        `[${n + 1}] Джерело <${n}> — https://s${n}.example/p?i=${n}&x=%22y%22`,
+      );
+    }
+    // Deterministic: re-rendering the stored report gives identical bytes.
+    expect(renderReport(input)).toEqual(parts);
+  });
+
+  it('uses only the run ID in the file name', () => {
+    expect(reportFileName(base.runId)).toBe(`report-${base.runId}.txt`);
+    expect(() => reportFileName('../../etc/passwd')).toThrow();
   });
 
   it('renders every synthetic fixture with clickable sources', () => {
@@ -151,7 +198,9 @@ describe('renderReport', () => {
       const report = extractReport(completed(fixture.parts, { webSearchCalls: fixture.searches }));
       const parts = renderReport(renderable(report, { simulated: true }));
       expect(parts, key).toHaveLength(1);
-      expect(parts[0], key).toMatch(/<a href="https:\/\/[^"]+\.(com|org|net)\/[^"]*">\[1\]<\/a>/);
+      expect(parts[0]?.html, key).toMatch(
+        /<a href="https:\/\/[^"]+\.(com|org|net)\/[^"]*">\[1\]<\/a>/,
+      );
     }
   });
 });

@@ -4,6 +4,7 @@ import { createDelivery } from '../delivery/delivery-records';
 import { denialMessage } from '../delivery/messages';
 import { escapeHtml } from '../delivery/telegram-html';
 import type { AppUser, Prisma, Task, TaskDraft } from '../generated/prisma/client';
+import { showHistory, showLatestResult } from '../delivery/history';
 import { userOperationDenial } from '../identity/authorization';
 import { SUGGESTED_TIME_ZONE } from '../identity/time-zone';
 import { admitResearch } from '../research/admission';
@@ -65,7 +66,7 @@ export interface TaskContext {
 }
 
 export interface TaskOutcome {
-  disposition: 'REPLIED' | 'REJECTED' | 'IGNORED' | 'RUN_ACCEPTED';
+  disposition: 'REPLIED' | 'REJECTED' | 'IGNORED' | 'RUN_ACCEPTED' | 'RESULT_REQUESTED';
   reason: string;
   callbackAnswer?: string;
   /** A research run started (or found active) by "Run now". */
@@ -200,6 +201,9 @@ export async function onTaskAction(
   // Foreign, deleted and nonexistent tasks are indistinguishable.
   if (!task) return reply(ctx, 'REJECTED', 'TASK_NOT_FOUND', { text: NOT_FOUND }, NOT_FOUND);
   if (op === 'v') return reply(ctx, 'REPLIED', 'TASK_CARD', taskCardView(task));
+  // Read-only views (TRB-080) show the current state; the revision does not matter.
+  if (op === 'lr') return showLatestResult(ctx, task.id);
+  if (op === 'h') return showHistory(ctx, { taskId: task.id });
   if (task.revision !== revision) {
     return reply(
       ctx,

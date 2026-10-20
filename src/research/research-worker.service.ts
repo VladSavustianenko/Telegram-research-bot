@@ -27,7 +27,7 @@ import { renderReport } from '../delivery/report-renderer';
 import { Prisma, type AppUser } from '../generated/prisma/client';
 import { submissionDenial } from '../identity/authorization';
 import { lockUserForShare } from '../identity/users';
-import { QueueService, type ResearchJob } from '../queue/queue.service';
+import { QueueService, RESEARCH_QUEUE, type ResearchJob } from '../queue/queue.service';
 import { ADMISSION_LOCK_KEY } from './admission';
 import { cancelOverdueQueued, cancelUnadmitted } from './lifecycle';
 import { OutboxDispatcher } from './outbox-dispatcher';
@@ -216,7 +216,7 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
    * none is left. Returns true when a run was executed.
    */
   async tick(signal?: AbortSignal): Promise<boolean> {
-    if (!this.provider || !this.queue.enabled) return false;
+    if (!this.provider || !this.queue.has(RESEARCH_QUEUE)) return false;
     await this.dispatcher.sweep();
     await this.dispatcher.dispatchDue();
     for (;;) {

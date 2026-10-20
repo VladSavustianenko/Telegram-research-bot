@@ -7,6 +7,7 @@ import { AppModule } from '../../src/app.module';
 import { CLOCK } from '../../src/common/clock';
 import { parseEnv } from '../../src/config/env.schema';
 import { PrismaService } from '../../src/database/prisma.service';
+import { DeliveryDispatcher } from '../../src/delivery/delivery-dispatcher';
 import { DeliveryWorker } from '../../src/delivery/delivery-worker.service';
 import { QueueService } from '../../src/queue/queue.service';
 import { OutboxDispatcher } from '../../src/research/outbox-dispatcher';
@@ -61,6 +62,7 @@ export interface Harness {
   scheduler: SchedulerService;
   dispatcher: OutboxDispatcher;
   delivery: DeliveryWorker;
+  deliveryDispatcher: DeliveryDispatcher;
   provider: ScriptedProvider;
   sender: RecordingSender;
   clock: FakeClock;
@@ -122,6 +124,7 @@ export async function startHarness(
     scheduler: app.get(SchedulerService),
     dispatcher: app.get(OutboxDispatcher),
     delivery: app.get(DeliveryWorker),
+    deliveryDispatcher: app.get(DeliveryDispatcher),
     provider,
     sender,
     clock,
@@ -146,7 +149,7 @@ export async function resetDatabase(
   options: { onboardedAdmins?: boolean } = {},
 ): Promise<void> {
   await prisma.$executeRawUnsafe(
-    'TRUNCATE usage_ledger, budget_reservation, pricing_version, outbox_event, task_draft, task, audit_event, invitation, research_tool_item, research_reconciliation, research_attempt, schedule_event, delivery_part, delivery, research_run, telegram_update, app_user RESTART IDENTITY CASCADE',
+    'TRUNCATE usage_ledger, budget_reservation, pricing_version, outbox_event, task_draft, task, audit_event, invitation, research_tool_item, research_reconciliation, research_attempt, schedule_event, delivery_event, delivery_part, delivery, research_run, telegram_update, app_user RESTART IDENTITY CASCADE',
   );
   // Jobs of earlier tests (pg-boss's own schema, installed by the global setup).
   await prisma.$executeRawUnsafe('TRUNCATE pgboss.job');

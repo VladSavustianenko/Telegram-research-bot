@@ -144,6 +144,10 @@ export const envSchema = z
       z.string().regex(/^[A-Za-z0-9_]{5,32}$/, 'must be a Telegram bot username without "@"'),
     ),
 
+    // Optional Bot API root (TRB-080), e.g. a self-hosted Bot API server or a local
+    // test double; unset means https://api.telegram.org. The bot token is sent there.
+    TELEGRAM_API_ROOT: optional(z.url({ protocol: /^https?$/, error: 'must be an http(s) URL' })),
+
     // Invitations (TRB-030). The secret derives invitation tokens at send time so that
     // neither the database nor stored messages contain them. Without it, /admin invite
     // is refused. Rotating it invalidates invitations whose message is not yet sent.

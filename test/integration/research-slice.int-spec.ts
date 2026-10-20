@@ -347,8 +347,10 @@ describe('research-to-Telegram slice (fake provider and Telegram, real PostgreSQ
       const [run] = await runs();
       await h.post(privateMessage(`/result ${run?.id}`)).expect(200);
       await drainDeliveries(h);
-      expect(h.sender.sent).toHaveLength(1);
-      expect(h.sender.sent[0]?.html).toBe(report?.parts[0]?.html);
+      // TRB-080: the resend is preceded by a notice that the first send may have arrived.
+      expect(h.sender.sent).toHaveLength(2);
+      expect(h.sender.sent[0]?.html).toContain('могло вже надійти');
+      expect(h.sender.sent[1]?.html).toBe(report?.parts[0]?.html);
       expect((await deliveries()).at(-1)).toMatchObject({ kind: 'RESEND', state: 'SENT' });
       expect(h.provider.calls).toMatchObject({ submit: 1, retrieve: 1 });
     });

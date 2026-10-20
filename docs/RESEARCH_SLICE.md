@@ -110,6 +110,13 @@ Inspect with `npm run ops:tool-telemetry -- --run <id>` (read-only).
 
 ## Delivery
 
+> **Updated by TRB-080 ([DELIVERY.md](DELIVERY.md)).** The description below is the TRB-020 behaviour. Since TRB-080:
+> - deliveries go through a separate pg-boss queue (`delivery-send`), in creation order per chat;
+> - a 5xx answer is retried, and a connection that was never opened is retried instead of becoming `UNKNOWN`;
+> - a confirmed blocked chat pauses automatic research;
+> - a report longer than 6 messages is sent as a summary plus a complete UTF-8 text document instead of being truncated;
+> - "non-clickable" below means not rendered as a link: Telegram clients may still auto-detect a bare URL in text.
+
 `DeliveryWorker` sends deliveries oldest-first, one part at a time. Before each request the part is marked SENDING; right after success it is marked SENT with the Telegram message ID, so confirmed parts are never resent.
 
 - Telegram error response (definite, nothing created): 429 waits `retry_after`; other retryable errors back off, up to 5 attempts. 400, 403 and 404 are `PERMANENT_FAILURE`.

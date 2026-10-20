@@ -76,7 +76,9 @@ Prepare and store immutable chunks before sending. Use Telegram HTML with escape
 
 States: PENDING, SENDING, SENT, RETRYABLE_FAILURE, UNKNOWN, PERMANENT_FAILURE, SUPPRESSED. A crash/timeout after Telegram may have accepted a send creates UNKNOWN: Telegram sendMessage does not provide a general application idempotency key. Default policy is no blind retry of the ambiguous part. Expose a stored-result resend action and label it a resend; duplicates are possible. Document the tradeoff between missed delivery and duplicates.
 
-An explicit resend creates a new Delivery referencing the same stored report and uses no research budget. Failure to send a result never moves a SUCCEEDED research run back to FAILED. A permanently blocked private chat pauses automatic work, records a destination problem and avoids endless retries.
+An explicit resend creates a new Delivery referencing the same stored report and uses no research budget.
+
+Implementation note (TRB-080, clarification): deliveries use their own outbox table (`delivery_event`) and pg-boss queue (`delivery-send`), with the research pattern. Deliveries to one chat are sent in creation order. A 5xx answer with `ok: false` counts as a confirmed refusal (retried); timeouts and unreadable answers are UNKNOWN. A report beyond six messages becomes a summary plus a full-text document instead of being truncated. A confirmed blocked chat pauses the user's tasks. Details are in DELIVERY.md. Failure to send a result never moves a SUCCEEDED research run back to FAILED. A permanently blocked private chat pauses automatic work, records a destination problem and avoids endless retries.
 
 ## 7. Usage controls
 

@@ -12,6 +12,7 @@ import { APP_CONFIG } from '../config/config.module';
 import { MAX_RUN_DEADLINE_SECONDS, type Env } from '../config/env.schema';
 import type { Tx } from '../database/prisma-errors';
 import { RESEARCH_PROVIDER, type ResearchProvider } from '../research/provider/provider.types';
+import { TELEGRAM_SENDER, type TelegramSender } from '../telegram/telegram-sender';
 
 /** The single research queue (docs/QUEUE.md). */
 export const RESEARCH_QUEUE = 'research-execute';
@@ -47,6 +48,39 @@ export const RESEARCH_QUEUE_OPTIONS = {
   deleteAfterSeconds: 7 * 24 * 3600,
 } as const satisfies Omit<Queue, 'name'>;
 
+/** The delivery queue (TRB-080, docs/DELIVERY.md), separate from research. */
+export const DELIVERY_QUEUE = 'delivery-send';
+
+/** A delivery job only names the delivery to inspect; the database decides what is sent. */
+export interface DeliveryJobData {
+  deliveryId: string;
+  eventId: string;
+}
+
+export type DeliveryJob = Job<DeliveryJobData>;
+
+/**
+ * Delivery queue options. Same reasoning as research: `standard` policy, job ID
+ * = delivery event ID, the database deduplicates. A handler sends at most
+ * MAX_REPORT_PARTS + 1 parts, each bounded by the Telegram HTTP timeout, so a
+ * job outlives it comfortably. Handler failures are infrastructure errors; a
+ * retry only re-inspects the delivery (a part already handed to Telegram is
+ * never resent: it is SENDING, then UNKNOWN). Telegram retries are not pg-boss
+ * retries: they are new delivery events with their own available_at.
+ */
+export const DELIVERY_QUEUE_OPTIONS = {
+  policy: 'standard',
+  expireInSeconds: 300,
+  retryLimit: 5,
+  retryDelay: 10,
+  retryBackoff: true,
+  retryDelayMax: 300,
+  retentionSeconds: 14 * 24 * 3600,
+  deleteAfterSeconds: 7 * 24 * 3600,
+} as const satisfies Omit<Queue, 'name'>;
+
+type QueueName = typeof RESEARCH_QUEUE | typeof DELIVERY_QUEUE;
+
 export type QueueStatus = 'disabled' | 'starting' | 'up' | 'down' | 'stopped';
 
 /** Delays between start attempts while the database is unavailable. */
@@ -56,7 +90,9 @@ const START_RETRY_MAX_MS = 30_000;
 /**
  * Owns the pg-boss instance. pg-boss lives in its own schema (QUEUE_SCHEMA),
  * which it creates and migrates at startup; Prisma migrations never touch it.
- * Started only when a research provider is configured. Maintenance (job
+ * Started when a research provider or a Telegram sender is configured; the
+ * research queue exists with a provider, the delivery queue with a sender.
+ * Maintenance (job
  * expiry, retention) runs only with BACKGROUND_WORKERS=on; tests drive jobs
  * through fetch/complete instead.
  *
@@ -74,11 +110,21 @@ export class QueueService implements OnModuleInit, BeforeApplicationShutdown {
   private retryTimer: NodeJS.Timeout | undefined;
   private readonly upCallbacks: (() => Promise<void>)[] = [];
 
+  private readonly queues: { name: QueueName; options: Omit<Queue, 'name'> }[] = [];
+
   constructor(
     @Inject(APP_CONFIG) private readonly config: Env,
     @Optional() @Inject(RESEARCH_PROVIDER) provider: ResearchProvider | null,
+    @Optional() @Inject(TELEGRAM_SENDER) sender: TelegramSender | null = null,
   ) {
-    this.state = provider ? 'starting' : 'disabled';
+    if (provider) this.queues.push({ name: RESEARCH_QUEUE, options: RESEARCH_QUEUE_OPTIONS });
+    if (sender) this.queues.push({ name: DELIVERY_QUEUE, options: DELIVERY_QUEUE_OPTIONS });
+    this.state = this.queues.length > 0 ? 'starting' : 'disabled';
+  }
+
+  /** Whether this process has the named queue (research needs a provider, delivery a sender). */
+  has(name: QueueName): boolean {
+    return this.enabled && this.queues.some((queue) => queue.name === name);
   }
 
   get status(): QueueStatus {
@@ -152,7 +198,7 @@ export class QueueService implements OnModuleInit, BeforeApplicationShutdown {
     });
     try {
       await boss.start();
-      await this.ensureQueue(boss);
+      for (const queue of this.queues) await this.ensureQueue(boss, queue.name, queue.options);
     } catch (error) {
       await boss.stop({ graceful: false }).catch(() => undefined);
       throw error;
@@ -160,22 +206,25 @@ export class QueueService implements OnModuleInit, BeforeApplicationShutdown {
     return boss;
   }
 
-  private async ensureQueue(boss: PgBoss): Promise<void> {
-    const existing = await boss.getQueue(RESEARCH_QUEUE);
+  private async ensureQueue(
+    boss: PgBoss,
+    name: QueueName,
+    options: Omit<Queue, 'name'>,
+  ): Promise<void> {
+    const existing = await boss.getQueue(name);
     if (!existing) {
       try {
-        await boss.createQueue(RESEARCH_QUEUE, RESEARCH_QUEUE_OPTIONS);
+        await boss.createQueue(name, options);
         return;
       } catch (error) {
         // Another instance may have created it concurrently.
-        if (!(await boss.getQueue(RESEARCH_QUEUE))) throw error;
+        if (!(await boss.getQueue(name))) throw error;
       }
-    } else if (existing.policy !== RESEARCH_QUEUE_OPTIONS.policy) {
-      throw new Error(`Queue ${RESEARCH_QUEUE} has policy ${existing.policy}; expected standard`);
+    } else if (existing.policy !== options.policy) {
+      throw new Error(`Queue ${name} has policy ${existing.policy}; expected standard`);
     }
     // Policy and the maximum retry delay are fixed at creation (pg-boss API); the rest is kept current.
-    const options = RESEARCH_QUEUE_OPTIONS;
-    await boss.updateQueue(RESEARCH_QUEUE, {
+    await boss.updateQueue(name, {
       expireInSeconds: options.expireInSeconds,
       retryLimit: options.retryLimit,
       retryDelay: options.retryDelay,
@@ -200,10 +249,27 @@ export class QueueService implements OnModuleInit, BeforeApplicationShutdown {
     return this.started.send(RESEARCH_QUEUE, data, { id: data.eventId, db: fromPrisma(tx) });
   }
 
-  /** Registers the background handler (one job at a time per process). */
-  async work(handler: (job: ResearchJob) => Promise<unknown>): Promise<void> {
-    await this.started.work<ResearchJobData>(
-      RESEARCH_QUEUE,
+  /** Delivery counterpart of publish (same transaction semantics, job ID = event ID). */
+  publishDelivery(tx: Tx, data: DeliveryJobData): Promise<string | null> {
+    return this.started.send(DELIVERY_QUEUE, data, { id: data.eventId, db: fromPrisma(tx) });
+  }
+
+  /** Registers the research background handler (one job at a time per process). */
+  work(handler: (job: ResearchJob) => Promise<unknown>): Promise<void> {
+    return this.workOn(RESEARCH_QUEUE, handler);
+  }
+
+  /** Registers the delivery background handler (one job at a time per process). */
+  workDelivery(handler: (job: DeliveryJob) => Promise<unknown>): Promise<void> {
+    return this.workOn(DELIVERY_QUEUE, handler);
+  }
+
+  private async workOn<T extends object>(
+    name: QueueName,
+    handler: (job: Job<T>) => Promise<unknown>,
+  ): Promise<void> {
+    await this.started.work<T>(
+      name,
       {
         batchSize: 1,
         pollingIntervalSeconds: Math.max(0.5, this.config.WORKER_POLL_INTERVAL_MS / 1_000),
@@ -213,14 +279,17 @@ export class QueueService implements OnModuleInit, BeforeApplicationShutdown {
   }
 
   /** Stops fetching new jobs and waits (bounded) for the active handler. */
-  async stopWork(timeoutMs: number): Promise<'stopped' | 'timeout'> {
+  async stopWork(
+    timeoutMs: number,
+    name: QueueName = RESEARCH_QUEUE,
+  ): Promise<'stopped' | 'timeout'> {
     if (!this.boss || this.state !== 'up') return 'stopped';
     let timer: NodeJS.Timeout | undefined;
     const timedOut = new Promise<'timeout'>((resolve) => {
       timer = setTimeout(() => resolve('timeout'), timeoutMs);
     });
     const outcome = await Promise.race([
-      this.boss.offWork(RESEARCH_QUEUE, { wait: true }).then(() => 'stopped' as const),
+      this.boss.offWork(name, { wait: true }).then(() => 'stopped' as const),
       timedOut,
     ]);
     clearTimeout(timer);
@@ -233,13 +302,19 @@ export class QueueService implements OnModuleInit, BeforeApplicationShutdown {
     return job ?? null;
   }
 
-  async complete(job: ResearchJob): Promise<void> {
-    await this.started.complete(RESEARCH_QUEUE, { id: job.id, retryCount: job.retryCount });
+  /** Delivery counterpart of fetchOne. */
+  async fetchDelivery(): Promise<DeliveryJob | null> {
+    const [job] = await this.started.fetch<DeliveryJobData>(DELIVERY_QUEUE, { batchSize: 1 });
+    return job ?? null;
   }
 
-  async fail(job: ResearchJob, error: unknown): Promise<void> {
+  async complete(job: Job<object>, name: QueueName = RESEARCH_QUEUE): Promise<void> {
+    await this.started.complete(name, { id: job.id, retryCount: job.retryCount });
+  }
+
+  async fail(job: Job<object>, error: unknown, name: QueueName = RESEARCH_QUEUE): Promise<void> {
     await this.started.fail(
-      RESEARCH_QUEUE,
+      name,
       { id: job.id, retryCount: job.retryCount },
       { error: errorInfo(error) },
     );

@@ -203,6 +203,10 @@ Only account access counts:
 
 Replies that are not about a run (help, invitation-required, onboarding prompts, administrator replies, invitation links) are not subject to this rule.
 
+TRB-080 additions (docs/DELIVERY.md):
+- **Chat block.** Every delivery, run-related or not, is also stopped while Telegram has confirmed that the chat is blocked (`CHAT_BLOCKED`).
+- **Deleted tasks.** `/result` and the history resend no longer resend runs of deleted tasks: they answer "Запуск не знайдено.", like foreign runs.
+
 ## Research access before TRB-050
 
 - **Simulated research.** Invited active members with completed onboarding may use it (`RESEARCH_MODE=fake`).

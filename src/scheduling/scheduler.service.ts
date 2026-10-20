@@ -233,6 +233,10 @@ export class SchedulerService implements OnApplicationBootstrap, OnModuleDestroy
       } else if (user.privateChatId === null) {
         disposition = 'SKIPPED_DENIED';
         await record({ occurrenceAt: latest, disposition, reason: 'NO_PRIVATE_CHAT' });
+      } else if (user.chatBlockedAt) {
+        // Defence in depth: a confirmed block pauses the tasks (TRB-080), so this is not expected.
+        disposition = 'SKIPPED_DENIED';
+        await record({ occurrenceAt: latest, disposition, reason: 'CHAT_BLOCKED' });
       } else {
         const outcome = await admitResearch(tx, this.config, {
           user,

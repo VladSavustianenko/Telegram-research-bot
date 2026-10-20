@@ -62,6 +62,17 @@ describe('parseEnv', () => {
     expect(error.message).toContain('TELEGRAM_WEBHOOK_SECRET');
   });
 
+  it('accepts an optional http(s) Bot API root and rejects other values (TRB-080)', () => {
+    expect(parseEnv(base).TELEGRAM_API_ROOT).toBeUndefined();
+    expect(parseEnv({ ...base, TELEGRAM_API_ROOT: '' }).TELEGRAM_API_ROOT).toBeUndefined();
+    expect(
+      parseEnv({ ...base, TELEGRAM_API_ROOT: 'http://localhost:8081' }).TELEGRAM_API_ROOT,
+    ).toBe('http://localhost:8081');
+    expect(problemsOf({ ...base, TELEGRAM_API_ROOT: 'ftp://bot.example' })).toEqual([
+      'TELEGRAM_API_ROOT must be an http(s) URL',
+    ]);
+  });
+
   it('treats empty template values as not set', () => {
     const env = parseEnv({ ...base, OPENAI_API_KEY: '', PORT: '', USER_MONTHLY_BUDGET_USD: '' });
     expect(env.OPENAI_API_KEY).toBeUndefined();

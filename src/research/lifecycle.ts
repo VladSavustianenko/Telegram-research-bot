@@ -6,12 +6,16 @@ import { messages } from '../delivery/messages';
 import { Prisma } from '../generated/prisma/client';
 import { EXECUTE_EVENT } from './wake';
 
-export type RunScope = { userId: string } | { taskId: string };
+/** A user's or a task's runs; `trigger` narrows to scheduled (automatic) runs. */
+export type RunScope = ({ userId: string } | { taskId: string }) & { trigger?: 'SCHEDULED' };
 
-const scopeSql = (scope: RunScope) =>
-  'userId' in scope
-    ? Prisma.sql`user_id = ${scope.userId}::uuid`
-    : Prisma.sql`task_id = ${scope.taskId}::uuid`;
+const scopeSql = (scope: RunScope) => {
+  const owner =
+    'userId' in scope
+      ? Prisma.sql`user_id = ${scope.userId}::uuid`
+      : Prisma.sql`task_id = ${scope.taskId}::uuid`;
+  return scope.trigger ? Prisma.sql`${owner} AND "trigger" = 'SCHEDULED'` : owner;
+};
 
 /**
  * Cancels QUEUED runs in scope (suspension, task pause or deletion). A queued
@@ -99,12 +103,12 @@ export async function cancelOverdueQueued(
  * queued and running runs get the decision (their later reports are created
  * SUPPRESSED), and unfinished deliveries of all their runs get it too. Never
  * cleared. USER_SUSPENDED also makes polling request provider cancellation;
- * TASK_DELETED only suppresses delivery. Returns the suppressed deliveries.
+ * TASK_DELETED and CHAT_BLOCKED (TRB-080) only suppress delivery. Returns the suppressed deliveries.
  */
 export async function suppressRunDeliveries(
   tx: Tx,
   scope: RunScope,
-  reason: 'USER_SUSPENDED' | 'TASK_DELETED',
+  reason: 'USER_SUSPENDED' | 'TASK_DELETED' | 'CHAT_BLOCKED',
 ): Promise<number> {
   // Runs first: a completing worker holds the run row, so this waits for it and
   // the delivery statement below then sees the report it created.
@@ -113,7 +117,7 @@ export async function suppressRunDeliveries(
        SET delivery_suppressed_at = COALESCE(delivery_suppressed_at, now()),
            delivery_suppression_reason = COALESCE(delivery_suppression_reason, ${reason})
      WHERE ${scopeSql(scope)} AND state IN ('QUEUED', 'RUNNING')`;
-  const code = reason === 'USER_SUSPENDED' ? 'RECIPIENT_SUSPENDED' : 'TASK_DELETED';
+  const code = reason === 'USER_SUSPENDED' ? 'RECIPIENT_SUSPENDED' : reason;
   return tx.$executeRaw`
     UPDATE delivery
        SET suppressed_at = COALESCE(suppressed_at, now()),

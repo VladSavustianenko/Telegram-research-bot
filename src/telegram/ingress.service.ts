@@ -8,6 +8,8 @@ import { isUniqueViolation, type Tx } from '../database/prisma-errors';
 import { PrismaService } from '../database/prisma.service';
 import { createStatusDelivery } from '../delivery/delivery-records';
 import { messages } from '../delivery/messages';
+import { restoreDestination } from '../delivery/destination';
+import { resendFromHistory, showHistory, showRun } from '../delivery/history';
 import { requestResultResend } from '../delivery/result-resend';
 import type { AppUser } from '../generated/prisma/client';
 import { runAdminCommand } from '../identity/admin-actions';
@@ -154,7 +156,10 @@ export class TelegramIngressService {
     }
     // One sender at a time; then load (and row-lock) the sender's record.
     await lockTelegramIdentity(tx, update.senderId);
-    const user = await resolveSender(tx, this.config, update.senderId, update.chatId);
+    let user = await resolveSender(tx, this.config, update.senderId, update.chatId);
+    // Writing to the bot proves the chat works again (TRB-080): the block is
+    // cleared before any reply is created; paused tasks stay paused.
+    if (user?.chatBlockedAt) user = await restoreDestination(tx, user);
     const context: Context = { tx, update, user };
     return update.kind === 'callback'
       ? this.onCallback(context, update.data)
@@ -213,6 +218,8 @@ export class TelegramIngressService {
         return showUsage(tx, this.config, { user, chatId: update.chatId, now: this.clock.now() });
       case 'tasks':
         return showTasks(this.taskContext(context, user));
+      case 'history':
+        return showHistory(this.taskContext(context, user), 'all');
       case 'new':
         return startCreate(this.taskContext(context, user));
       case 'cancel':
@@ -364,6 +371,12 @@ export class TelegramIngressService {
           return showTasks(tasks, action.page);
         case 'task_new':
           return startCreate(tasks);
+        case 'history':
+          return showHistory(tasks, action.scope, action.cursor);
+        case 'run':
+          return showRun(tasks, action.runId, action.scope);
+        case 'resend':
+          return resendFromHistory(tasks, action.runId);
       }
     }
     if (access === 'ACTIVE') {

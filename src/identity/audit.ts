@@ -6,7 +6,9 @@ export type AuditKind =
   | 'INVITATION_CREATED'
   | 'INVITATION_REDEEMED'
   | 'USER_SUSPENDED'
-  | 'USER_REACTIVATED';
+  | 'USER_REACTIVATED'
+  | 'DESTINATION_BLOCKED'
+  | 'DESTINATION_RESTORED';
 
 /** Identifiers, codes and counts only; never tokens, prompts or report content. */
 export type AuditDetails = Record<string, string | number | boolean | null>;

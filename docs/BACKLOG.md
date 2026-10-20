@@ -87,7 +87,9 @@ Implement due-task polling, local occurrence computation, DST policies, single c
 
 Acceptance: daily/weekly schedules work in Europe/Kyiv and at least one additional DST zone; gap/overlap behavior matches SPEC; two schedulers create one occurrence; downtime causes at most one eligible catch-up; manual run does not shift future schedule; pause/edit cancels eligible queued jobs and releases reservations; budget denial cannot busy-loop.
 
-Status: READY FOR REVIEW (2026-10-20). Mock validation only: fake clock, scripted providers (no network), recording Telegram sender, real PostgreSQL and pg-boss; Docker smoke with the fake provider; no live request or Telegram message. Behaviour: docs/SCHEDULING.md. Evidence: docs/VALIDATION.md, "TRB-070 evidence" and "TRB-070 review fixes" (review of commit 6225d2e, applied 2026-10-20: manual quota no longer applied to scheduled occurrences; prompt edits recompute the next occurrence). Existing active scheduled tasks are initialized to their next future occurrence, with no historical execution.
+Status: DONE — accepted by the owner on 2026-10-20 after review of commit 35d5426befe5eb6aaa9ea7d79f73707c2999fc50 (implementation and the review fixes for 6225d2e). Mock validation only: fake clock, scripted providers (no network), recording Telegram sender, real PostgreSQL and pg-boss; Docker smoke with the fake provider; no live request or Telegram message. Behaviour: docs/SCHEDULING.md. Evidence: docs/VALIDATION.md, "TRB-070 evidence", "TRB-070 review fixes" (manual quota no longer applied to scheduled occurrences; prompt edits recompute the next occurrence) and "TRB-070 acceptance". Existing active scheduled tasks are initialized to their next future occurrence, with no historical execution.
+
+Accepted limitation: when a prompt edit replaces an unprocessed past-due occurrence, no schedule-history record is written for the dropped occurrence.
 
 ## TRB-080 — Reliable result delivery and history
 
@@ -96,6 +98,8 @@ Depends on: 040, 060.
 Implement durable chunks, separate delivery queue, citation rendering, Unicode-safe splitting, full-text attachment fallback, paginated history, explicit resend and ambiguous-send policy.
 
 Acceptance: Telegram failure does not invoke OpenAI; confirmed parts are not resent after restart; uncertain sends become UNKNOWN; malicious HTML/URLs cannot alter markup; long Unicode results retain citations; blocked chat pauses automatic research; resend costs no research quota; all history actions enforce ownership.
+
+Status: READY FOR REVIEW (2026-10-20). Mock validation only: recording/scripted Telegram sender (no Telegram message), fake and scripted providers (no network), real PostgreSQL and pg-boss 12.37.0; Docker smoke with the fake provider and a local test sender. Telegram delivery is not live-tested. Behaviour: docs/DELIVERY.md. Evidence: docs/VALIDATION.md, "TRB-080 evidence". New command: `/history`. Rollout: the old and new delivery mechanisms must not overlap (docs/DELIVERY.md, "Schema and migration").
 
 ## TRB-090 — Telegram administration and data lifecycle
 

@@ -18,7 +18,7 @@ Out of scope here: recurring scheduling (TRB-070, docs/SCHEDULING.md: scheduled 
 | `OutboxDispatcher` | Publishes due outbox events to pg-boss; recovery sweep |
 | `QueueService` | Owns the pg-boss instance, its schema and the `research-execute` queue |
 | `ResearchWorker` | pg-boss handler: inspects a run, claims or takes it over, executes it with the existing provider logic |
-| Delivery worker (TRB-020, unchanged) | Sends stored deliveries; never calls the provider |
+| Delivery worker | Sends stored deliveries; never calls the provider. Since TRB-080 it consumes its own pg-boss queue, `delivery-send` (docs/DELIVERY.md) |
 
 There is exactly one path to a provider submission: pg-boss job → `ResearchWorker.handle` → database claim. The TRB-050 in-process claim loop, which consumed outbox events directly, has been removed.
 

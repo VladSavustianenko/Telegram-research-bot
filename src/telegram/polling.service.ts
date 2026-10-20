@@ -34,7 +34,10 @@ export class TelegramPollingService implements OnApplicationBootstrap, OnModuleD
   onApplicationBootstrap(): void {
     if (this.config.TELEGRAM_MODE !== 'polling' || this.config.BACKGROUND_WORKERS !== 'on') return;
     if (!this.config.TELEGRAM_BOT_TOKEN) return;
-    const api = new Api(this.config.TELEGRAM_BOT_TOKEN, { timeoutSeconds: LONG_POLL_SECONDS + 10 });
+    const api = new Api(this.config.TELEGRAM_BOT_TOKEN, {
+      timeoutSeconds: LONG_POLL_SECONDS + 10,
+      ...(this.config.TELEGRAM_API_ROOT ? { apiRoot: this.config.TELEGRAM_API_ROOT } : {}),
+    });
     this.running = this.run(api);
   }
 

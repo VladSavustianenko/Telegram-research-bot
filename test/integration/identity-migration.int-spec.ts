@@ -102,14 +102,30 @@ const NEW_COLUMNS = [
   'next_attempt_at',
   // TRB-070
   'occurrence_at',
+  // TRB-080
+  'chat_blocked_at',
+  'chat_block_reason',
+  'file_name',
+  'file_content',
+  'send_started_at',
+  'error_code',
+  'seq',
 ];
+/** TRB-080 columns whose names also exist on other tables (delivery.kind is original). */
+const NEW_PART_COLUMNS = ['kind'];
 
 async function snapshotTables(client: Client): Promise<Record<string, unknown[]>> {
   const result: Record<string, unknown[]> = {};
   for (const [table, sql] of Object.entries(SNAPSHOT_QUERIES)) {
     const rows = (await client.query<Record<string, unknown>>(sql)).rows;
     result[table] = rows.map((row) =>
-      Object.fromEntries(Object.entries(row).filter(([column]) => !NEW_COLUMNS.includes(column))),
+      Object.fromEntries(
+        Object.entries(row).filter(
+          ([column]) =>
+            !NEW_COLUMNS.includes(column) &&
+            !(table === 'delivery_part' && NEW_PART_COLUMNS.includes(column)),
+        ),
+      ),
     );
   }
   return result;

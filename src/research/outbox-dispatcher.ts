@@ -9,7 +9,7 @@ import { WorkerLoop } from '../common/worker-loop';
 import { APP_CONFIG } from '../config/config.module';
 import type { Env } from '../config/env.schema';
 import { PrismaService } from '../database/prisma.service';
-import { QueueService } from '../queue/queue.service';
+import { QueueService, RESEARCH_QUEUE } from '../queue/queue.service';
 import { cancelOverdueQueued, cancelUnadmitted } from './lifecycle';
 import { EXECUTE_EVENT, TERMINAL_RUN_STATES, WAKE_EVENT } from './wake';
 
@@ -88,7 +88,7 @@ export class OutboxDispatcher implements OnApplicationBootstrap, OnModuleDestroy
 
   /** Publishes up to one batch of due events. Returns the number of events handled. */
   async dispatchDue(): Promise<number> {
-    if (!this.queue.enabled) return 0;
+    if (!this.queue.has(RESEARCH_QUEUE)) return 0;
     return this.prisma.$transaction(
       async (tx) => {
         const events = await tx.$queryRaw<{ id: string; runId: string; state: string }[]>`

@@ -769,6 +769,101 @@ Regression scenarios (real PostgreSQL; the 5 manual runs are live admissions wit
 
 **Not run:** Docker smoke (no dependency, schema or runtime configuration change since the TRB-070 smoke), mutation re-run, CI, live requests.
 
+### TRB-070 acceptance (2026-10-20)
+
+The owner accepted TRB-070 after review of commit `35d5426befe5eb6aaa9ea7d79f73707c2999fc50` (implementation and the review fixes for 6225d2e). The evidence and limitations above are left as recorded. Accepted for now: when a prompt edit replaces an unprocessed past-due occurrence, no schedule-history record is written for it.
+
+### TRB-080 evidence (2026-10-20, local Windows 11, Node 24.19.0, PostgreSQL 17, pg-boss 12.37.0)
+
+**Mock validation only.**
+- Telegram: a recording sender with scripted Telegram errors in tests; in the Docker smoke, a local Bot API test double on localhost.
+- Research: fake and scripted providers, no network.
+- No Telegram message was sent and no OpenAI request was made. No deployment, no commit.
+- Local `.env` keeps `TELEGRAM_MODE=disabled` and `RESEARCH_MODE=disabled`.
+- Telegram delivery is **not** live-tested.
+
+Behaviour: docs/DELIVERY.md.
+
+| Check | Command | Result |
+|---|---|---|
+| Static checks | `npm run format:check`, `npm run lint`, `npm run typecheck`, `npm run prisma:validate` | Pass |
+| Unit tests | `npm test` | 213 passed (16 files). New: Telegram error classification and compact history callbacks (8), document fallback and file name (renderer), `TELEGRAM_API_ROOT` validation |
+| Integration tests | `npm run test:integration` | 237 passed (16 files: 21 new delivery scenarios, all earlier suites); 0 disposable databases left |
+| Build | `npm run build` | Pass |
+| Telegram limits | Bot API documentation (core.telegram.org/bots/api), read 2026-10-20; no API call | `text` 1–4 096 characters after entity parsing; `caption` 0–1 024; multipart upload 50 MB; `callback_data` 1–64 bytes; `retry_after` is the flood-control wait. grammY 1.46.0 source: `GrammyError` only for a parsed `ok: false` answer, `HttpError` for fetch failures, timeouts and unparsable bodies |
+| Migration, isolated DB | global setup and `identity-migration.int-spec.ts` (all migrations on TRB-020 records) | Pass. Existing rows unchanged apart from the new columns (`seq` numbering, nulls and the `MESSAGE` default) |
+| Migration, dev DB | `migrate deploy`, `migrate status`, `migrate diff --exit-code` | `20261020210000_trb_080_delivery_history` applied without reset; "up to date"; no difference. MD5 identical before and after over runs, deliveries (state, attempts, codes, decisions), parts (payload, hash, state, Telegram message IDs), attempts, reservations and ledger. The dev DB has 3 runs and 10 SENT deliveries: no events were backfilled and no confirmation was invented |
+| Docker smoke | Production image; disposable database; `NODE_ENV=production`, `TELEGRAM_MODE=webhook` with a fake token and `TELEGRAM_API_ROOT` pointing at a local Bot API double; `RESEARCH_MODE=fake`; `BACKGROUND_WORKERS=on` | See below |
+
+**Docker smoke, observed:**
+- **Readiness:** `queue: up`.
+- **Webhook research:** `/research` from the administrator gave the acknowledgement and the report through `delivery-send`, and the run through `research-execute`: 1 research job, delivery jobs completed.
+- **Document part:** a seeded document part was uploaded as multipart `sendDocument` with `filename=report-smoke2.txt`, the exact UTF-8 bytes and an HTML caption.
+- **Legacy row:** a delivery without any event was picked up by the sweep.
+- **Blocked chat:** a chat answered with 403 "bot was blocked by the user" was recorded as `BOT_BLOCKED`, and its delivery ended `PERMANENT_FAILURE / TELEGRAM_403`.
+- **Logs:** no error lines; no token, webhook secret or prompt text.
+- **Shutdown:** `docker stop` ended in 3 s with exit 0.
+- **Clean-up:** container, image and database removed.
+- **Fault in my test double, fixed:** the first pass of the double's multipart parser did not extract the file name. A raw capture then confirmed the upload above; the application was not changed.
+
+**Scenarios** (`test/integration/delivery.int-spec.ts`, 21 tests). Concurrency uses separate application instances and deterministic gates in the scripted sender.
+- **Independent queues.** In live accounting mode with synthetic prices:
+  - an ambiguous report send, an explicit resend and a 5xx answer leave runs, reservations, ledger entries, outbox events and attempts identical;
+  - one provider submission in total;
+  - delivery jobs name only deliveries, research jobs only runs.
+- **Transactional publication.**
+  - A report committed before a crash, with the dispatcher never run, is published after the restart and sent once.
+  - An interrupted publication rolls back with its acknowledgement and is published once; a repeated publication returns `null`.
+- **Two workers and a duplicate job.** While worker A is inside the first part's send, worker B consumes a duplicate job and does nothing. Every part is sent exactly once.
+- **Restart.**
+  - After a shutdown hand-over (first part `SENT`, delivery `PENDING`), a crash with an expired lease and no wake-up, then a new process: only the remaining parts are sent, and the first part keeps its message ID.
+  - Crash after a part's send intent: that part and the delivery become `UNKNOWN`, nothing more is sent, and no event remains.
+- **Classification.**
+  - A timeout on part 2 of a multipart report gives `SENT`, `UNKNOWN`, `PENDING`; the delivery is `UNKNOWN`, and a sweep and drain send nothing.
+  - 429 with `retry_after = 30`: `RETRYABLE_FAILURE` with a durable retry time about 30 s ahead and a matching event. Repeated ticks publish no job and send nothing; once due, it is sent (2 attempts).
+  - Five 429s end `PERMANENT_FAILURE` after 5 attempts.
+  - 400, a 403 without a block description, a timeout, 429 and 502 end in the expected states, with no blocked chat, no paused task and no `DESTINATION_BLOCKED` audit.
+- **Rendering.**
+  - A 40-paragraph Unicode report (ZWJ emoji, flags, `& <b>`): sent equals stored; every message is within limits, well-formed and has balanced links; all text is present; each claim is linked to its source.
+  - A 400-paragraph report: a summary message plus `report-<run>.txt`. The document holds the full text, header, markers and source list, with bytes equal to the stored part and a matching hash. After a restart `/result` resends identical bytes, and re-rendering the stored run reproduces the same parts.
+  - Malicious content: script-like text, a `javascript:` and a credential URL annotation, and an HTML title produce no foreign tags and no links except validated https sources. Rejected annotations are not listed as sources; the file name and caption are fixed.
+- **History.**
+  - Keyset paging over 12 runs: 5 + 5 + 2, newest first. A run inserted meanwhile does not shift the open pages; "newer" returns to the first page; every button is within 64 bytes.
+  - A second user sees only their own run. Foreign run cards, resends and cursors reveal nothing ("Запуск не знайдено.", a restart notice) and create no `RESEND`.
+  - Malformed callbacks are recorded `IGNORED / CALLBACK_UNKNOWN`. Foreign task history and latest result get "Завдання не знайдено.".
+  - After deletion, the task's runs disappear from `/history`, run cards, the resend button, `/result` and task history.
+  - Lines and cards distinguish manual and scheduled runs and show planned and actual time (42 min late), research state and outcome, delivery state (`UNKNOWN`, `SUPPRESSED` with reason) and usage.
+- **Explicit resend.**
+  - From a task card (live mode), the same Telegram update delivered twice gives one `RESEND` with copies of the stored parts. The original delivery and parts, the runs, reservations, ledger, outbox and attempts are identical, the daily run count is unchanged, and there is 1 submission.
+  - An `UNKNOWN` original shows a warning and a "possible duplicate" button; the resend is preceded by the explanation.
+  - After suspension and reactivation, nothing suppressed is sent; an explicit resend from the run card works.
+- **Blocked chat** (live mode).
+  - **Confirmed block.** A 403 "bot was blocked by the user" pauses both active tasks (no next run) and cancels the queued scheduled run (`CHAT_BLOCKED`, ledger RESERVE + RELEASE, reservation `RELEASED`). It is recorded in an audit event with its counts.
+  - **While blocked.** The scheduler does nothing two days later, and a new automatic message is stored `SUPPRESSED / CHAT_BLOCKED` without a send attempt.
+  - **Recovery.** `/start` restores the chat (audited) and sends the notice before the reply; nothing suppressed is released and both tasks stay paused. An explicit resume gives the next future occurrence, with no replay.
+  - **Running research.** Research in flight when the block is confirmed finishes with its report stored and `SUPPRESSED / CHAT_BLOCKED`; `/result` then resends it with no new submission.
+
+**Earlier suites adapted:**
+- **Migration snapshot.** The migration test ignores the TRB-080 columns.
+- **`/result` after an UNKNOWN send.** The research-slice test now expects the explanation before the resent part.
+- **Task card buttons.** The card unit test expects "Останній результат" and "Історія".
+
+All other suites (identity, invitations, onboarding, status messages, suspension and suppression, scheduling, queue, accounting) pass unchanged through the new delivery queue.
+
+**Not run:**
+- CI;
+- any live Telegram message or OpenAI request (Telegram delivery is not live-tested);
+- deployment;
+- a mutation re-run;
+- the rollout procedure against a database with deliveries in flight under the old worker. Covered only by the lease-recovery and backfill paths in tests.
+
+**Remaining limitations** (docs/DELIVERY.md):
+- no exactly-once delivery: `UNKNOWN` parts need an explicit, possibly duplicating resend;
+- the one-part race on suspension, deletion or block;
+- head-of-line waiting per chat behind a retry (Retry-After at most 1 h);
+- Telegram clients may auto-link bare model-written URLs, which are not presented as sources;
+- deleted-task content is hidden, not purged (TRB-090).
+
 ## Release checklist
 
 - Exact model/tool compatibility verified in official docs and an authorized sample.

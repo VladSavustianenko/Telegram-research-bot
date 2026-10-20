@@ -1,6 +1,7 @@
 import {
   TASK_NEW_CALLBACK,
   draftCallbackData,
+  historyCallbackData,
   taskCallbackData,
   taskListCallbackData,
 } from '../telegram/callback-data';
@@ -257,6 +258,10 @@ export function taskCardView(task: TaskView, notice?: string): View {
           { text: 'Видалити', callback_data: taskCallbackData(id, rev, 'd') },
         ],
         [
+          { text: 'Останній результат', callback_data: taskCallbackData(id, rev, 'lr') },
+          { text: 'Історія', callback_data: taskCallbackData(id, rev, 'h') },
+        ],
+        [
           { text: 'Запустити зараз', callback_data: taskCallbackData(id, rev, 'r') },
           { text: '« До списку', callback_data: taskListCallbackData(0) },
         ],
@@ -288,10 +293,14 @@ export function taskListView(
   notice?: string,
 ): View {
   const newButton: Button = { text: '+ Нове завдання', callback_data: TASK_NEW_CALLBACK };
+  const historyButton: Button = {
+    text: 'Історія запусків',
+    callback_data: historyCallbackData('all'),
+  };
   if (counts.saved === 0) {
     return {
       text: [...(notice ? [notice, ''] : []), 'Завдань ще немає.'].join('\n'),
-      keyboard: { inline_keyboard: [[newButton]] },
+      keyboard: { inline_keyboard: [[newButton, historyButton]] },
     };
   }
   const pages = Math.max(1, Math.ceil(counts.saved / TASKS_PER_PAGE));
@@ -316,6 +325,6 @@ export function taskListView(
   if (page > 0) paging.push({ text: '«', callback_data: taskListCallbackData(page - 1) });
   if (page + 1 < pages) paging.push({ text: '»', callback_data: taskListCallbackData(page + 1) });
   if (paging.length > 0) rows.push(paging);
-  rows.push([newButton]);
+  rows.push([newButton, historyButton]);
   return { text: lines.join('\n'), keyboard: { inline_keyboard: rows } };
 }

@@ -11,6 +11,7 @@ import {
 import {
   TelegramSendError,
   type InlineKeyboard,
+  type TelegramDocument,
   type TelegramSender,
 } from '../../src/telegram/telegram-sender';
 
@@ -137,7 +138,14 @@ export const unknownOutcome = (code = 'OPENAI_CONNECTION') => new ProviderError(
 
 /** Records sent messages; `failNext` scripts failures for upcoming sends. */
 export class RecordingSender implements TelegramSender {
-  readonly sent: { chatId: bigint; html: string; replyMarkup?: InlineKeyboard }[] = [];
+  /** Messages and documents Telegram accepted; for a document `html` is the caption. */
+  readonly sent: {
+    chatId: bigint;
+    html: string;
+    replyMarkup?: InlineKeyboard;
+    document?: TelegramDocument;
+    messageId: number;
+  }[] = [];
   readonly attempts: { chatId: bigint; html: string }[] = [];
   readonly callbackAnswers: { id: string; text: string | undefined }[] = [];
   private readonly failures: TelegramSendError[] = [];
@@ -157,8 +165,32 @@ export class RecordingSender implements TelegramSender {
     await this.beforeSend(html);
     const failure = this.failures.shift();
     if (failure) throw failure;
-    this.sent.push({ chatId, html, ...(replyMarkup ? { replyMarkup } : {}) });
     this.nextMessageId += 1;
+    this.sent.push({
+      chatId,
+      html,
+      ...(replyMarkup ? { replyMarkup } : {}),
+      messageId: this.nextMessageId,
+    });
+    return { messageId: this.nextMessageId };
+  }
+
+  async sendDocument(
+    chatId: bigint,
+    document: TelegramDocument,
+    captionHtml: string,
+  ): Promise<{ messageId: number }> {
+    this.attempts.push({ chatId, html: captionHtml });
+    await this.beforeSend(captionHtml);
+    const failure = this.failures.shift();
+    if (failure) throw failure;
+    this.nextMessageId += 1;
+    this.sent.push({
+      chatId,
+      html: captionHtml,
+      document: { fileName: document.fileName, content: Buffer.from(document.content) },
+      messageId: this.nextMessageId,
+    });
     return { messageId: this.nextMessageId };
   }
 
@@ -170,5 +202,11 @@ export class RecordingSender implements TelegramSender {
 
 export const telegramRateLimited = () =>
   new TelegramSendError('TELEGRAM_429', 'not_sent', false, 0);
-export const telegramBlocked = () => new TelegramSendError('TELEGRAM_403', 'not_sent', true);
+/** Confirmed by Telegram: 403 "Forbidden: bot was blocked by the user". */
+export const telegramBlocked = () =>
+  new TelegramSendError('TELEGRAM_403', 'not_sent', true, undefined, 'BOT_BLOCKED');
+/** A permanent refusal that says nothing about the chat (e.g. 400 can't parse entities). */
+export const telegramBadRequest = () => new TelegramSendError('TELEGRAM_400', 'not_sent', true);
+/** A Bot API 5xx answer (ok=false): not sent, retryable. */
+export const telegramServerError = () => new TelegramSendError('TELEGRAM_502', 'not_sent', false);
 export const telegramTimeout = () => new TelegramSendError('TELEGRAM_NETWORK', 'unknown', false);
