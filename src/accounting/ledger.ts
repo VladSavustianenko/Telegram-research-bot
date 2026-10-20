@@ -222,10 +222,9 @@ export async function settleRun(
 
   const policy = reservation.policy as unknown as ReservationPolicy;
   const estimate = estimateRun(policy, accounting);
-  const known =
-    estimate.kind === 'estimate' ? estimate.estimatedMicros + estimate.uncertainMicros : null;
 
-  if (accounting.outcome === 'settle' && estimate.kind === 'estimate' && known !== null) {
+  if (accounting.outcome === 'settle' && estimate.kind === 'estimate') {
+    const known = estimate.estimatedMicros + estimate.uncertainMicros;
     const entries: Entry[] = [
       {
         kind: 'SETTLE',
@@ -263,9 +262,26 @@ export async function settleRun(
       : 'ALREADY_FINAL';
   }
 
-  // Unknown cost: at least the full reservation stays exposed; a partial
-  // estimate above it raises the exposure (recorded as an overrun).
-  const exposure = known !== null && known > reserved ? known : reserved;
+  // Cost not fully known. Component policy (docs/ACCOUNTING.md): reported
+  // components are priced, each unreported one keeps its own allowance, the
+  // uncovered search allowance stays held; overall at least the reservation.
+  // An amount above the reservation raises the exposure (recorded as an
+  // overrun), never clamped. Nothing can be priced for missing usage or an
+  // unmapped model: the reservation stays held.
+  const known =
+    estimate.kind === 'estimate'
+      ? estimate.estimatedMicros
+      : estimate.kind === 'partial'
+        ? estimate.knownMicros
+        : null;
+  const held =
+    estimate.kind === 'estimate'
+      ? estimate.uncertainMicros
+      : estimate.kind === 'partial'
+        ? estimate.heldMicros
+        : 0n;
+  const componentTotal = known === null ? null : known + held;
+  const exposure = componentTotal !== null && componentTotal > reserved ? componentTotal : reserved;
   const entries: Entry[] = [
     {
       kind: 'UNRESOLVED',
@@ -274,13 +290,16 @@ export async function settleRun(
       basis: {
         reason: accounting.reason,
         unknownBecause:
-          estimate.kind === 'unknown'
-            ? estimate.reason
-            : accounting.outcome === 'unresolved'
-              ? 'OUTCOME_AMBIGUOUS'
-              : null,
+          accounting.outcome === 'unresolved'
+            ? 'OUTCOME_AMBIGUOUS'
+            : estimate.kind === 'unknown'
+              ? estimate.reason
+              : 'USAGE_PARTIAL',
         ...estimate.basis,
-        partialEstimateMicros: known,
+        ...(estimate.kind === 'partial' ? { unknownComponents: estimate.unknownComponents } : {}),
+        knownMicros: known,
+        heldMicros: known === null ? null : held,
+        exposureMicros: exposure,
       },
     },
   ];
@@ -292,7 +311,19 @@ export async function settleRun(
       basis: { reservedMicros: reserved, exposureMicros: exposure },
     });
   }
-  return (await move(tx, reservation, { status: 'UNRESOLVED', exposure }, entries))
+  return (await move(
+    tx,
+    reservation,
+    {
+      status: 'UNRESOLVED',
+      exposure,
+      // The known part, and the remainder of the exposure (held allowances, or the
+      // reservation itself while nothing is known); together they equal the exposure.
+      estimated: known,
+      uncertain: known === null ? null : exposure - known,
+    },
+    entries,
+  ))
     ? 'UNRESOLVED'
     : 'ALREADY_FINAL';
 }
@@ -388,7 +419,12 @@ export async function usageTotals(tx: Tx, month: string, userId?: string): Promi
       totals.estimatedMicros += row.estimatedMicros ?? 0n;
       totals.unresolvedMicros += row.uncertainMicros ?? 0n;
     }
-    if (row.status === 'UNRESOLVED') totals.unresolvedMicros += row.exposureMicros;
+    if (row.status === 'UNRESOLVED') {
+      // A known partial estimate is shown as estimated; the rest of the exposure is unresolved.
+      totals.estimatedMicros += row.estimatedMicros ?? 0n;
+      totals.unresolvedMicros +=
+        row.estimatedMicros === null ? row.exposureMicros : (row.uncertainMicros ?? 0n);
+    }
     if (row.status === 'RESOLVED') totals.confirmedMicros += row.confirmedMicros ?? 0n;
   }
   return totals;

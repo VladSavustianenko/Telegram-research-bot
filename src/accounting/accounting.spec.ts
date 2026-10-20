@@ -147,13 +147,85 @@ describe('usage estimates', () => {
         returnedModel: 'm',
         observedSearchItems: 1,
       }),
-    ).toMatchObject({ kind: 'unknown', reason: 'USAGE_PARTIAL' });
+    ).toMatchObject({ kind: 'partial', unknownComponents: ['output'] });
     expect(
       estimateRun(policy, { usage, returnedModel: 'other', observedSearchItems: 1 }),
     ).toMatchObject({
       kind: 'unknown',
       reason: 'MODEL_NOT_PRICED',
     });
+  });
+});
+
+describe('partial usage (component policy)', () => {
+  const policy = policyOf(); // allowances: input $0.20, output $0.024, searches 6 x $0.01
+  const partial = (usage: Partial<Record<string, number | null>>, observedSearchItems = 0) =>
+    estimateRun(policy, {
+      usage: {
+        inputTokens: null,
+        outputTokens: null,
+        reasoningTokens: null,
+        cachedInputTokens: null,
+        totalTokens: null,
+        ...usage,
+      },
+      returnedModel: 'm',
+      observedSearchItems,
+    });
+
+  it('keeps a known input cost above the reservation and holds the output allowance', () => {
+    // 1 000 000 x $2 = $2.00 known; output unknown: its $0.024 allowance stays held,
+    // and the search allowance (0 observed) stays held: $0.06.
+    expect(partial({ inputTokens: 1_000_000, cachedInputTokens: 0 })).toMatchObject({
+      kind: 'partial',
+      knownMicros: 2_000_000n,
+      heldMicros: 24_000n + 60_000n,
+      unknownComponents: ['output'],
+    });
+  });
+
+  it('keeps a known output cost above the reservation and holds the input allowance', () => {
+    // 50 000 x $8 = $0.40 known; input unknown: its $0.20 allowance stays held.
+    expect(partial({ outputTokens: 50_000 })).toMatchObject({
+      kind: 'partial',
+      knownMicros: 400_000n,
+      heldMicros: 200_000n + 60_000n,
+      unknownComponents: ['input'],
+    });
+  });
+
+  it('includes observed searches as known and keeps the uncovered search allowance', () => {
+    expect(partial({ inputTokens: 1_200 }, 2)).toMatchObject({
+      // 1 200 x $2 (cache unreported: full rate) + 2 observed searches
+      knownMicros: 2_400n + 20_000n,
+      // output allowance + 4 uncovered searches
+      heldMicros: 24_000n + 40_000n,
+    });
+  });
+
+  it('holds every allowance when no token count is reported', () => {
+    expect(partial({}, 0)).toMatchObject({
+      kind: 'partial',
+      knownMicros: 0n,
+      heldMicros: 284_000n,
+      unknownComponents: ['input', 'output'],
+    });
+  });
+
+  it('does not price an unmapped model even when usage is partial', () => {
+    expect(
+      estimateRun(policy, {
+        usage: {
+          inputTokens: 1_000_000,
+          outputTokens: null,
+          reasoningTokens: null,
+          cachedInputTokens: 0,
+          totalTokens: null,
+        },
+        returnedModel: 'other',
+        observedSearchItems: 0,
+      }),
+    ).toMatchObject({ kind: 'unknown', reason: 'MODEL_NOT_PRICED' });
   });
 });
 

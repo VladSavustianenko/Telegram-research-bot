@@ -557,6 +557,45 @@ Remaining limitations:
 - **Outbox dispatch.** The outbox is consumed directly by the in-process worker until TRB-060.
 - **Not run:** Docker smoke (no Dockerfile or dependency change; new optional variables), CI, any live request.
 
+### TRB-050 review fix (2026-10-20, reviewed commit 6ddcc3e)
+
+**Finding.** Partial usage discarded known costs above the reservation.
+
+**Root cause.** `estimateRun` returned `unknown / USAGE_PARTIAL` as soon as the input or output token count was missing, discarding the reported component. `settleRun` then held only the reservation. Example: 1 000 000 reported input tokens at the synthetic $2/MTok cost $2.00, but the run stayed at $0.284 with no `OVERRUN`, and further admissions were allowed.
+
+**Fix** (docs/ACCOUNTING.md, "Partial usage"):
+- **Component policy.** Reported components are priced from the run's own snapshot. Each unreported component keeps its own reservation allowance, and the uncovered search allowance stays held. Exposure = max(reservation, known + held), with increases recorded as `OVERRUN`.
+- **What is stored.** `estimated_micros` holds the known part and `uncertain_micros` the remainder of the exposure; `/usage` shows them as estimate and unresolved, without double counting.
+- **Unchanged:**
+  - no usage at all, or an unmapped model, still prices nothing; the model is now checked before any component is priced;
+  - complete usage settles as before;
+  - settlement stays in the fenced finish transaction.
+- **No schema change.**
+
+| Check | Command | Result |
+|---|---|---|
+| Reproduction before fix | new unit tests and `test/integration/accounting-partial.int-spec.ts` against the code of 6ddcc3e | Unit: 6 failed. Integration: 7 failed, 1 passed (replay, which was already idempotent) |
+| Static checks | `npm run format:check`, `npm run lint`, `npm run typecheck`, `npm run prisma:validate` | Pass |
+| Unit tests | `npm test` | 183 passed (13 files) |
+| Integration tests | `npm run test:integration` | 158 passed (13 files, all earlier suites included); 0 disposable databases left |
+| Build | `npm run build` | Pass |
+
+Regression scenarios (synthetic prices, scripted responses, real PostgreSQL):
+1. **Input known, output missing.** Input 1 000 000 is known ($2.00); output $0.024 and searches $0.06 are held. Exposure is $2.084: UNRESOLVED 0 and OVERRUN +$1.80. The basis lists `unknownComponents: [output]`.
+2. **Output known, input missing.** Output 50 000 is known ($0.40); input $0.20 and searches $0.06 are held. Exposure is $0.66, OVERRUN +$0.376.
+3. **Known part below the reservation.** Input 1 200 is known ($0.0024): exposure stays $0.284, with no overrun.
+4. **Ambiguous outcome.** A deadline with failed cancellation, after polls reported input 1 000 000: UNCERTAIN, UNRESOLVED at $2.084.
+5. **User budget.** With a user budget of $2.20, the next admission is refused (`USER_BUDGET_EXHAUSTED`): no new run, reservation, execution event or submission.
+6. **Global budget.** With a global budget of $2.20, another user's admission is refused (`GLOBAL_BUDGET_EXHAUSTED`) with the same guarantees.
+7. **Replay.** Replayed settlement (ambiguous and terminal) gives `ALREADY_FINAL`; the reservation and ledger are unchanged.
+8. **`/usage`.** Shows estimated $2.00, unresolved $0.084, reserved $0.00 and a total of $2.084.
+9. **Unit tests.** Both partial directions; the observed searches policy; held allowances when no token count is reported; an unmapped model with partial usage is still unknown.
+10. **Existing behaviour.** The existing `accounting.int-spec.ts` scenarios pass unchanged: complete usage, missing usage, partial usage below the reservation, unmapped model, overrun, operator resolution and stale worker.
+
+**Earlier records.** Reservations finalized by the earlier code are not changed automatically; they would need an explicit operator resolution. None exist: TRB-050 is unreleased and the owner's database has no reservations.
+
+**Not run:** Docker smoke (no configuration change), CI, live requests.
+
 ## Release checklist
 
 - Exact model/tool compatibility verified in official docs and an authorized sample.

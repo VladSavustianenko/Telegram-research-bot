@@ -147,27 +147,50 @@ export function modelPriced(pricing: PricingContent, returned: string | null): b
   );
 }
 
+type Basis = Record<string, string | number | boolean | null>;
+
 export type Estimate =
   | {
+      /** Every component reported. */
       kind: 'estimate';
       /** Token cost from reported usage plus observed web search items x rate. */
       estimatedMicros: bigint;
       /** Search allowance not covered by observed items: kept because billing is unverified. */
       uncertainMicros: bigint;
-      basis: Record<string, string | number | boolean | null>;
+      basis: Basis;
     }
   | {
+      /**
+       * Some token counts missing. Reported components are priced; each missing
+       * one keeps its own reservation allowance (component policy).
+       */
+      kind: 'partial';
+      /** Cost of the reported components plus observed searches. */
+      knownMicros: bigint;
+      /** Allowances of the unreported components plus the uncovered search allowance. */
+      heldMicros: bigint;
+      unknownComponents: ('input' | 'output')[];
+      basis: Basis;
+    }
+  | {
+      /** Nothing can be priced: no usage at all, or a model the pricing does not cover. */
       kind: 'unknown';
-      reason: 'USAGE_MISSING' | 'USAGE_PARTIAL' | 'MODEL_NOT_PRICED';
-      basis: Record<string, string | number | boolean | null>;
+      reason: 'USAGE_MISSING' | 'MODEL_NOT_PRICED';
+      basis: Basis;
     };
 
 /**
- * Local estimate for a terminal response, using the run's own policy snapshot
- * (never today's configuration). Missing usage is unknown, never zero. Cached
- * tokens not reported are charged at the full input rate. Observed
- * web_search_call items are not authoritative: the search allowance they do not
- * cover stays as `uncertainMicros` until an operator resolves the run.
+ * Local estimate from provider usage, using the run's own policy snapshot
+ * (never today's configuration). Components are priced independently:
+ * - input: (input - cached) x input rate + cached x cached rate; unreported
+ *   cached tokens are charged at the full input rate;
+ * - output: output tokens x output rate (includes reasoning);
+ * - searches: observed web_search_call items x rate are known; the allowance
+ *   they do not cover is held, because billable searches are not verified.
+ * A missing input or output count is unknown, never zero: that component keeps
+ * its own allowance from the reservation (so an overrun of a known component
+ * never consumes the allowance of an unknown one). No usage at all, or an
+ * unmapped returned model, prices nothing.
  */
 export function estimateRun(
   policy: ReservationPolicy,
@@ -177,7 +200,7 @@ export function estimateRun(
     observedSearchItems: number;
   },
 ): Estimate {
-  const basis = {
+  const basis: Basis = {
     returnedModel: evidence.returnedModel,
     inputTokens: evidence.usage?.inputTokens ?? null,
     cachedInputTokens: evidence.usage?.cachedInputTokens ?? null,
@@ -189,31 +212,64 @@ export function estimateRun(
     policyVersion: policy.policyVersion,
   };
   if (!evidence.usage) return { kind: 'unknown', reason: 'USAGE_MISSING', basis };
-  const { inputTokens, outputTokens } = evidence.usage;
-  if (inputTokens === null || outputTokens === null) {
-    return { kind: 'unknown', reason: 'USAGE_PARTIAL', basis };
-  }
   if (!modelPriced(policy.pricing, evidence.returnedModel)) {
     return { kind: 'unknown', reason: 'MODEL_NOT_PRICED', basis };
   }
   const rates = policy.pricing;
-  const cached = Math.min(Math.max(evidence.usage.cachedInputTokens ?? 0, 0), inputTokens);
-  const tokens =
-    tokenCostMicros(inputTokens - cached, BigInt(rates.inputPerMTokMicros)) +
-    tokenCostMicros(cached, BigInt(rates.cachedInputPerMTokMicros)) +
-    tokenCostMicros(outputTokens, BigInt(rates.outputPerMTokMicros));
+  const { inputTokens, outputTokens } = evidence.usage;
+
+  const inputMicros =
+    inputTokens === null
+      ? null
+      : (() => {
+          const cached = Math.min(Math.max(evidence.usage.cachedInputTokens ?? 0, 0), inputTokens);
+          return (
+            tokenCostMicros(inputTokens - cached, BigInt(rates.inputPerMTokMicros)) +
+            tokenCostMicros(cached, BigInt(rates.cachedInputPerMTokMicros))
+          );
+        })();
+  const outputMicros =
+    outputTokens === null ? null : tokenCostMicros(outputTokens, BigInt(rates.outputPerMTokMicros));
+
   const searchRate = BigInt(rates.webSearchCallMicros);
   const observed = BigInt(Math.max(0, evidence.observedSearchItems));
   const allowance = BigInt(policy.webSearchCallAllowance);
-  const uncovered = allowance > observed ? allowance - observed : 0n;
+  const searchKnown = observed * searchRate;
+  const searchHeld = (allowance > observed ? allowance - observed : 0n) * searchRate;
+
+  if (inputMicros !== null && outputMicros !== null) {
+    const tokens = inputMicros + outputMicros;
+    return {
+      kind: 'estimate',
+      estimatedMicros: tokens + searchKnown,
+      uncertainMicros: searchHeld,
+      basis: {
+        ...basis,
+        tokenMicros: tokens.toString(),
+        searchRateMicros: rates.webSearchCallMicros,
+      },
+    };
+  }
+  const unknownComponents: ('input' | 'output')[] = [];
+  if (inputMicros === null) unknownComponents.push('input');
+  if (outputMicros === null) unknownComponents.push('output');
+  const known = (inputMicros ?? 0n) + (outputMicros ?? 0n) + searchKnown;
+  const held =
+    (inputMicros === null ? BigInt(policy.components.inputMicros) : 0n) +
+    (outputMicros === null ? BigInt(policy.components.outputMicros) : 0n) +
+    searchHeld;
   return {
-    kind: 'estimate',
-    estimatedMicros: tokens + observed * searchRate,
-    uncertainMicros: uncovered * searchRate,
+    kind: 'partial',
+    knownMicros: known,
+    heldMicros: held,
+    unknownComponents,
     basis: {
       ...basis,
-      tokenMicros: tokens.toString(),
-      searchRateMicros: rates.webSearchCallMicros,
+      inputMicros: inputMicros === null ? null : inputMicros.toString(),
+      outputMicros: outputMicros === null ? null : outputMicros.toString(),
+      searchKnownMicros: searchKnown.toString(),
+      searchHeldMicros: searchHeld.toString(),
+      unknownComponents: unknownComponents.join(','),
     },
   };
 }

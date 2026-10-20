@@ -133,7 +133,7 @@ Replays (recovery, repeated cancellation, repeated settlement) find the status a
 | — → RESERVED (`RESERVE`) | Admission | The reservation |
 | RESERVED → RELEASED (`RELEASE`) | No request can exist: cancelled before submission (pause, delete, suspension, eligibility recheck), provider change before submission, or provider refused the request at submit (HTTP 4xx, "not accepted") | 0 |
 | RESERVED → SETTLED (`SETTLE`, `OVERRUN`) | Terminal provider response (succeeded, failed, incomplete, cancelled, bounds not confirmed) with complete usage and a priced model | Estimate + uncertain search allowance |
-| RESERVED → UNRESOLVED (`UNRESOLVED`, `OVERRUN`) | Ambiguous outcome (UNCERTAIN: unknown submit, interrupted submission, response not retrievable, unconfirmed cancellation); or terminal with missing or partial usage, or an unmapped returned model | max(reservation, partial estimate) |
+| RESERVED → UNRESOLVED (`UNRESOLVED`, `OVERRUN`) | Ambiguous outcome (UNCERTAIN: unknown submit, interrupted submission, response not retrievable, unconfirmed cancellation); or terminal with missing or partial usage, or an unmapped returned model | max(reservation, known components + held allowances); see [Partial usage](#partial-usage) |
 | SETTLED / UNRESOLVED → RESOLVED (`RESOLVE`) | Operator command with a confirmed amount | The confirmed amount |
 
 **Settlement estimate**, using the run's own policy:
@@ -141,6 +141,43 @@ Replays (recovery, repeated cancellation, repeated settlement) find the status a
 - **Searches:** observed `web_search_call` items × search rate. The count is the larger of the recorded tool items and the stored item count.
 - **Uncertain hold:** the part of the search allowance the observed items do not cover. It stays in exposure as "unresolved", because billable searches are not verified. Only an operator resolution removes it.
 - **Overruns:** an estimate above the reservation is recorded in full, with an `OVERRUN` entry, never clamped. The higher exposure then reduces the remaining budget, and later admissions are refused when it is exhausted.
+
+### Partial usage
+
+When usage is reported but the input or the output token count is missing, the cost is not fully known and the reservation becomes UNRESOLVED. This applies both to a terminal response and to an ambiguous outcome whose polls reported partial usage.
+
+Components are priced independently from the run's own pricing snapshot, using the component policy:
+
+| Component | Reported | Not reported |
+|---|---|---|
+| Input | (input − cached) × input rate + cached × cached rate; an unreported cached count is priced at the full input rate | Its reservation allowance stays held: `RESERVATION_INPUT_TOKENS` × input rate |
+| Output | Output tokens × output rate | Its reservation allowance stays held: `OUTPUT_TOKEN_LIMIT` × output rate |
+| Searches | Observed items × search rate (known; not proof of billing) | The allowance not covered by observed items stays held (unchanged search policy) |
+
+**Exposure** = max(reservation, known + held):
+- **Unknown allowances.** Each unknown component keeps exactly its own allowance, so an overrun of a known component never consumes the allowance of an unknown one, and no component is counted twice.
+- **Increases.** An increase above the reservation is recorded as `OVERRUN`, never clamped, and counts against the user and global budgets at the next admission.
+- **What is stored:**
+  - `estimated_micros` holds the known part;
+  - `uncertain_micros` holds the remainder of the exposure (held allowances, or the rest of the reservation when that is larger);
+  - the ledger entry's basis lists the unknown components, the known and held amounts and the per-component prices.
+
+**Fail-closed cases:**
+- **No usage at all** keeps the full reservation (equivalent to every component unknown).
+- **An unmapped returned model** prices nothing and keeps the full reservation: no rate is substituted.
+- **Release.** Nothing is released automatically; only an operator resolution with a confirmed amount ends an UNRESOLVED reservation.
+
+`/usage` and `ops:accounting --list` show the known part as "оцінено"/`estimated` and the remainder as "невизначено"/`uncertain`; the two add up to the exposure, with nothing counted twice. Neither is a confirmed amount.
+
+**Worked examples** (synthetic prices, `test/support/live-env.ts`). The allowances are input $0.20, output $0.024 and 6 searches at $0.01 = $0.06, so the reservation is $0.284. No search items were observed in either example.
+
+| Reported | Known | Held | Exposure | Ledger |
+|---|---|---|---|---|
+| input 1 000 000 (cached 0), output missing | 1 000 000 × $2 = $2.00 | output $0.024 + searches $0.06 | **$2.084** | RESERVE +0.284, UNRESOLVED 0, OVERRUN +1.80 |
+| output 50 000, input missing | 50 000 × $8 = $0.40 | input $0.20 + searches $0.06 | **$0.66** | RESERVE +0.284, UNRESOLVED 0, OVERRUN +0.376 |
+| input 1 200, output missing | $0.0024 | $0.084 | $0.284 (the reservation) | RESERVE +0.284, UNRESOLVED 0 |
+
+**Records created before this fix.** The first TRB-050 version held only the reservation for partial usage. Any reservation already finalized that way is not changed automatically; its exposure could be too low. Such records would need an explicit accounting decision: an operator resolution with the confirmed amount (`ops:accounting`). TRB-050 has not been released, and the owner's database has no reservations, so no such record exists.
 
 **Fencing.** Settlement and release happen in the same fenced transaction that finishes the run. A stale worker fails the fenced update first, so it can neither settle nor release. A worker cannot finalize a completed run again.
 

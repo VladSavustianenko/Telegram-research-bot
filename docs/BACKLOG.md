@@ -59,7 +59,7 @@ Acceptance note (owner, 2026-10-19, from the TRB-020 live evidence):
 - **Explicit policy.** Unknown usage and potential overruns need a documented policy, for example a reservation margin for extra searches, retention of unknown amounts and reconciliation against billing evidence. It must be accepted before live research is opened to members.
 - **Until then,** live research stays administrator-only (TRB-030).
 
-Status: READY FOR REVIEW (2026-10-19). Mock validation only: scripted providers (no network), synthetic prices, real PostgreSQL; no live request. Behaviour: docs/ACCOUNTING.md. Evidence: docs/VALIDATION.md, "TRB-050 evidence". The acceptance note above is implemented, as follows:
+Status: READY FOR REVIEW (2026-10-19; review fix for commit 6ddcc3e applied 2026-10-20: partial usage). Mock validation only: scripted providers (no network), synthetic prices, real PostgreSQL; no live request. Behaviour: docs/ACCOUNTING.md. Evidence: docs/VALIDATION.md, "TRB-050 evidence" and "TRB-050 review fix". The acceptance note above is implemented, as follows:
 - reservations do not trust `max_tool_calls`: the search allowance must exceed it;
 - observed searches are not treated as billed, and the uncovered allowance stays held;
 - unknown cost stays exposed until an explicit operator resolution.
