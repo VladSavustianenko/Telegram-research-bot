@@ -1,13 +1,13 @@
 # TRB-040: tasks and durable dialogs
 
-Status: READY FOR REVIEW (review fix for commit ebff202 applied 2026-10-19: draft buttons are bound to their draft). Validated with fake providers, a recording Telegram sender and real PostgreSQL only; nothing here was exercised against the real Telegram API.
+Status: DONE (accepted by the owner on 2026-10-19 after review of commit cf8637b; includes the review fix binding draft buttons to their draft). TRB-050 added "Запустити зараз" to cards and lifecycle effects on queued runs (docs/ACCOUNTING.md). Validated with fake providers, a recording Telegram sender and real PostgreSQL only; nothing here was exercised against the real Telegram API.
 
-**Configuration only.** Tasks store *what* to research and *when* (local intent). Nothing executes them yet:
-- **Scheduled runs:** TRB-070.
-- **Admission, quotas and budgets, including a card "Run now" button:** TRB-050.
-- **Effect of task actions on research:** saving, editing, pausing, resuming and deleting a task never creates a research run, job or provider call.
+**Schedules are configuration only.** Tasks store *what* to research and *when* (local intent):
+- **Scheduled runs:** TRB-070; nothing executes schedules yet.
+- **"Запустити зараз" (since TRB-050):** admits a manual run of the task through the single admission path, with quotas, budgets, the live restriction and one active run per task (docs/ACCOUNTING.md). It is available for paused tasks and never changes the schedule.
+- **Effect of task actions on research.** Saving, editing and resuming a task never creates a research run, job or provider call. Pausing or deleting cancels the task's *queued* run (releasing its reservation), and deleting also suppresses delivery of its results.
 
-Cards and previews say so ("Автоматичні запуски за розкладом і запуск завдання з картки ще не працюють…") and show no next-run time. `/research` and `/result` keep working unchanged, with their TRB-030 authorization: live research is administrator-only until TRB-050.
+Cards and previews say that scheduled runs do not work yet and show no next-run time. `/research` and `/result` keep working unchanged, with their TRB-030 authorization: live research is administrator-only until TRB-050.
 
 ## Commands and buttons
 

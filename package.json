@@ -27,7 +27,8 @@
     "db:down": "docker compose down",
     "postinstall": "prisma generate",
     "ops:reconcile": "node dist/ops/reconcile-run.js",
-    "ops:tool-telemetry": "node dist/ops/tool-telemetry.js"
+    "ops:tool-telemetry": "node dist/ops/tool-telemetry.js",
+    "ops:accounting": "node dist/ops/accounting.js"
   },
   "dependencies": {
     "@nestjs/common": "12.1.2",

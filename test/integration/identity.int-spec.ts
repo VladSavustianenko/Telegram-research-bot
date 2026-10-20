@@ -14,19 +14,13 @@ import {
   startHarness,
   type Harness,
 } from '../support/research-harness';
+import { LIVE_TEST_ENV } from '../support/live-env';
 
 const MEMBER_A = 3003;
 const MEMBER_B = 3004;
 const STRANGER = 3999;
 
-const LIVE_ENV = {
-  RESEARCH_MODE: 'live',
-  OPENAI_API_KEY: 'sk-test-not-a-real-key',
-  OPENAI_MODEL: 'operator-selected-model',
-  OUTPUT_TOKEN_LIMIT: '3000',
-  TOOL_CALL_LIMIT: '3',
-  RUN_DEADLINE_SECONDS: '300',
-};
+const LIVE_ENV = LIVE_TEST_ENV;
 
 describe('TRB-030 identity, invitations and authorization (fakes, real PostgreSQL)', () => {
   const open: Harness[] = [];
@@ -633,6 +627,11 @@ describe('TRB-030 identity, invitations and authorization (fakes, real PostgreSQ
                   'policyVersion', 'x', 'providerKind', 'openai', 'model', 'operator-selected-model',
                   'maxOutputTokens', 3000, 'maxToolCalls', 3, 'deadlineSeconds', 300,
                   'reasoningEffort', null, 'timeZone', 'Europe/Kyiv')) AS request_snapshot) s`;
+      // With an execution event, as if admitted (TRB-050); the owner check still applies first.
+      await live.prisma.$executeRaw`
+        INSERT INTO outbox_event (id, operation_key, type, run_id, payload)
+        SELECT gen_random_uuid(), 'RESEARCH_EXECUTE:' || id, 'RESEARCH_EXECUTE', id, '{}'::jsonb
+          FROM research_run`;
       await live.research.tick();
       expect(await live.prisma.researchRun.findFirstOrThrow()).toMatchObject({
         state: 'CANCELLED',

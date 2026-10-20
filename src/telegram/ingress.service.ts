@@ -1,5 +1,7 @@
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
+import { CLOCK, type Clock } from '../common/clock';
 import { errorInfo } from '../common/error-info';
+import { showUsage } from '../accounting/usage';
 import { APP_CONFIG } from '../config/config.module';
 import type { Env } from '../config/env.schema';
 import { isUniqueViolation, type Tx } from '../database/prisma-errors';
@@ -78,6 +80,7 @@ export class TelegramIngressService {
   constructor(
     private readonly prisma: PrismaService,
     @Inject(APP_CONFIG) private readonly config: Env,
+    @Inject(CLOCK) private readonly clock: Clock,
     @Optional() @Inject(TELEGRAM_SENDER) private readonly sender: TelegramSender | null = null,
   ) {}
 
@@ -206,6 +209,8 @@ export class TelegramIngressService {
           : this.reply(context, 'REPLIED', 'HELP', help);
       case 'help':
         return this.reply(context, 'REPLIED', 'HELP', help);
+      case 'usage':
+        return showUsage(tx, this.config, { user, chatId: update.chatId, now: this.clock.now() });
       case 'tasks':
         return showTasks(this.taskContext(context, user));
       case 'new':
@@ -230,7 +235,8 @@ export class TelegramIngressService {
           user,
           chatId: update.chatId,
           updateId: update.updateId,
-          prompt: command.args,
+          now: this.clock.now(),
+          source: { kind: 'prompt', prompt: command.args },
         });
       }
       case 'result':
@@ -407,7 +413,14 @@ export class TelegramIngressService {
   }
 
   private taskContext(context: Context, user: AppUser): TaskContext {
-    return { tx: context.tx, config: this.config, user, chatId: context.update.chatId };
+    return {
+      tx: context.tx,
+      config: this.config,
+      user,
+      chatId: context.update.chatId,
+      updateId: context.update.updateId,
+      now: this.clock.now(),
+    };
   }
 
   private helpFor(user: AppUser): string {

@@ -60,6 +60,20 @@ const telegramIdList = z
     'must be a comma-separated list of numeric Telegram user IDs',
   );
 
+/** Comma-separated model identifiers; a trailing "*" makes an entry a prefix. */
+const modelPatternList = z
+  .string()
+  .transform((value) =>
+    value
+      .split(',')
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0),
+  )
+  .refine(
+    (entries) => entries.length > 0 && entries.every((e) => /^[A-Za-z0-9._:-]+\*?$/.test(e)),
+    'must be a comma-separated list of model names (a trailing * matches a prefix)',
+  );
+
 const postgresUrl = z.string().refine((value) => {
   try {
     const url = new URL(value);
@@ -155,15 +169,42 @@ export const envSchema = z
     // Timeout of each HTTP call to OpenAI (create/retrieve/cancel), not the run deadline.
     OPENAI_HTTP_TIMEOUT_MS: positiveIntWithDefault(30_000),
 
-    // Budgets and run bounds. TRB-020 enforces RUN_DEADLINE_SECONDS, OUTPUT_TOKEN_LIMIT and
-    // TOOL_CALL_LIMIT. Dollar amounts are parsed but NOT enforced before TRB-050.
-    USER_MONTHLY_BUDGET_USD: optional(usdAmount),
-    GLOBAL_MONTHLY_BUDGET_USD: optional(usdAmount),
-    RUN_MAX_ESTIMATED_COST_USD: optional(usdAmount),
+    // Run bounds sent to the provider (TRB-020). Not proven caps on billed usage.
     RESEARCH_CONCURRENCY: optional(positiveInt),
     RUN_DEADLINE_SECONDS: optional(positiveInt),
     OUTPUT_TOKEN_LIMIT: optional(positiveInt),
     TOOL_CALL_LIMIT: optional(positiveInt),
+
+    // Run quotas (TRB-050; SPEC §6 proposals, UTC days). Apply to every admitted run
+    // (live and simulated) except runs cancelled before submission.
+    USER_ACTIVE_RUN_LIMIT: positiveIntWithDefault(1),
+    USER_DAILY_RUN_LIMIT: positiveIntWithDefault(10),
+    USER_DAILY_MANUAL_RUN_LIMIT: positiveIntWithDefault(5),
+
+    // Live accounting (TRB-050, docs/ACCOUNTING.md). All of these are required for
+    // live admission; when any is missing, live requests are refused (fail closed).
+    // Budgets are per UTC month, in USD (micro-USD internally).
+    USER_MONTHLY_BUDGET_USD: optional(usdAmount),
+    GLOBAL_MONTHLY_BUDGET_USD: optional(usdAmount),
+    // Upper bound for one run's reservation; a policy reserving more refuses admission.
+    RUN_MAX_ESTIMATED_COST_USD: optional(usdAmount),
+    // Operator-supplied pricing. The label must change whenever any rate changes.
+    PRICING_VERSION: optional(
+      z.string().regex(/^[A-Za-z0-9._:-]{1,64}$/, 'must be 1-64 characters of A-Z a-z 0-9 . _ : -'),
+    ),
+    // Model the rates apply to; must equal OPENAI_MODEL.
+    PRICING_MODEL: optional(z.string().min(1)),
+    // Model identifiers the provider may return for it: exact names, or a prefix ending in "*".
+    PRICING_RETURNED_MODELS: optional(modelPatternList),
+    OPENAI_PRICE_INPUT_PER_MTOK_USD: optional(usdAmount),
+    OPENAI_PRICE_CACHED_INPUT_PER_MTOK_USD: optional(usdAmount),
+    OPENAI_PRICE_OUTPUT_PER_MTOK_USD: optional(usdAmount),
+    OPENAI_PRICE_WEB_SEARCH_CALL_USD: optional(usdAmount),
+    // Reservation allowances: input tokens (no API limit exists; includes search
+    // content) and web search calls (must exceed TOOL_CALL_LIMIT, which is not a
+    // proven cap on billed searches).
+    RESERVATION_INPUT_TOKENS: optional(positiveInt),
+    RESERVATION_WEB_SEARCH_CALLS: optional(positiveInt),
   })
   .superRefine((env, ctx) => {
     const problem = (path: string, message: string) =>
@@ -225,6 +266,12 @@ export const envSchema = z
   });
 
 export type Env = z.output<typeof envSchema>;
+
+/** Parses a USD amount ("12.5", at most 6 decimals) into micro-USD; null when malformed. */
+export function parseUsdMicros(value: string): bigint | null {
+  const result = usdAmount.safeParse(value.trim());
+  return result.success ? result.data : null;
+}
 
 export class ConfigValidationError extends Error {
   constructor(readonly problems: readonly string[]) {

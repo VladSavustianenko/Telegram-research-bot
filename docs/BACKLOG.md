@@ -44,7 +44,7 @@ Implement /tasks, /new, cards, editable prompts/schedules, pause/resume/delete, 
 
 Acceptance: full creation/edit flow works with Back/Cancel; restart resumes an unexpired draft; malformed zone/time/input is rejected; stale edit callbacks do not overwrite changes; existing tasks keep their zone when the user default changes; save never launches research implicitly.
 
-Status: READY FOR REVIEW (2026-10-19; review fix for commit ebff202 applied 2026-10-19). Mock validation only: fake provider, recording Telegram sender, real PostgreSQL; no live Telegram check. Behaviour: docs/TASKS.md. Evidence: docs/VALIDATION.md, "TRB-040 evidence" and "TRB-040 review fix". Schedules are stored configuration only; execution is TRB-070, and "Run now" from a task is TRB-050/060.
+Status: DONE — accepted by the owner on 2026-10-19 after review of commit cf8637b4b04eb94e197177acaa858017fa96a78f (implementation ebff202 and the review fix). Behaviour: docs/TASKS.md. Evidence: docs/VALIDATION.md, "TRB-040 evidence" and "TRB-040 review fix". Mock validation only; no live Telegram check. Schedules are stored configuration only; execution is TRB-070.
 
 ## TRB-050 — Atomic admission, quotas and cost reservations
 
@@ -58,6 +58,13 @@ Acceptance note (owner, 2026-10-19, from the TRB-020 live evidence):
 - **No assumed cap.** Budget reservations must not treat `max_tool_calls` as a proven hard cap on billable searches. One live run carried `max_tool_calls = 3` and was metered with 4 web search requests (docs/VALIDATION.md).
 - **Explicit policy.** Unknown usage and potential overruns need a documented policy, for example a reservation margin for extra searches, retention of unknown amounts and reconciliation against billing evidence. It must be accepted before live research is opened to members.
 - **Until then,** live research stays administrator-only (TRB-030).
+
+Status: READY FOR REVIEW (2026-10-19). Mock validation only: scripted providers (no network), synthetic prices, real PostgreSQL; no live request. Behaviour: docs/ACCOUNTING.md. Evidence: docs/VALIDATION.md, "TRB-050 evidence". The acceptance note above is implemented, as follows:
+- reservations do not trust `max_tool_calls`: the search allowance must exceed it;
+- observed searches are not treated as billed, and the uncovered allowance stays held;
+- unknown cost stays exposed until an explicit operator resolution.
+
+Live research remains administrator-only; opening it to members needs a separate owner decision.
 
 ## TRB-060 — Persistent queue execution and recovery
 

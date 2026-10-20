@@ -135,7 +135,7 @@ Enforced by TRB-020:
 - no SDK or application retry of a potentially billed request.
 
 Not enforced:
-- **Dollar amounts.** `RUN_MAX_ESTIMATED_COST_USD` and the monthly budgets are parsed but not enforced; budget reservation belongs to TRB-050.
+- **Dollar amounts.** Enforced since TRB-050 as application accounting: reservations, monthly budgets and a per-run maximum (docs/ACCOUNTING.md). This is not a provider spending ceiling.
 - **Input tokens.** These include retrieved search content and are not bounded by these settings. OpenAI's documentation limits the web search context window to 128k tokens.
 - **Billing on failure.** A cancelled or failed request may still be billed.
 
@@ -147,9 +147,9 @@ Three different things; only the second stops traffic:
 |---|---|
 | Spend alert (notification threshold) | Sends a notification; API traffic continues. Not a cap. |
 | Hard spend limit: a monthly spend limit with **"Enforce a hard limit"** turned on, per organization or per project | At the limit, requests fail with HTTP 429 (`project_spend_limit_exceeded` or `organization_spend_limit_exceeded`). Enforcement is not instantaneous, so recorded spend can slightly exceed the configured amount; it is not an exact dollar ceiling. Resets with the monthly cycle or when the limit is raised or removed. The guide does not say whether in-flight requests are stopped. |
-| Application budgets (`USER_MONTHLY_BUDGET_USD`, `GLOBAL_MONTHLY_BUDGET_USD`, `RUN_MAX_ESTIMATED_COST_USD`) | Parsed, not enforced. Reservation and enforcement are deferred to TRB-050. |
+| Application budgets (`USER_MONTHLY_BUDGET_USD`, `GLOBAL_MONTHLY_BUDGET_USD`, `RUN_MAX_ESTIMATED_COST_USD`) | Since TRB-050: admission is refused when the application's accounting (reservations, estimates, unresolved amounts) would exceed them; live admission is refused while any is missing. They do not stop a request that is already running and are not an exact invoice ceiling (docs/ACCOUNTING.md). |
 
-Entering a budget amount without turning on "Enforce a hard limit" leaves only notifications. Until TRB-050, a project hard limit with enforcement enabled is the only mechanism that stops billed traffic. Older community reports describe project limits as notification-only. Verify the toggle in your own dashboard rather than assuming the account has it. A request rejected with 429 `*_spend_limit_exceeded` at submit is classified as not accepted, giving FAILED.
+Entering a budget amount without turning on "Enforce a hard limit" leaves only notifications. A project hard limit with enforcement enabled remains the only mechanism that stops billed traffic at the provider; TRB-050 budgets only refuse new admissions. Older community reports describe project limits as notification-only. Verify the toggle in your own dashboard rather than assuming the account has it. A request rejected with 429 `*_spend_limit_exceeded` at submit is classified as not accepted, giving FAILED.
 
 ## Deferred
 

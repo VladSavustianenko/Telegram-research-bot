@@ -40,6 +40,8 @@ import {
 } from './request-builder';
 import { TOOL_TELEMETRY_VERSION, recordToolItems } from './tool-telemetry';
 import { hasUnresolvedLiveUncertainty } from './uncertainty';
+import { EXECUTE_EVENT } from './admission';
+import { settleRun, type RunAccounting } from '../accounting/ledger';
 
 export const RUN_LEASE_SECONDS = 60;
 const SHUTDOWN_WAIT_MS = 10_000;
@@ -183,29 +185,64 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
    * RUNNING until that commit, so no interleaving lets a live run start.
    */
   private async claimQueued(): Promise<Claim | null> {
+    await this.cancelUnadmitted();
     try {
+      // Only runs with a pending execution event (written by admission) are
+      // eligible; the claim consumes that event in the same statement, so the
+      // in-process worker is the only execution path until TRB-060.
       const rows = await this.prisma.$queryRaw<Claim[]>`
-        UPDATE research_run
-           SET state = 'RUNNING', lease_owner = ${this.workerId},
-               lease_until = now() + ${RUN_LEASE_SECONDS} * interval '1 second',
-               fencing_token = fencing_token + 1, started_at = COALESCE(started_at, now()),
-               updated_at = now()
-         WHERE id = (SELECT q.id FROM research_run q
-                      WHERE q.state = 'QUEUED'
-                        AND NOT EXISTS (SELECT 1 FROM research_run r WHERE r.state = 'RUNNING')
-                        AND (q.provider_kind <> 'openai' OR NOT EXISTS (
-                              SELECT 1 FROM research_run u
-                               WHERE u.state = 'UNCERTAIN' AND u.provider_kind = 'openai'
-                                 AND u.reconciled_at IS NULL))
-                      ORDER BY q.created_at, q.id
-                      LIMIT 1
-                      FOR UPDATE SKIP LOCKED)
-        RETURNING id, fencing_token AS "fencingToken"`;
+        WITH claimed AS (
+          UPDATE research_run
+             SET state = 'RUNNING', lease_owner = ${this.workerId},
+                 lease_until = now() + ${RUN_LEASE_SECONDS} * interval '1 second',
+                 fencing_token = fencing_token + 1, started_at = COALESCE(started_at, now()),
+                 updated_at = now()
+           WHERE id = (SELECT q.id FROM research_run q
+                        WHERE q.state = 'QUEUED'
+                          AND EXISTS (SELECT 1 FROM outbox_event o
+                                       WHERE o.run_id = q.id AND o.type = ${EXECUTE_EVENT}
+                                         AND o.dispatched_at IS NULL AND o.cancelled_at IS NULL)
+                          AND NOT EXISTS (SELECT 1 FROM research_run r WHERE r.state = 'RUNNING')
+                          AND (q.provider_kind <> 'openai' OR NOT EXISTS (
+                                SELECT 1 FROM research_run u
+                                 WHERE u.state = 'UNCERTAIN' AND u.provider_kind = 'openai'
+                                   AND u.reconciled_at IS NULL))
+                        ORDER BY q.created_at, q.id
+                        LIMIT 1
+                        FOR UPDATE SKIP LOCKED)
+          RETURNING id, fencing_token),
+        consumed AS (
+          UPDATE outbox_event SET dispatched_at = now()
+           WHERE run_id IN (SELECT id FROM claimed) AND type = ${EXECUTE_EVENT}
+             AND dispatched_at IS NULL AND cancelled_at IS NULL)
+        SELECT id, fencing_token AS "fencingToken" FROM claimed`;
       return rows[0] ?? null;
     } catch (error) {
       // research_run_single_running: another worker started a run concurrently.
       if (isUniqueViolation(error)) return null;
       throw error;
+    }
+  }
+
+  /**
+   * Queued runs without admission evidence (no pending execution event: rows
+   * from before TRB-050 or inserted outside admission) are never executed. They
+   * are cancelled before any submission; there is no reservation to release.
+   */
+  private async cancelUnadmitted(): Promise<void> {
+    const cancelled = await this.prisma.$executeRaw`
+      UPDATE research_run q
+         SET state = 'CANCELLED', failure_code = 'ADMISSION_EVIDENCE_MISSING',
+             completed_at = now(), updated_at = now()
+       WHERE q.state = 'QUEUED'
+         AND NOT EXISTS (SELECT 1 FROM outbox_event o
+                          WHERE o.run_id = q.id AND o.type = ${EXECUTE_EVENT}
+                            AND o.dispatched_at IS NULL AND o.cancelled_at IS NULL)`;
+    if (cancelled > 0) {
+      this.logger.warn({
+        message: 'Cancelled queued runs without admission evidence',
+        count: cancelled,
+      });
     }
   }
 
@@ -255,10 +292,12 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
 
     // Defence in depth for the fail-closed gate (normally enforced at claim time).
     if (provider.kind === 'openai' && (await hasUnresolvedLiveUncertainty(this.prisma))) {
-      await this.fenced(this.prisma, claim, {
-        state: 'QUEUED',
-        leaseOwner: null,
-        leaseUntil: null,
+      await this.prisma.$transaction(async (tx) => {
+        await this.fenced(tx, claim, { state: 'QUEUED', leaseOwner: null, leaseUntil: null });
+        // The run is eligible again: its execution event becomes pending again.
+        await tx.$executeRaw`
+          UPDATE outbox_event SET dispatched_at = NULL
+           WHERE run_id = ${claim.id}::uuid AND type = ${EXECUTE_EVENT} AND cancelled_at IS NULL`;
       });
       this.logger.warn({
         message: 'Live run returned to queue: unresolved uncertainty',
@@ -277,6 +316,14 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
       const owner = run.userId ? await lockUserForShare(tx, run.userId) : null;
       const reason = submissionDenial(owner, provider.kind, this.config);
       if (reason) return reason;
+      // A live run is submitted only against its own reservation (admission evidence).
+      if (provider.kind === 'openai') {
+        const reservation = await tx.budgetReservation.findUnique({
+          where: { runId: claim.id },
+          select: { status: true },
+        });
+        if (reservation?.status !== 'RESERVED') return 'ACCOUNTING_MISSING';
+      }
       await this.fenced(tx, claim, {
         submissionState: 'SUBMITTING',
         submittedAt,
@@ -297,7 +344,7 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
       const code = providerError?.code ?? 'SUBMIT_UNEXPECTED';
       this.logger.warn({ message: 'Research submission failed', runId: run.id, code });
       return providerError?.certainty === 'not_accepted'
-        ? this.finishWithoutReport(execution, 'FAILED', code)
+        ? this.finishWithoutReport(execution, 'FAILED', code, null, { providerNotAccepted: true })
         : this.finishWithoutReport(execution, 'UNCERTAIN', code);
     }
 
@@ -434,9 +481,39 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
   private async ownerSuspended(execution: Execution): Promise<boolean> {
     const run = await this.prisma.researchRun.findUnique({
       where: { id: execution.claim.id },
-      select: { deliverySuppressedAt: true, user: { select: { status: true } } },
+      select: { deliverySuppressionReason: true, user: { select: { status: true } } },
     });
-    return run?.deliverySuppressedAt != null || run?.user?.status === 'SUSPENDED';
+    return run?.deliverySuppressionReason === 'USER_SUSPENDED' || run?.user?.status === 'SUSPENDED';
+  }
+
+  /**
+   * Finalizes the run's reservation (live runs only) inside the fenced
+   * transaction that finishes the run: a stale worker fails the fenced update
+   * first and can neither settle nor release. Replays are no-ops (ledger).
+   */
+  private async settle(
+    tx: Tx,
+    claim: Claim,
+    outcome: RunAccounting['outcome'],
+    reason: string,
+  ): Promise<void> {
+    if (outcome === 'release') {
+      await settleRun(tx, claim.id, { outcome, reason });
+      return;
+    }
+    const run = await tx.researchRun.findUniqueOrThrow({
+      where: { id: claim.id },
+      select: { usage: true, providerModel: true, toolCallCount: true },
+    });
+    const observed = await tx.researchToolItem.count({ where: { runId: claim.id } });
+    await settleRun(tx, claim.id, {
+      outcome,
+      reason,
+      usage: (run.usage as unknown as ProviderSnapshot['usage']) ?? null,
+      returnedModel: run.providerModel,
+      // Observed items, not billed searches (docs/ACCOUNTING.md).
+      observedSearchItems: Math.max(observed, run.toolCallCount ?? 0),
+    });
   }
 
   /**
@@ -531,8 +608,9 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
         chatId: run.chatId,
         runId: claim.id,
         parts,
-        suppressed: run.deliverySuppressedAt !== null,
+        suppressedBy: run.deliverySuppressionReason,
       });
+      await this.settle(tx, claim, 'settle', 'SUCCEEDED');
     });
     this.logger.log({
       message: 'Research succeeded',
@@ -548,6 +626,7 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
     state: 'FAILED' | 'UNCERTAIN' | 'CANCELLED',
     failureCode: string,
     accounting?: ProviderSnapshot | null,
+    options: { providerNotAccepted?: boolean } = {},
   ): Promise<void> {
     const { claim, stored } = execution;
     const simulated = stored.config.providerKind === 'fake';
@@ -574,8 +653,18 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
         text,
         claim.id,
         undefined,
-        run.deliverySuppressedAt !== null,
+        run.deliverySuppressionReason,
       );
+      // Accounting: nothing could have been billed before submission or when the
+      // provider refused the request; an ambiguous outcome stays unresolved;
+      // otherwise the provider reached a terminal state and usage is settled.
+      const outcome =
+        options.providerNotAccepted || run.submissionState === 'NOT_SUBMITTED'
+          ? 'release'
+          : state === 'UNCERTAIN'
+            ? 'unresolved'
+            : 'settle';
+      await this.settle(tx, claim, outcome, failureCode);
     });
     const log = { message: `Research ${state.toLowerCase()}`, runId: claim.id, failureCode };
     if (state === 'UNCERTAIN' && !simulated) {
@@ -620,7 +709,11 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
     client: Tx | PrismaService,
     claim: Claim,
     data: Prisma.ResearchRunUpdateManyMutationInput,
-  ): Promise<{ chatId: bigint; deliverySuppressedAt: Date | null }> {
+  ): Promise<{
+    chatId: bigint;
+    deliverySuppressionReason: string | null;
+    submissionState: string;
+  }> {
     const result = await client.researchRun.updateMany({
       where: { id: claim.id, fencingToken: claim.fencingToken, state: 'RUNNING' },
       data,
@@ -628,7 +721,7 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
     if (result.count !== 1) throw new StaleLeaseError();
     return client.researchRun.findUniqueOrThrow({
       where: { id: claim.id },
-      select: { chatId: true, deliverySuppressedAt: true },
+      select: { chatId: true, deliverySuppressionReason: true, submissionState: true },
     });
   }
 

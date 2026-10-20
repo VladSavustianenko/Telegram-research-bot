@@ -21,16 +21,10 @@ import {
   startHarness,
   type Harness,
 } from '../support/research-harness';
+import { LIVE_TEST_ENV } from '../support/live-env';
 import { buildTextPart } from '../../src/research/provider/fake-fixtures';
 
-const LIVE_ENV = {
-  RESEARCH_MODE: 'live',
-  OPENAI_API_KEY: 'sk-test-not-a-real-key',
-  OPENAI_MODEL: 'operator-selected-model',
-  OUTPUT_TOKEN_LIMIT: '3000',
-  TOOL_CALL_LIMIT: '3',
-  RUN_DEADLINE_SECONDS: '300',
-};
+const LIVE_ENV = LIVE_TEST_ENV;
 
 const USAGE_POLL = {
   inputTokens: 900,

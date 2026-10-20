@@ -90,6 +90,13 @@ const NEW_COLUMNS = [
   'reply_markup',
   'suppressed_at',
   'delivery_suppressed_at',
+  // TRB-050
+  'task_id',
+  'task_revision',
+  'trigger',
+  'admitted_day',
+  'admitted_month',
+  'delivery_suppression_reason',
 ];
 
 async function snapshotTables(client: Client): Promise<Record<string, unknown[]>> {
@@ -181,13 +188,24 @@ describe('TRB-030 migration on a database with TRB-020 records', () => {
     // The unreconciled live run of the former administrator still blocks live work.
     expect(await hasUnresolvedLiveUncertainty(h.prisma)).toBe(true);
 
-    // The queued run with an unknown owner is never submitted.
+    // The queued TRB-020 run (no admission evidence since TRB-050) is never submitted.
     await h.research.tick();
     expect(await h.prisma.researchRun.findUniqueOrThrow({ where: { id: R5 } })).toMatchObject({
       state: 'CANCELLED',
-      failureCode: 'OWNER_UNRESOLVED',
+      failureCode: 'ADMISSION_EVIDENCE_MISSING',
       submissionState: 'NOT_SUBMITTED',
     });
+    // Historical runs get no invented accounting.
+    expect(await h.prisma.budgetReservation.count()).toBe(0);
+    expect(await h.prisma.usageLedger.count()).toBe(0);
+    expect(
+      (
+        await h.prisma.researchRun.findMany({
+          orderBy: { id: 'asc' },
+          select: { admittedDay: true },
+        })
+      ).map((run) => run.admittedDay),
+    ).toEqual(['2026-10-19', '2026-10-19', '2026-10-19', '2026-10-19', '2026-10-19']);
     expect(h.provider.calls.submit).toBe(0);
 
     // The administrator onboards and can resend the stored TRB-020 report.
@@ -223,11 +241,8 @@ describe('TRB-030 migration on a database with TRB-020 records', () => {
       .map((m) => m.html);
     expect(toFormer[0]).toBe('Цей бот приватний. Доступ лише за запрошенням.');
     expect(toFormer.at(-1)).toBe('<b>Report R4</b>');
-    // The cancellation notice of the run without an owner was not delivered.
-    expect(await h.prisma.delivery.findFirst({ where: { runId: R5 } })).toMatchObject({
-      state: 'SUPPRESSED',
-      lastErrorCode: 'OWNER_UNRESOLVED',
-    });
+    // Nothing was sent about the cancelled legacy run.
+    expect(await h.prisma.delivery.findFirst({ where: { runId: R5 } })).toBeNull();
     expect(
       (await h.prisma.researchRun.findMany({ where: { userId: member.id }, select: { id: true } }))
         .map((run) => run.id)

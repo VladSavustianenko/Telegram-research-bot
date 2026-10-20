@@ -6,6 +6,8 @@ import { escapeHtml } from '../delivery/telegram-html';
 import type { AppUser, Prisma, Task, TaskDraft } from '../generated/prisma/client';
 import { userOperationDenial } from '../identity/authorization';
 import { SUGGESTED_TIME_ZONE } from '../identity/time-zone';
+import { admitResearch } from '../research/admission';
+import { cancelQueuedRuns, suppressRunDeliveries } from '../research/lifecycle';
 import type { DraftOp, TaskOp } from '../telegram/callback-data';
 import {
   applyEvent,
@@ -51,12 +53,17 @@ export interface TaskContext {
   config: Env;
   user: AppUser;
   chatId: bigint;
+  /** The inbox update being handled (a run's source) and the admission time. */
+  updateId: bigint;
+  now: Date;
 }
 
 export interface TaskOutcome {
-  disposition: 'REPLIED' | 'REJECTED' | 'IGNORED';
+  disposition: 'REPLIED' | 'REJECTED' | 'IGNORED' | 'RUN_ACCEPTED';
   reason: string;
   callbackAnswer?: string;
+  /** A research run started (or found active) by "Run now". */
+  runId?: string;
 }
 
 const STALE_BUTTON = 'Ця кнопка застаріла.';
@@ -202,6 +209,20 @@ export async function onTaskAction(
       return setPaused(ctx, task, op === 'p');
     case 'd':
       return reply(ctx, 'REPLIED', 'TASK_DELETE_REQUESTED', deleteConfirmView(task));
+    case 'r':
+      // The one admission path (quotas, budgets, live restriction, one active run per
+      // task). Available for paused tasks too (SPEC §4); the schedule is not touched.
+      return admitResearch(ctx.tx, ctx.config, {
+        user: ctx.user,
+        chatId: ctx.chatId,
+        updateId: ctx.updateId,
+        now: ctx.now,
+        source: { kind: 'task', taskId: task.id, revision: task.revision },
+      }).then((outcome) => ({
+        disposition: outcome.disposition,
+        reason: outcome.reason ?? 'TASK_RUN_ACCEPTED',
+        ...(outcome.runId ? { runId: outcome.runId } : {}),
+      }));
     case 'dy':
       return deleteTask(ctx, task);
     default:
@@ -227,6 +248,10 @@ async function setPaused(ctx: TaskContext, task: Task, pause: boolean): Promise<
     where: { id: task.id, userId: ctx.user.id, revision: task.revision, state: task.state },
     data: { state: target, revision: { increment: 1 } },
   });
+  // Pausing cancels queued research of the task (its reservation is released);
+  // a running request may finish and deliver (SPEC §4).
+  if (updated.count === 1 && pause)
+    await cancelQueuedRuns(ctx.tx, { taskId: task.id }, 'TASK_PAUSED');
   const current = await ownTask(ctx, task.id);
   if (updated.count !== 1 || !current) {
     return current
@@ -268,6 +293,10 @@ async function deleteTask(ctx: TaskContext, task: Task): Promise<TaskOutcome> {
         )
       : reply(ctx, 'REJECTED', 'TASK_NOT_FOUND', { text: NOT_FOUND });
   }
+  // Deletion suppresses delivery of the task's results, including from a running
+  // request, and cancels its queued research (releasing the reservation).
+  await suppressRunDeliveries(ctx.tx, { taskId: task.id }, 'TASK_DELETED');
+  await cancelQueuedRuns(ctx.tx, { taskId: task.id }, 'TASK_DELETED');
   const outcome = await showTasks(ctx, 0, `Завдання «${task.name}» видалено.`);
   return { ...outcome, reason: 'TASK_DELETED' };
 }

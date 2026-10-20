@@ -1,6 +1,6 @@
 # Telegram Research Bot — implementation brief
 
-Version: 1.0 · 2026-10-18 · Documentation package, project foundation (TRB-010, DONE), first research-to-Telegram slice (TRB-020, DONE; tool-call metering unresolved) invitations, identity and authorization (TRB-030, DONE) and task management with durable dialogs (TRB-040, ready for review; schedules are not executed yet).
+Version: 1.0 · 2026-10-18 · Documentation package, project foundation (TRB-010, DONE), first research-to-Telegram slice (TRB-020, DONE; tool-call metering unresolved) invitations, identity and authorization (TRB-030, DONE), task management with durable dialogs (TRB-040, DONE; schedules are not executed yet) and atomic admission, quotas and cost accounting (TRB-050, ready for review).
 
 Build a private-beta, multi-user Telegram bot that runs user-authored research prompts manually or on a schedule, uses OpenAI web search, and delivers sourced results. Deploy one NestJS application and PostgreSQL on Railway.
 
@@ -81,6 +81,17 @@ Commands, token handling, suspension semantics and the migration of existing run
 - **Not executed yet.** Saving or changing a task never starts research. Scheduled execution comes in TRB-070, and running a task from its card in TRB-050/060.
 
 Details: [docs/TASKS.md](docs/TASKS.md).
+
+### Admission, quotas and accounting (TRB-050)
+
+- **One admission path.** `/research` and a task's "Запустити зараз" go through one transactional admission. It enforces the queue, per-user active runs, daily quotas (UTC) and, for live research, monthly budgets.
+- **Reservations.** Each live run gets a conservative reservation from operator-supplied pricing. Settlement uses an append-only usage ledger and an outbox event.
+- **Live requirements.** Live admission is refused unless budgets, prices and allowances are configured, and it stays administrator-only.
+- **Checking usage.** `/usage` shows the user's own quotas and estimates.
+- **Operator resolution.** `npm run ops:accounting` records confirmed amounts for unresolved costs.
+- **Not an invoice.** Estimates are not OpenAI invoices, and reservations are not a provider spending ceiling.
+
+Details: [docs/ACCOUNTING.md](docs/ACCOUNTING.md).
 
 Prisma owns the `public` schema and its migrations in `prisma/migrations`; pg-boss will own a separate `pgboss` schema (TRB-060). The generated Prisma client is written to `src/generated/prisma` (not committed).
 

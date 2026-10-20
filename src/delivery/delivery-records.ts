@@ -20,8 +20,11 @@ export async function createDelivery(
     runId?: string;
     invitationId?: string;
     parts: readonly (string | DeliveryPartInput)[];
-    /** The run's durable suspension decision: the delivery is stored but never sent automatically. */
-    suppressed?: boolean;
+    /**
+     * The run's durable suppression reason (USER_SUSPENDED or TASK_DELETED): the
+     * delivery is stored but never sent automatically.
+     */
+    suppressedBy?: string | null;
   },
 ): Promise<string> {
   const delivery = await tx.delivery.create({
@@ -30,8 +33,13 @@ export async function createDelivery(
       chatId: input.chatId,
       runId: input.runId ?? null,
       invitationId: input.invitationId ?? null,
-      ...(input.suppressed
-        ? { state: 'SUPPRESSED', suppressedAt: new Date(), lastErrorCode: 'RECIPIENT_SUSPENDED' }
+      ...(input.suppressedBy
+        ? {
+            state: 'SUPPRESSED',
+            suppressedAt: new Date(),
+            lastErrorCode:
+              input.suppressedBy === 'USER_SUSPENDED' ? 'RECIPIENT_SUSPENDED' : input.suppressedBy,
+          }
         : {}),
       parts: {
         create: input.parts.map((part, ordinal) => {
@@ -59,13 +67,13 @@ export function createStatusDelivery(
   text: string,
   runId?: string,
   replyMarkup?: InlineKeyboard,
-  suppressed = false,
+  suppressedBy: string | null = null,
 ): Promise<string> {
   return createDelivery(tx, {
     kind: 'STATUS',
     chatId,
     parts: [{ html: escapeHtml(text), ...(replyMarkup ? { replyMarkup } : {}) }],
     ...(runId ? { runId } : {}),
-    suppressed,
+    suppressedBy,
   });
 }

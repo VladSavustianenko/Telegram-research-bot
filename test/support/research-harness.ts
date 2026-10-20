@@ -85,6 +85,10 @@ export async function startHarness(
     TELEGRAM_BOT_USERNAME: BOT_USERNAME,
     RESEARCH_MODE: 'fake',
     OPENAI_POLL_INTERVAL_MS: '5',
+    // Generous quotas so that earlier suites keep their meaning; quota tests set their own.
+    USER_ACTIVE_RUN_LIMIT: '10',
+    USER_DAILY_RUN_LIMIT: '100',
+    USER_DAILY_MANUAL_RUN_LIMIT: '100',
     ...env,
   });
   const provider =
@@ -133,7 +137,7 @@ export async function resetDatabase(
   options: { onboardedAdmins?: boolean } = {},
 ): Promise<void> {
   await prisma.$executeRawUnsafe(
-    'TRUNCATE task_draft, task, audit_event, invitation, research_tool_item, research_reconciliation, delivery_part, delivery, research_run, telegram_update, app_user RESTART IDENTITY CASCADE',
+    'TRUNCATE usage_ledger, budget_reservation, pricing_version, outbox_event, task_draft, task, audit_event, invitation, research_tool_item, research_reconciliation, delivery_part, delivery, research_run, telegram_update, app_user RESTART IDENTITY CASCADE',
   );
   if (options.onboardedAdmins === false) return;
   for (const id of [ADMIN_ID, OTHER_ADMIN_ID]) {

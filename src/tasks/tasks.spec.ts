@@ -263,6 +263,14 @@ describe('task callbacks and messages', () => {
     expect(card.text).not.toMatch(/Наступн/);
     expect(card.text).toContain(`${'p'.repeat(300)}…`);
     const buttons = card.keyboard?.inline_keyboard.flat().map((b) => b.text);
-    expect(buttons).toEqual(['Назва', 'Запит', 'Розклад', 'Відновити', 'Видалити', '« До списку']);
+    expect(buttons).toEqual([
+      'Назва',
+      'Запит',
+      'Розклад',
+      'Відновити',
+      'Видалити',
+      'Запустити зараз',
+      '« До списку',
+    ]);
   });
 });

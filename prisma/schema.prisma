@@ -74,6 +74,15 @@ model ResearchRun {
   /// yet; such runs are inaccessible and never submitted (fail closed). A trigger
   /// keeps it consistent with requested_by_telegram_user_id.
   userId                    String?          @map("user_id") @db.Uuid
+  /// TRB-050: the task this manual run was started from (its prompt and zone are copied
+  /// into the immutable snapshot), with the task revision at admission. Null for /research.
+  taskId                    String?          @map("task_id") @db.Uuid
+  task                      Task?            @relation(fields: [taskId], references: [id], onDelete: Restrict)
+  taskRevision              Int?             @map("task_revision")
+  trigger                   RunTrigger       @default(MANUAL)
+  /// UTC accounting periods of the admission ("YYYY-MM-DD", "YYYY-MM"); never recomputed.
+  admittedDay               String?          @map("admitted_day")
+  admittedMonth             String?          @map("admitted_month")
   user                      AppUser?         @relation(fields: [userId], references: [id], onDelete: Restrict)
   /// Destination derived from the authorized private chat of the request.
   chatId                    BigInt           @map("chat_id")
@@ -95,35 +104,40 @@ model ResearchRun {
   leaseUntil   DateTime? @map("lease_until") @db.Timestamptz(3)
   fencingToken Int       @default(0) @map("fencing_token")
 
-  startedAt            DateTime?               @map("started_at") @db.Timestamptz(3)
-  completedAt          DateTime?               @map("completed_at") @db.Timestamptz(3)
-  outcome              ResearchOutcome?
+  startedAt                 DateTime?               @map("started_at") @db.Timestamptz(3)
+  completedAt               DateTime?               @map("completed_at") @db.Timestamptz(3)
+  outcome                   ResearchOutcome?
   /// Original provider text, before rendering.
-  reportText           String?                 @map("report_text")
+  reportText                String?                 @map("report_text")
   /// Provider url_citation annotations with resolved code-point offsets.
-  citations            Json?
+  citations                 Json?
   /// URLs reported as consulted by web_search_call actions.
-  sources              Json?
-  warnings             Json?
-  usage                Json?
+  sources                   Json?
+  warnings                  Json?
+  usage                     Json?
   /// Historical meaning (unchanged): number of web_search_call output items in the
   /// final known snapshot (maximum over snapshots). An observation, not a count of
   /// executed or billable searches.
-  toolCallCount        Int?                    @map("tool_call_count")
+  toolCallCount             Int?                    @map("tool_call_count")
   /// Null: per-item tool telemetry was not recorded for this run (it predates it).
   /// 1: observed items are recorded in research_tool_item during execution.
-  toolTelemetryVersion Int?                    @map("tool_telemetry_version")
-  toolItems            ResearchToolItem[]
-  failureCode          String?                 @map("failure_code")
+  toolTelemetryVersion      Int?                    @map("tool_telemetry_version")
+  toolItems                 ResearchToolItem[]
+  failureCode               String?                 @map("failure_code")
   /// Set only by operator reconciliation of an UNCERTAIN run; the run keeps its
   /// state, failure code, response ID and usage as evidence.
-  reconciledAt         DateTime?               @map("reconciled_at") @db.Timestamptz(3)
-  reconciliation       ResearchReconciliation?
+  reconciledAt              DateTime?               @map("reconciled_at") @db.Timestamptz(3)
+  reconciliation            ResearchReconciliation?
   /// Durable suspension decision (TRB-030): set when the owner is suspended while the
   /// run is queued or running. Automatic deliveries for this run are created
   /// SUPPRESSED and a running request gets a cancellation request. Never cleared,
   /// so reactivation does not release this run's results; /result still works.
-  deliverySuppressedAt DateTime?               @map("delivery_suppressed_at") @db.Timestamptz(3)
+  deliverySuppressedAt      DateTime?               @map("delivery_suppressed_at") @db.Timestamptz(3)
+  /// Why delivery_suppressed_at was set: USER_SUSPENDED (also requests provider
+  /// cancellation of a running request) or TASK_DELETED (delivery only).
+  deliverySuppressionReason String?                 @map("delivery_suppression_reason")
+  reservation               BudgetReservation?
+  outboxEvents              OutboxEvent[]
 
   createdAt  DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt  DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
@@ -276,32 +290,34 @@ enum OnboardingState {
 /// A Telegram user known to the bot. Identity is the immutable Telegram user ID
 /// (a trigger rejects changes); usernames and display names are not stored.
 model AppUser {
-  id                 String          @id @default(uuid()) @db.Uuid
-  telegramUserId     BigInt          @unique @map("telegram_user_id")
+  id                 String              @id @default(uuid()) @db.Uuid
+  telegramUserId     BigInt              @unique @map("telegram_user_id")
   /// Private chat with the bot, recorded from the user's own private messages.
-  privateChatId      BigInt?         @map("private_chat_id")
+  privateChatId      BigInt?             @map("private_chat_id")
   /// Mirror of ADMIN_TELEGRAM_IDS, which is authoritative (synchronized at startup
   /// and on each update from the user). Invitations never grant ADMIN.
-  role               UserRole        @default(MEMBER)
-  status             UserStatus      @default(ACTIVE)
-  onboardingState    OnboardingState @default(AWAITING_TIME_ZONE) @map("onboarding_state")
+  role               UserRole            @default(MEMBER)
+  status             UserStatus          @default(ACTIVE)
+  onboardingState    OnboardingState     @default(AWAITING_TIME_ZONE) @map("onboarding_state")
   /// Confirmed IANA time zone; required once onboarding is COMPLETED.
-  timeZone           String?         @map("time_zone")
+  timeZone           String?             @map("time_zone")
   /// Incremented on every onboarding or lifecycle change; callbacks carry it, so stale buttons do nothing.
-  revision           Int             @default(0)
+  revision           Int                 @default(0)
   /// Set when the user redeemed an invitation. Members need it; administrators do not.
-  invitedAt          DateTime?       @map("invited_at") @db.Timestamptz(3)
-  onboardedAt        DateTime?       @map("onboarded_at") @db.Timestamptz(3)
-  suspendedAt        DateTime?       @map("suspended_at") @db.Timestamptz(3)
-  createdAt          DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt          DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
+  invitedAt          DateTime?           @map("invited_at") @db.Timestamptz(3)
+  onboardedAt        DateTime?           @map("onboarded_at") @db.Timestamptz(3)
+  suspendedAt        DateTime?           @map("suspended_at") @db.Timestamptz(3)
+  createdAt          DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
   runs               ResearchRun[]
-  invitationsCreated Invitation[]    @relation("InvitationCreator")
-  invitationRedeemed Invitation?     @relation("InvitationRedeemer")
-  auditAsActor       AuditEvent[]    @relation("AuditActor")
-  auditAsSubject     AuditEvent[]    @relation("AuditSubject")
+  invitationsCreated Invitation[]        @relation("InvitationCreator")
+  invitationRedeemed Invitation?         @relation("InvitationRedeemer")
+  auditAsActor       AuditEvent[]        @relation("AuditActor")
+  auditAsSubject     AuditEvent[]        @relation("AuditSubject")
   tasks              Task[]
   taskDraft          TaskDraft?
+  reservations       BudgetReservation[]
+  ledgerEntries      UsageLedger[]
 
   @@map("app_user")
 }
@@ -370,27 +386,28 @@ enum ScheduleKind {
 }
 
 model Task {
-  id                 String       @id @default(uuid()) @db.Uuid
-  userId             String       @map("user_id") @db.Uuid
-  user               AppUser      @relation(fields: [userId], references: [id], onDelete: Restrict)
+  id                 String        @id @default(uuid()) @db.Uuid
+  userId             String        @map("user_id") @db.Uuid
+  user               AppUser       @relation(fields: [userId], references: [id], onDelete: Restrict)
   name               String
   prompt             String
-  scheduleKind       ScheduleKind @map("schedule_kind")
+  scheduleKind       ScheduleKind  @map("schedule_kind")
   /// ISO weekday 1 (Monday) to 7 (Sunday); WEEKLY only.
   weekday            Int?
   /// Local wall-clock time "HH:mm" in time_zone; DAILY and WEEKLY only. Never converted to UTC.
-  localTime          String?      @map("local_time")
+  localTime          String?       @map("local_time")
   /// The task's own IANA zone; independent of the user's default.
-  timeZone           String       @map("time_zone")
-  state              TaskState    @default(ACTIVE)
+  timeZone           String        @map("time_zone")
+  state              TaskState     @default(ACTIVE)
   /// Incremented on every change; edits and buttons carry it (optimistic concurrency).
-  revision           Int          @default(1)
+  revision           Int           @default(1)
   /// The draft that created it; unique, so one draft can never create two tasks.
-  createdFromDraftId String?      @unique @map("created_from_draft_id") @db.Uuid
-  deletedAt          DateTime?    @map("deleted_at") @db.Timestamptz(3)
-  createdAt          DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt          DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdFromDraftId String?       @unique @map("created_from_draft_id") @db.Uuid
+  deletedAt          DateTime?     @map("deleted_at") @db.Timestamptz(3)
+  createdAt          DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
   drafts             TaskDraft[]
+  runs               ResearchRun[]
 
   @@index([userId, state, createdAt])
   @@map("task")
@@ -438,4 +455,126 @@ model TaskDraft {
   updatedAt    DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   @@map("task_draft")
+}
+
+// ---------------------------------------------------------------------------
+// TRB-050: atomic admission, quotas, cost reservations, usage ledger and outbox.
+// Money is integer micro-USD (BigInt). Estimates are local accounting, never a
+// provider invoice.
+
+enum RunTrigger {
+  MANUAL
+  /// Reserved for TRB-070; not produced yet.
+  SCHEDULED
+}
+
+/// Operator-supplied pricing, registered on first use. A version label is
+/// immutable: different rates under the same label are refused at admission.
+model PricingVersion {
+  version      String              @id
+  model        String
+  content      Json
+  contentHash  String              @map("content_hash")
+  createdAt    DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  reservations BudgetReservation[]
+
+  @@map("pricing_version")
+}
+
+enum ReservationStatus {
+  /// Admitted, provider outcome not known yet; exposure = reserved amount.
+  RESERVED
+  /// Ended before any provider request could exist; exposure 0.
+  RELEASED
+  /// Terminal with usage: exposure = token estimate + observed searches + the
+  /// unverified search allowance still held (see docs/ACCOUNTING.md).
+  SETTLED
+  /// Cost unknown (ambiguous outcome, missing usage, unmapped model); exposure is
+  /// at least the reserved amount until an operator resolves it.
+  UNRESOLVED
+  /// Operator recorded a confirmed amount from billing evidence; exposure = that amount.
+  RESOLVED
+}
+
+/// One per accepted live run. Status changes are conditional (idempotent) and
+/// mirrored by append-only usage_ledger entries whose amounts sum to exposure.
+model BudgetReservation {
+  id              String            @id @default(uuid()) @db.Uuid
+  runId           String            @unique @map("run_id") @db.Uuid
+  run             ResearchRun       @relation(fields: [runId], references: [id], onDelete: Restrict)
+  userId          String            @map("user_id") @db.Uuid
+  user            AppUser           @relation(fields: [userId], references: [id], onDelete: Restrict)
+  /// UTC month of admission; every later entry stays in this period.
+  periodMonth     String            @map("period_month")
+  status          ReservationStatus @default(RESERVED)
+  reservedMicros  BigInt            @map("reserved_micros")
+  /// Token cost estimate plus observed searches (SETTLED); null otherwise.
+  estimatedMicros BigInt?           @map("estimated_micros")
+  /// Search allowance kept because billable searches are not verified (SETTLED).
+  uncertainMicros BigInt?           @map("uncertain_micros")
+  /// Operator-confirmed amount (RESOLVED).
+  confirmedMicros BigInt?           @map("confirmed_micros")
+  /// Amount counted against budgets now.
+  exposureMicros  BigInt            @map("exposure_micros")
+  pricingVersion  String            @map("pricing_version")
+  pricing         PricingVersion    @relation(fields: [pricingVersion], references: [version], onDelete: Restrict)
+  /// Reservation policy version and every input of the reservation (rates, allowances).
+  policyVersion   String            @map("policy_version")
+  policy          Json
+  createdAt       DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime          @updatedAt @map("updated_at") @db.Timestamptz(3)
+  ledger          UsageLedger[]
+
+  @@index([userId, periodMonth])
+  @@index([periodMonth])
+  @@map("budget_reservation")
+}
+
+enum LedgerKind {
+  RESERVE
+  RELEASE
+  SETTLE
+  UNRESOLVED
+  OVERRUN
+  RESOLVE
+}
+
+/// Append-only accounting evidence (UPDATE and DELETE are rejected by a trigger).
+/// `amount_micros` is the change of exposure; `operation_key` makes replays no-ops.
+model UsageLedger {
+  id                  String            @id @default(uuid()) @db.Uuid
+  reservationId       String            @map("reservation_id") @db.Uuid
+  reservation         BudgetReservation @relation(fields: [reservationId], references: [id], onDelete: Restrict)
+  runId               String            @map("run_id") @db.Uuid
+  userId              String            @map("user_id") @db.Uuid
+  user                AppUser           @relation(fields: [userId], references: [id], onDelete: Restrict)
+  periodMonth         String            @map("period_month")
+  kind                LedgerKind
+  amountMicros        BigInt            @map("amount_micros")
+  exposureAfterMicros BigInt            @map("exposure_after_micros")
+  operationKey        String            @unique @map("operation_key")
+  /// Raw usage, rates, counts and notes that explain the amount.
+  basis               Json
+  createdAt           DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([reservationId])
+  @@map("usage_ledger")
+}
+
+/// Durable execution request written in the admission transaction. Until TRB-060
+/// connects pg-boss, the in-process research worker consumes RESEARCH_EXECUTE
+/// events directly when it claims the run (dispatched_at), in one statement.
+model OutboxEvent {
+  id           String      @id @default(uuid()) @db.Uuid
+  operationKey String      @unique @map("operation_key")
+  type         String
+  runId        String      @map("run_id") @db.Uuid
+  run          ResearchRun @relation(fields: [runId], references: [id], onDelete: Restrict)
+  payload      Json
+  createdAt    DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+  dispatchedAt DateTime?   @map("dispatched_at") @db.Timestamptz(3)
+  cancelledAt  DateTime?   @map("cancelled_at") @db.Timestamptz(3)
+
+  @@index([runId])
+  @@map("outbox_event")
 }

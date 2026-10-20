@@ -16,7 +16,7 @@ const TIME_ZONE_CALLBACK = /^tz:(0|[1-9]\d{0,8}):([A-Za-z][A-Za-z0-9_+\-/]{0,39}
 const DRAFT_CALLBACK =
   /^d:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}):(0|[1-9]\d{0,8}):(b|x|k|s|r|n|km|kd|kw|w[1-7]|z)$/;
 const TASK_CALLBACK =
-  /^t:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}):([1-9]\d{0,8}):(v|en|ep|es|p|u|d|dy)$/;
+  /^t:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}):([1-9]\d{0,8}):(v|en|ep|es|p|u|d|dy|r)$/;
 const LIST_CALLBACK = /^tl:(0|[1-9]\d{0,3})$/;
 
 /**
@@ -27,9 +27,9 @@ const LIST_CALLBACK = /^tl:(0|[1-9]\d{0,3})$/;
 export type DraftOp = 'b' | 'x' | 'k' | 's' | 'r' | 'n' | 'km' | 'kd' | 'kw' | `w${number}` | 'z';
 /**
  * Task operations: v view card, en/ep/es edit name/prompt/schedule, p pause,
- * u resume, d ask to delete, dy confirm deletion.
+ * u resume, d ask to delete, dy confirm deletion, r run now (manual admission).
  */
-export type TaskOp = 'v' | 'en' | 'ep' | 'es' | 'p' | 'u' | 'd' | 'dy';
+export type TaskOp = 'v' | 'en' | 'ep' | 'es' | 'p' | 'u' | 'd' | 'dy' | 'r';
 
 export type CallbackAction =
   | { kind: 'confirm_time_zone'; revision: number; zone: string }

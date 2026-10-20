@@ -478,6 +478,85 @@ Not run: Docker smoke (no configuration or dependency change), CI, live Telegram
 
 **Limitation.** Buttons sent before this fix stop working; users get the stale-button acknowledgement and continue with `/new` or `/cancel`. No real users had such buttons: Telegram was disabled outside tests.
 
+### TRB-040 acceptance (2026-10-19)
+
+The owner accepted TRB-040 after review of commit `cf8637b4b04eb94e197177acaa858017fa96a78f`: implementation ebff202 plus the review fix recorded above. The sections above are left as recorded.
+
+### TRB-050 evidence (2026-10-19, local Windows 11, Node 24.19.0, PostgreSQL 17)
+
+Mock validation only. Scripted providers stand in for OpenAI: no network call, no Telegram message, no deployment. Prices are synthetic (`test/support/live-env.ts`); they are not OpenAI prices and no real price was configured. Behaviour: docs/ACCOUNTING.md.
+
+| Check | Command | Result |
+|---|---|---|
+| Static checks | `npm run format:check`, `npm run lint`, `npm run typecheck`, `npm run prisma:validate` | Pass |
+| Unit tests | `npm test` | 178 passed (13 files) |
+| Integration tests | `npm run test:integration` | 150 passed (12 files, all earlier suites included); 0 disposable databases left |
+| Build | `npm run build` | Pass |
+| Migration, isolated DB | global setup (`migrate deploy` on a fresh database); `identity-migration.int-spec.ts` applies all migrations after TRB-020 to a database with TRB-020 records | Pass. Rows unchanged apart from the new columns. No reservation, ledger entry or outbox event is invented. Admission days are backfilled from `created_at`. A legacy QUEUED run is cancelled `ADMISSION_EVIDENCE_MISSING` with zero submissions and no reply |
+| Migration, dev DB | `migrate deploy`, `migrate status`, `migrate diff --exit-code` | Applied without reset; "up to date"; no difference (exit 0). 3 historical runs got admission days and no accounting rows; 10 deliveries kept |
+| Migration correction | — | The first version of `20261019194156_trb_050_admission_accounting` added the suppression-reason check before its backfill. That would fail on a database with suppressed runs, and the migration test caught it. The statement order was corrected before release. The migration had been applied only to the local dev DB, which had no such rows, so the resulting schema is identical; its `_prisma_migrations` checksum was updated to the corrected file so that `migrate dev` does not flag it |
+| Operator command | `node dist/ops/accounting.js --list` against the dev DB; missing arguments | `[]`, exit 0; usage message, exit 2 |
+| Mutation check | Each guard removed in turn, `accounting.int-spec.ts` and `identity-migration.int-spec.ts` rerun (script outside the repository) | 8 of 8 caught after one test was added. Guards: user budget, global budget, settlement idempotency, unknown cost kept at the reservation, ambiguous outcome not released, reservation required before submission, legacy queued runs gated, cancelled runs excluded from quotas. The last one initially survived; the test "does not count a run cancelled before submission against the daily quota" was added and catches it |
+
+Scenarios (`test/integration/accounting.int-spec.ts`, real PostgreSQL). Concurrency tests hold the global admission advisory lock until the expected number of sessions wait at PostgreSQL (`pg_stat_activity`), using separate application instances.
+- **Admission evidence and settlement.**
+  - Admission writes the reservation (284 000 µUSD), its policy inputs and pricing version, the run's UTC periods, the snapshot reference and one pending outbox event.
+  - Execution consumes the event and settles with estimate 14 800 and uncertain search hold 50 000. The ledger is RESERVE then SETTLE and sums to the exposure.
+  - Replayed release and settlement change nothing.
+- **Missing configuration.** A missing user or global budget, pricing label, output rate or search allowance each refuses live admission with its reason: no run, reservation or outbox event, and zero submissions. So do an unmapped model and a pricing label reused with different rates.
+- **Pricing snapshots.** A run admitted under `synthetic-test-1` is settled by a worker configured with `synthetic-test-2` and higher prices, at its own rates; its policy is unchanged. A new run uses the new version.
+- **Live restriction and simulated runs.** A non-administrator's live request is refused with no reservation. Simulated runs create no reservation, `/usage` labels them as simulation, and they do not block a later live admission.
+- **Capacity under overlap.**
+  - User budget 0.6: three overlapping requests from one user give exactly 2 runs and reservations, and 1 `USER_BUDGET_EXHAUSTED`.
+  - Global budget 0.6: four overlapping requests from two users give exactly 2 reservations, a total exposure of 2 × 284 000, and 2 `GLOBAL_BUDGET_EXHAUSTED`.
+  - Daily limit 2: three overlapping requests give 2 runs. The active-run and manual-run limits refuse at their bounds.
+- **Run now.** The same Run now update twice, plus a press from another instance, all overlapping, then a later press: one run, with the task's prompt, revision and zone in the snapshot. The later press answers `TASK_RUN_ACTIVE`, and the task is unchanged.
+- **Lifecycle.**
+  - Pausing a task cancels its queued live run: RELEASED exactly once (RESERVE +284 000, RELEASE −284 000), event cancelled, a replayed release is a no-op, the worker finds nothing, and the paused task can be run again.
+  - Deleting a task cancels its queued run and its event.
+  - Deleting a task during its running request does not cancel the request: the run SUCCEEDED, its report delivery is SUPPRESSED `TASK_DELETED`, and the reservation is SETTLED.
+  - A run cancelled before submission stops counting against the daily quota; a submitted run keeps counting.
+- **Ambiguous and failed outcomes.**
+  - An unknown submission outcome gives UNRESOLVED at the full reservation; a provider refusal (4xx) gives RELEASED.
+  - A deadline with failed cancellation gives UNRESOLVED at the full reservation.
+  - Missing usage, partial usage and an unmapped returned model are each UNRESOLVED at the full reservation, with the reason in the ledger basis.
+- **Overrun.** Usage of 400 000 input and 3 000 output tokens with 9 observed searches is estimated at 914 000 and recorded in full: SETTLE 0 then OVERRUN +630 000. The next admission is refused once the budget (1.00) is exhausted.
+- **Resolution.**
+  - Research reconciliation with `OPERATOR_ACCEPTED_RISK` leaves the reservation UNRESOLVED and fully exposed.
+  - Operator resolution to 120 000 succeeds once and a second attempt is refused; the ledger is RESERVE, UNRESOLVED, RESOLVE and sums to 120 000; the ledger rejects UPDATE.
+  - Resolving a run that has not finished is refused.
+- **Month boundary.** A run admitted at 2026-10-31T23:59:30Z and settled after midnight keeps every ledger entry in 2026-10. The next run is in 2026-11, and `/usage` for 2026-11 shows only it.
+- **Recovery and stale workers.**
+  - After a restart between admission commit and execution, the run executes exactly once in a new instance.
+  - A stale worker returning a large failed response after a takeover writes nothing: one SETTLE, from the newer worker.
+- **Isolation and free operations.**
+  - `/usage` shows each user's own amounts only.
+  - Run now on another user's task gives `TASK_NOT_FOUND`.
+  - `/result`, `/new` and `/tasks` add no ledger entries, reservations, runs or submissions.
+- **Missing reservation.** A queued live run without a reservation is CANCELLED `ACCOUNTING_MISSING` with zero submissions.
+
+Unit (`src/accounting/accounting.spec.ts`):
+- reservation components and rounding up;
+- every configuration problem;
+- returned-model mapping;
+- estimates with cached input, unreported cache and overrun, and unknown (missing or partial usage, unmapped model);
+- UTC periods across the month boundary and Kyiv midnight;
+- exact USD formatting.
+
+Earlier suites were adapted where TRB-050 changed behaviour:
+- live tests use the synthetic accounting configuration;
+- the harness sets generous quotas;
+- the raw-inserted queued live run in `identity.int-spec.ts` gets an execution event;
+- the migration test expects `ADMISSION_EVIDENCE_MISSING` for the legacy queued run.
+
+Remaining limitations:
+- **Not a provider ceiling.** Estimates and reservations are not invoices or a provider spending ceiling. Input tokens and searches beyond the allowances are not bounded; billing of `open_page`/`find_in_page` is unverified; the uncertain search hold is released only by an operator.
+- **Real prices.** No real prices are configured. The operator must supply and date them.
+- **Corrections.** Operator corrections after a resolution are not supported (TRB-090).
+- **Live for members** remains disabled; it needs an owner decision.
+- **Outbox dispatch.** The outbox is consumed directly by the in-process worker until TRB-060.
+- **Not run:** Docker smoke (no Dockerfile or dependency change; new optional variables), CI, any live request.
+
 ## Release checklist
 
 - Exact model/tool compatibility verified in official docs and an authorized sample.

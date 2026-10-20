@@ -591,7 +591,14 @@ describe('TRB-040 tasks and durable dialogs (fakes, real PostgreSQL)', () => {
         ADMIN_TELEGRAM_IDS: `${ADMIN_ID}`,
       });
       const outcomes = await h.prisma.$transaction(async (tx) => {
-        const ctx = { tx, config, user, chatId: BigInt(ADMIN_ID) };
+        const ctx = {
+          tx,
+          config,
+          user,
+          chatId: BigInt(ADMIN_ID),
+          updateId: 999_999n,
+          now: new Date(),
+        };
         return [
           await showTasks(ctx),
           await startCreate(ctx),

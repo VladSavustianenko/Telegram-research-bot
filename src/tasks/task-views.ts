@@ -45,8 +45,7 @@ export interface TaskView extends ScheduleView {
 
 /** Scheduling is configuration only until TRB-070; said once, briefly, wherever a schedule is shown. */
 export const NOT_YET_SCHEDULED =
-  'Автоматичні запуски за розкладом і запуск завдання з картки ще не працюють. ' +
-  'Щоб дослідити зараз, надішліть /research <запит>.';
+  'Автоматичні запуски за розкладом ще не працюють; «Запустити зараз» запускає дослідження вручну (за лімітами /usage).';
 
 export function truncate(text: string, maxCodePoints: number): string {
   const points = Array.from(text);
@@ -240,7 +239,10 @@ export function taskCardView(task: TaskView, notice?: string): View {
             : { text: 'Відновити', callback_data: taskCallbackData(id, rev, 'u') },
           { text: 'Видалити', callback_data: taskCallbackData(id, rev, 'd') },
         ],
-        [{ text: '« До списку', callback_data: taskListCallbackData(0) }],
+        [
+          { text: 'Запустити зараз', callback_data: taskCallbackData(id, rev, 'r') },
+          { text: '« До списку', callback_data: taskListCallbackData(0) },
+        ],
       ],
     },
   };
