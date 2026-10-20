@@ -245,7 +245,34 @@ describe('task callbacks and messages', () => {
     expect(parts.every((part) => !/&[a-z]*$/.test(part))).toBe(true);
   });
 
-  it('shows the task zone and no invented schedule execution on cards', () => {
+  it('shows the next planned run in the task zone, or why there is none', () => {
+    const task = {
+      id,
+      name: 'N',
+      prompt: 'p',
+      scheduleKind: 'DAILY' as const,
+      weekday: null,
+      localTime: '09:00',
+      timeZone: 'America/New_York',
+      state: 'ACTIVE' as const,
+      revision: 1,
+      nextRunAt: new Date('2026-11-01T14:00:00Z'),
+    };
+    expect(taskCardView(task).text).toContain(
+      'Наступний запуск: 2026-11-01 09:00 (America/New_York).',
+    );
+    expect(
+      taskCardView({ ...task, scheduleKind: 'MANUAL', localTime: null, nextRunAt: null }).text,
+    ).toContain('лише вручну');
+    expect(taskCardView({ ...task, state: 'PAUSED', nextRunAt: null }).text).toContain(
+      'пропущені не надолужуються',
+    );
+    for (const card of [taskCardView(task), taskCardView({ ...task, state: 'PAUSED' })]) {
+      expect(card.text).not.toContain('ще не працюють');
+    }
+  });
+
+  it('shows the task zone on cards', () => {
     const card = taskCardView({
       id,
       name: 'N',
@@ -259,7 +286,6 @@ describe('task callbacks and messages', () => {
     });
     expect(card.text).toContain('Часовий пояс: America/New_York');
     expect(card.text).toContain('Стан: на паузі');
-    expect(card.text).toContain('ще не працюють');
     expect(card.text).not.toMatch(/Наступн/);
     expect(card.text).toContain(`${'p'.repeat(300)}…`);
     const buttons = card.keyboard?.inline_keyboard.flat().map((b) => b.text);

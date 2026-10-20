@@ -13,7 +13,12 @@ export interface RenderableReport {
   simulated: boolean;
   text: string;
   citations: readonly Citation[];
+  /** Scheduled runs: the planned occurrence; the header discloses any delay (TRB-070). */
+  scheduledFor?: Date;
 }
+
+/** A scheduled report started later than this is labelled as delayed. */
+export const DELAY_NOTICE_MINUTES = 5;
 
 /** An indivisible piece of HTML, or plain text that may be split at boundaries. */
 type Atom = { kind: 'html'; html: string } | { kind: 'text'; text: string };
@@ -56,6 +61,17 @@ function headerHtml(report: RenderableReport): string {
         `(${report.checkedAt.toISOString().slice(0, 16).replace('T', ' ')} UTC)`,
     ),
   );
+  if (report.scheduledFor) {
+    const minutes = Math.round(
+      (report.checkedAt.getTime() - report.scheduledFor.getTime()) / 60_000,
+    );
+    lines.push(
+      escapeHtml(
+        `${messages.scheduledForLabel}: ${formatLocal(report.scheduledFor, report.timeZone)} ${report.timeZone}` +
+          (minutes > DELAY_NOTICE_MINUTES ? ` — ${messages.delayedBy(minutes)}` : ''),
+      ),
+    );
+  }
   lines.push(
     `${escapeHtml(messages.outcomeLabel)}: <b>${escapeHtml(OUTCOME_LABELS[report.outcome])}</b>`,
   );

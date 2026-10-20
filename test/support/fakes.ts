@@ -22,6 +22,9 @@ export class FakeClock implements Clock {
   advance(ms: number): void {
     this.current = new Date(this.current.getTime() + ms);
   }
+  set(instant: Date | string): void {
+    this.current = new Date(instant);
+  }
 }
 
 type Bounds = Pick<ResearchRequest, 'maxOutputTokens' | 'maxToolCalls'>;

@@ -80,13 +80,17 @@ model ResearchRun {
   task                      Task?            @relation(fields: [taskId], references: [id], onDelete: Restrict)
   taskRevision              Int?             @map("task_revision")
   trigger                   RunTrigger       @default(MANUAL)
+  /// SCHEDULED only: the planned occurrence (UTC) this run executes; actual times are started_at/submitted_at.
+  occurrenceAt              DateTime?        @map("occurrence_at") @db.Timestamptz(3)
+  scheduleEvents            ScheduleEvent[]
   /// UTC accounting periods of the admission ("YYYY-MM-DD", "YYYY-MM"); never recomputed.
   admittedDay               String?          @map("admitted_day")
   admittedMonth             String?          @map("admitted_month")
   user                      AppUser?         @relation(fields: [userId], references: [id], onDelete: Restrict)
   /// Destination derived from the authorized private chat of the request.
   chatId                    BigInt           @map("chat_id")
-  sourceUpdateId            BigInt           @unique @map("source_update_id")
+  /// Telegram update of a manual request; null for scheduled runs (TRB-070).
+  sourceUpdateId            BigInt?          @unique @map("source_update_id")
   state                     ResearchRunState @default(QUEUED)
   prompt                    String
   /// Provider kind fixed at admission ("fake" or "openai"); never switched silently.
@@ -326,6 +330,7 @@ model AppUser {
   taskDraft          TaskDraft?
   reservations       BudgetReservation[]
   ledgerEntries      UsageLedger[]
+  scheduleEvents     ScheduleEvent[]
 
   @@map("app_user")
 }
@@ -394,28 +399,31 @@ enum ScheduleKind {
 }
 
 model Task {
-  id                 String        @id @default(uuid()) @db.Uuid
-  userId             String        @map("user_id") @db.Uuid
-  user               AppUser       @relation(fields: [userId], references: [id], onDelete: Restrict)
+  id                 String          @id @default(uuid()) @db.Uuid
+  userId             String          @map("user_id") @db.Uuid
+  user               AppUser         @relation(fields: [userId], references: [id], onDelete: Restrict)
   name               String
   prompt             String
-  scheduleKind       ScheduleKind  @map("schedule_kind")
+  scheduleKind       ScheduleKind    @map("schedule_kind")
   /// ISO weekday 1 (Monday) to 7 (Sunday); WEEKLY only.
   weekday            Int?
   /// Local wall-clock time "HH:mm" in time_zone; DAILY and WEEKLY only. Never converted to UTC.
-  localTime          String?       @map("local_time")
+  localTime          String?         @map("local_time")
   /// The task's own IANA zone; independent of the user's default.
-  timeZone           String        @map("time_zone")
-  state              TaskState     @default(ACTIVE)
+  timeZone           String          @map("time_zone")
+  state              TaskState       @default(ACTIVE)
   /// Incremented on every change; edits and buttons carry it (optimistic concurrency).
-  revision           Int           @default(1)
+  revision           Int             @default(1)
   /// The draft that created it; unique, so one draft can never create two tasks.
-  createdFromDraftId String?       @unique @map("created_from_draft_id") @db.Uuid
-  deletedAt          DateTime?     @map("deleted_at") @db.Timestamptz(3)
-  createdAt          DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt          DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdFromDraftId String?         @unique @map("created_from_draft_id") @db.Uuid
+  /// Next planned occurrence (UTC) of an active daily/weekly task; null otherwise (TRB-070).
+  nextRunAt          DateTime?       @map("next_run_at") @db.Timestamptz(3)
+  deletedAt          DateTime?       @map("deleted_at") @db.Timestamptz(3)
+  createdAt          DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
   drafts             TaskDraft[]
   runs               ResearchRun[]
+  scheduleEvents     ScheduleEvent[]
 
   @@index([userId, state, createdAt])
   @@map("task")
@@ -472,7 +480,7 @@ model TaskDraft {
 
 enum RunTrigger {
   MANUAL
-  /// Reserved for TRB-070; not produced yet.
+  /// Admitted by the scheduler for a planned occurrence (TRB-070).
   SCHEDULED
 }
 
@@ -634,4 +642,48 @@ model ResearchAttempt {
 
   @@unique([runId, attemptNo])
   @@map("research_attempt")
+}
+
+// ---------------------------------------------------------------------------
+// TRB-070: persistent scheduling.
+
+/// What happened to one planned occurrence of a task.
+enum ScheduleDisposition {
+  /// Admitted through the normal admission path (run_id).
+  ADMITTED
+  /// The task already had a QUEUED or RUNNING run (run_id references it; nothing new was created).
+  SKIPPED_OVERLAP
+  /// Admission refused it: quota, budget, configuration, access (reason).
+  SKIPPED_DENIED
+  /// Missed during downtime: superseded by a later occurrence, or older than the catch-up window.
+  SKIPPED_MISSED
+}
+
+/// Operational history of planned occurrences: one row per (task, occurrence).
+/// A SKIPPED_MISSED row may stand for a range (occurrence_at … range_end, skipped_count).
+model ScheduleEvent {
+  id              String              @id @default(uuid()) @db.Uuid
+  taskId          String              @map("task_id") @db.Uuid
+  task            Task                @relation(fields: [taskId], references: [id], onDelete: Restrict)
+  userId          String              @map("user_id") @db.Uuid
+  user            AppUser             @relation(fields: [userId], references: [id], onDelete: Restrict)
+  occurrenceAt    DateTime            @map("occurrence_at") @db.Timestamptz(3)
+  disposition     ScheduleDisposition
+  reason          String
+  runId           String?             @map("run_id") @db.Uuid
+  run             ResearchRun?        @relation(fields: [runId], references: [id], onDelete: Restrict)
+  taskRevision    Int                 @map("task_revision")
+  /// Admitted later than the on-time grace after its occurrence.
+  catchUp         Boolean             @default(false) @map("catch_up")
+  latenessSeconds Int                 @default(0) @map("lateness_seconds")
+  /// SKIPPED_MISSED ranges: the last skipped occurrence and how many (null when beyond the counting bound).
+  rangeEnd        DateTime?           @map("range_end") @db.Timestamptz(3)
+  skippedCount    Int?                @map("skipped_count")
+  /// The owner was told (denials are reported once per consecutive reason).
+  notified        Boolean             @default(false)
+  createdAt       DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@unique([taskId, occurrenceAt])
+  @@index([taskId, createdAt])
+  @@map("schedule_event")
 }

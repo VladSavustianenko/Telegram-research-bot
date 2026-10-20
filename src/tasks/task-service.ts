@@ -8,6 +8,7 @@ import { userOperationDenial } from '../identity/authorization';
 import { SUGGESTED_TIME_ZONE } from '../identity/time-zone';
 import { admitResearch } from '../research/admission';
 import { cancelQueuedRuns, suppressRunDeliveries } from '../research/lifecycle';
+import { nextOccurrenceAfter } from '../scheduling/recurrence';
 import type { DraftOp, TaskOp } from '../telegram/callback-data';
 import {
   applyEvent,
@@ -46,7 +47,12 @@ import {
  * authenticated user's ID, so foreign and nonexistent IDs look the same.
  * Mutations are also conditional on the revision the user acted on
  * (optimistic concurrency), so a stale button or edit never overwrites newer
- * data even without the lock. Nothing here creates research runs.
+ * data even without the lock. Only "Run now" creates research runs.
+ *
+ * Schedule (TRB-070): every change that affects it sets next_run_at in the same
+ * conditional update. Creation, resume and a schedule edit compute the first
+ * occurrence after now (never a catch-up); pause and deletion clear it. "Run
+ * now" never touches it.
  */
 export interface TaskContext {
   tx: Tx;
@@ -230,6 +236,13 @@ export async function onTaskAction(
   }
 }
 
+/** First occurrence after now for an active scheduled task, otherwise null. */
+const nextRunOf = (
+  task: Pick<Task, 'scheduleKind' | 'weekday' | 'localTime' | 'timeZone'>,
+  state: Task['state'],
+  now: Date,
+) => (state === 'ACTIVE' ? nextOccurrenceAfter(task, now) : null);
+
 /** Idempotent: pausing a paused task (or resuming an active one) changes nothing. */
 async function setPaused(ctx: TaskContext, task: Task, pause: boolean): Promise<TaskOutcome> {
   const target = pause ? 'PAUSED' : 'ACTIVE';
@@ -246,7 +259,12 @@ async function setPaused(ctx: TaskContext, task: Task, pause: boolean): Promise<
   }
   const updated = await ctx.tx.task.updateMany({
     where: { id: task.id, userId: ctx.user.id, revision: task.revision, state: task.state },
-    data: { state: target, revision: { increment: 1 } },
+    // Resume starts from the next future occurrence: missed ones are not replayed.
+    data: {
+      state: target,
+      revision: { increment: 1 },
+      nextRunAt: nextRunOf(task, target, ctx.now),
+    },
   });
   // Pausing cancels queued research of the task (its reservation is released);
   // a running request may finish and deliver (SPEC §4).
@@ -280,7 +298,7 @@ async function deleteTask(ctx: TaskContext, task: Task): Promise<TaskOutcome> {
       revision: task.revision,
       state: { not: 'DELETED' },
     },
-    data: { state: 'DELETED', deletedAt: new Date(), revision: { increment: 1 } },
+    data: { state: 'DELETED', deletedAt: new Date(), revision: { increment: 1 }, nextRunAt: null },
   });
   if (deleted.count !== 1) {
     const current = await ownTask(ctx, task.id);
@@ -607,7 +625,13 @@ async function saveCreate(ctx: TaskContext, draft: DraftRow): Promise<TaskOutcom
     return previewOnly(ctx, draft, 'TASK_LIMIT_ACTIVE', activeLimitText(ctx));
   }
   const task = await ctx.tx.task.create({
-    data: { userId: ctx.user.id, ...config, createdFromDraftId: draft.id },
+    data: {
+      userId: ctx.user.id,
+      ...config,
+      createdFromDraftId: draft.id,
+      // Saving never runs research; the first scheduled occurrence is in the future.
+      nextRunAt: nextRunOf(config, 'ACTIVE', ctx.now),
+    },
   });
   await removeDraft(ctx, draft);
   return reply(
@@ -625,9 +649,20 @@ async function saveEdit(ctx: TaskContext, draft: DraftRow): Promise<TaskOutcome>
     return previewOnly(ctx, draft, 'DRAFT_NOT_APPLICABLE', ERROR_TEXT('NOT_APPLICABLE', 0));
   const data = draft.data as unknown as DraftData;
   const changes = editChanges(draft.section, data, ctx.config.RESEARCH_PROMPT_MAX_CHARS);
-  if (!changes || !draft.taskId || draft.baseRevision === null) {
+  if (!changes || !draft.taskId || draft.baseRevision === null || !draft.task) {
     return previewOnly(ctx, draft, 'DRAFT_INCOMPLETE', 'Чернетка неповна; перевірте кроки.');
   }
+  // The revision condition guarantees the task state read with the draft is current.
+  const schedule =
+    draft.section === 'SCHEDULE'
+      ? {
+          nextRunAt: nextRunOf(
+            changes as Pick<Task, 'scheduleKind' | 'weekday' | 'localTime' | 'timeZone'>,
+            draft.task.state,
+            ctx.now,
+          ),
+        }
+      : {};
   const updated = await ctx.tx.task.updateMany({
     where: {
       id: draft.taskId,
@@ -635,8 +670,13 @@ async function saveEdit(ctx: TaskContext, draft: DraftRow): Promise<TaskOutcome>
       revision: draft.baseRevision,
       state: { not: 'DELETED' },
     },
-    data: { ...changes, revision: { increment: 1 } },
+    data: { ...changes, ...schedule, revision: { increment: 1 } },
   });
+  // Queued research built from the old prompt or schedule is cancelled (its
+  // reservation released); a running run keeps its immutable snapshot (SPEC §4).
+  if (updated.count === 1 && (draft.section === 'PROMPT' || draft.section === 'SCHEDULE')) {
+    await cancelQueuedRuns(ctx.tx, { taskId: draft.taskId }, 'TASK_EDITED');
+  }
   await removeDraft(ctx, draft);
   const current = await ownTask(ctx, draft.taskId);
   if (updated.count !== 1) {
@@ -687,7 +727,14 @@ function editChanges(
         { ...data, name: 'x', prompt: 'x' },
         { promptMaxChars: promptMax },
       );
-      return schedule && complete ? { ...schedule, timeZone: complete.timeZone } : null;
+      return schedule && complete
+        ? {
+            scheduleKind: complete.scheduleKind,
+            weekday: complete.weekday,
+            localTime: complete.localTime,
+            timeZone: complete.timeZone,
+          }
+        : null;
     }
     default:
       return null;

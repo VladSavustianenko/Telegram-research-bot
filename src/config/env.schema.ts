@@ -179,6 +179,11 @@ export const envSchema = z
         .refine((name) => name !== 'public', 'must not be the application schema')
         .default('pgboss'),
     ),
+    // Scheduler polling of due tasks (TRB-070; ARCHITECTURE §3 proposal), with BACKGROUND_WORKERS=on.
+    SCHEDULER_POLL_INTERVAL_SECONDS: positiveIntWithDefault(30).refine(
+      (seconds) => seconds <= 300,
+      'must be at most 300',
+    ),
     // Delay before a run that could not start (capacity, fairness, live gate) is inspected again.
     RESEARCH_CAPACITY_RETRY_SECONDS: positiveIntWithDefault(15),
     // A queued run not started within this time is cancelled and its reservation released.

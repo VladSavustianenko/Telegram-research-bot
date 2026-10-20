@@ -74,7 +74,7 @@ Connect outbox to pg-boss. Implement lease/fencing, research attempts, asynchron
 
 Acceptance: replayed jobs cannot execute a terminal run again; crash after business commit still dispatches; known provider response resumes after restart; unknown submission is not automatically resubmitted; stale workers cannot finalize; partial/incomplete responses are not delivered as complete; suspended/deleted work is suppressed with correct accounting.
 
-Status: READY FOR REVIEW (2026-10-20). Mock validation only: scripted providers (no network), recording Telegram sender, real PostgreSQL and real pg-boss 12.37.0; Docker smoke with the fake provider; no live request or Telegram message. Behaviour: docs/QUEUE.md. Evidence: docs/VALIDATION.md, "TRB-060 evidence".
+Status: DONE — accepted by the owner on 2026-10-20 after review of commit 5d19d297f1bd4b010c0f8b9ab9b52539bf0de98d. Mock validation only: scripted providers (no network), recording Telegram sender, real PostgreSQL and real pg-boss 12.37.0; Docker smoke with the fake provider; no live request or Telegram message. Behaviour: docs/QUEUE.md. Evidence: docs/VALIDATION.md, "TRB-060 evidence" and "TRB-060 acceptance". Carried-forward decisions: `RESEARCH_SUBMISSION_RETRY_LIMIT` stays 0, the queue maximum wait stays 3600 s and the deferred wake-up 15 s.
 - **Not exactly-once.** Exactly-once provider execution is not claimed: a submission interrupted before its response ID was saved is UNCERTAIN and never resubmitted.
 - **Retries off by default.** Automatic resubmission after a rate-limit refusal is implemented but disabled (`RESEARCH_SUBMISSION_RETRY_LIMIT=0`); enabling it is an owner decision.
 - **Rollout.** The old and new execution mechanisms must not overlap (docs/QUEUE.md, "Migration and rollout").
@@ -86,6 +86,8 @@ Depends on: 040, 050, 060.
 Implement due-task polling, local occurrence computation, DST policies, single catch-up policy, overlap records and edit/pause/resume semantics.
 
 Acceptance: daily/weekly schedules work in Europe/Kyiv and at least one additional DST zone; gap/overlap behavior matches SPEC; two schedulers create one occurrence; downtime causes at most one eligible catch-up; manual run does not shift future schedule; pause/edit cancels eligible queued jobs and releases reservations; budget denial cannot busy-loop.
+
+Status: READY FOR REVIEW (2026-10-20). Mock validation only: fake clock, scripted providers (no network), recording Telegram sender, real PostgreSQL and pg-boss; Docker smoke with the fake provider; no live request or Telegram message. Behaviour: docs/SCHEDULING.md. Evidence: docs/VALIDATION.md, "TRB-070 evidence". Existing active scheduled tasks are initialized to their next future occurrence, with no historical execution.
 
 ## TRB-080 — Reliable result delivery and history
 

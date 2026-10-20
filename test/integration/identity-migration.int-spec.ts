@@ -100,6 +100,8 @@ const NEW_COLUMNS = [
   // TRB-060
   'current_attempt_no',
   'next_attempt_at',
+  // TRB-070
+  'occurrence_at',
 ];
 
 async function snapshotTables(client: Client): Promise<Record<string, unknown[]>> {

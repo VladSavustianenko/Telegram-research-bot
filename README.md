@@ -78,7 +78,7 @@ Commands, token handling, suspension semantics and the migration of existing run
 
 - **Commands.** `/tasks`, `/new` and `/cancel` manage saved research tasks: name, prompt, a manual, daily or weekly schedule, and their own time zone.
 - **Dialogs.** Guided steps with Back and Cancel, persisted drafts (24 h), revision-checked edits, pause, resume and confirmed soft delete.
-- **Execution.** Saving or changing a task never starts research. "Запустити зараз" on a task card runs it once (TRB-050); scheduled execution comes in TRB-070.
+- **Execution.** Saving or changing a task never starts research by itself. "Запустити зараз" on a task card runs it once (TRB-050). Daily and weekly tasks run at their local time (TRB-070), with at most one catch-up (≤ 24 h) after downtime: [docs/SCHEDULING.md](docs/SCHEDULING.md).
 
 Details: [docs/TASKS.md](docs/TASKS.md).
 

@@ -2,7 +2,7 @@
 
 How admitted research reaches the provider, survives crashes and restarts, and stays accounted for. TRB-050 records (runs, reservations, ledger, outbox events) remain authoritative. pg-boss only carries wake-up requests.
 
-Out of scope here: recurring scheduling (TRB-070), the separate delivery queue (TRB-080), administration UI (TRB-090) and deployment (TRB-100).
+Out of scope here: recurring scheduling (TRB-070, docs/SCHEDULING.md: scheduled runs enter this path through admission and the outbox like manual runs), the separate delivery queue (TRB-080), administration UI (TRB-090) and deployment (TRB-100).
 
 ## Guarantees and their limits
 

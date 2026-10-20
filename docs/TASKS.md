@@ -2,12 +2,14 @@
 
 Status: DONE (accepted by the owner on 2026-10-19 after review of commit cf8637b; includes the review fix binding draft buttons to their draft). TRB-050 added "Запустити зараз" to cards and lifecycle effects on queued runs (docs/ACCOUNTING.md). Validated with fake providers, a recording Telegram sender and real PostgreSQL only; nothing here was exercised against the real Telegram API.
 
-**Schedules are configuration only.** Tasks store *what* to research and *when* (local intent):
-- **Scheduled runs:** TRB-070; nothing executes schedules yet.
+**Schedules.** Tasks store *what* to research and *when* (local intent):
+- **Scheduled runs (since TRB-070):** daily and weekly tasks run automatically at their local time through the same admission path. Behaviour, DST policy, catch-up and lifecycle effects: [SCHEDULING.md](SCHEDULING.md).
 - **"Запустити зараз" (since TRB-050):** admits a manual run of the task through the single admission path, with quotas, budgets, the live restriction and one active run per task (docs/ACCOUNTING.md). It is available for paused tasks and never changes the schedule.
-- **Effect of task actions on research.** Saving, editing and resuming a task never creates a research run, job or provider call. Pausing or deleting cancels the task's *queued* run (releasing its reservation), and deleting also suppresses delivery of its results.
+- **Effect of task actions on research.** Saving, editing and resuming a task never creates a research run, job or provider call.
+  - Pausing or deleting cancels the task's *queued* run, releasing its reservation; deleting also suppresses delivery of its results.
+  - Since TRB-070, editing the prompt or schedule cancels queued runs too (`TASK_EDITED`), and every change that affects the schedule recomputes or clears the next run.
 
-Cards and previews say that scheduled runs do not work yet and show no next-run time. `/research` and `/result` keep working unchanged, with their TRB-030 authorization: live research is administrator-only until TRB-050.
+Since TRB-070, cards show the next planned run in the task zone, or "лише вручну", or the paused state. Previews of scheduled tasks explain catch-up and delays. `/research` and `/result` keep working unchanged; live research stays administrator-only.
 
 ## Commands and buttons
 
@@ -21,7 +23,7 @@ Available to active users with completed onboarding (docs/IDENTITY.md), in their
 | `/tasks` | List of non-deleted tasks, oldest first, 5 per page (`«`/`»`), with counts against the limits. One button per task opens its card; "+ Нове завдання" starts creation. Empty state: "Завдань ще немає." |
 | `/new` | Starts the creation dialog. When a draft is already open, nothing is discarded: the bot offers "Продовжити" or "Відкинути й почати нове". |
 | `/cancel` | Ends the open draft. A saved task is never changed. Without a draft: "Немає незавершеної чернетки." |
-| Task card | Shows name, state (active or paused), schedule, the task's time zone and the prompt (first 300 characters). Buttons: Назва / Запит / Розклад (edit), Пауза or Відновити, Видалити, « До списку. |
+| Task card | Shows name, state (active or paused), schedule, the task's time zone, the next planned run (TRB-070) and the prompt (first 300 characters). Buttons: Назва / Запит / Розклад (edit), Пауза or Відновити, Видалити, « До списку. |
 
 Commands are routed before free text. Free text is a field value only while a draft is open at a text step; otherwise it gets the help text.
 
@@ -85,7 +87,7 @@ Creation steps: **name → prompt → schedule kind (Вручну / Щодня /
 - **Pause and resume.** Pause sets `PAUSED`, Resume sets `ACTIVE`; each increments the revision.
   - Pausing a paused task, or resuming an active one, changes nothing ("Завдання вже на паузі." / "…вже активне.").
   - Resume respects the active-task limit.
-  - Neither triggers research. Cancelling queued work of a paused task becomes relevant with TRB-070.
+  - Neither triggers research. Pausing cancels queued work and clears the next run. Resuming computes the next future occurrence; missed ones are not replayed (TRB-070).
 - **Delete.**
   1. "Видалити" asks for confirmation; the "Так, видалити" button is bound to the owner, task and revision.
   2. If the task changed after the confirmation was requested, the confirmation does nothing and the current card is shown.

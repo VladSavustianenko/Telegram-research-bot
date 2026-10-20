@@ -7,6 +7,7 @@ import { DeliveryModule } from './delivery/delivery.module';
 import { HealthModule } from './health/health.module';
 import { IdentityModule } from './identity/identity.module';
 import { ResearchModule } from './research/research.module';
+import { SchedulingModule } from './scheduling/scheduling.module';
 import { TelegramModule } from './telegram/telegram.module';
 
 @Module({})
@@ -22,6 +23,7 @@ export class AppModule {
         IdentityModule,
         TelegramModule,
         ResearchModule,
+        SchedulingModule,
         DeliveryModule,
       ],
     };

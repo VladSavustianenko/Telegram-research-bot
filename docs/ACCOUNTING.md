@@ -16,6 +16,8 @@ For a hard stop at the provider, keep an OpenAI project spend limit with "Enforc
 
 ## Admission (one path)
 
+Since TRB-070 scheduled occurrences use the same path, quietly: no reply is written and the scheduler records the outcome as a schedule disposition (docs/SCHEDULING.md).
+
 `src/research/admission.ts` `admitResearch` is the only way to create research. Two entry points use it:
 - `/research <prompt>`;
 - a task card's "Запустити зараз" (`t:<task>:<revision>:r`).
@@ -65,7 +67,7 @@ Administrators are subject to the same quotas and budgets; only the live-researc
 | Quota | Counts | Released when |
 |---|---|---|
 | `USER_DAILY_RUN_LIMIT` (default 10) | Runs admitted on the UTC day, live and simulated | The run is CANCELLED before submission (`submission_state = NOT_SUBMITTED`) |
-| `USER_DAILY_MANUAL_RUN_LIMIT` (default 5) | Same, `trigger = MANUAL`. Every run is manual until TRB-070 | Same |
+| `USER_DAILY_MANUAL_RUN_LIMIT` (default 5) | Same, `trigger = MANUAL`. Scheduled runs (TRB-070) count against the daily run limit only | Same |
 | `USER_ACTIVE_RUN_LIMIT` (default 1) | The user's QUEUED + RUNNING runs | The run leaves QUEUED/RUNNING |
 | `RESEARCH_QUEUE_LIMIT` (default 3) | All QUEUED + RUNNING runs | Same |
 | `USER_MONTHLY_BUDGET_USD` | Exposure of the user's live runs admitted in the UTC month | See ledger transitions |

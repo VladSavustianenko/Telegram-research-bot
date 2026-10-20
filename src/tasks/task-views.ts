@@ -4,6 +4,7 @@ import {
   taskCallbackData,
   taskListCallbackData,
 } from '../telegram/callback-data';
+import { formatInZone } from '../scheduling/recurrence';
 import type { InlineKeyboard } from '../telegram/telegram-sender';
 import { acceptsText, currentValue, previousStep, type DraftShape } from './draft-flow';
 import {
@@ -41,11 +42,26 @@ export interface TaskView extends ScheduleView {
   timeZone: string;
   state: 'ACTIVE' | 'PAUSED' | 'DELETED';
   revision: number;
+  /** Next planned occurrence (UTC), active scheduled tasks only (TRB-070). */
+  nextRunAt?: Date | null;
 }
 
-/** Scheduling is configuration only until TRB-070; said once, briefly, wherever a schedule is shown. */
-export const NOT_YET_SCHEDULED =
-  'Автоматичні запуски за розкладом ще не працюють; «Запустити зараз» запускає дослідження вручну (за лімітами /usage).';
+/** How scheduled runs behave; shown where a schedule is chosen (TRB-070, SPEC §4). */
+export const SCHEDULE_NOTE =
+  'Запуски за розкладом — у вказаний місцевий час завдання (з урахуванням переходу на літній/зимовий час). ' +
+  'Якщо бот був недоступний, виконується щонайбільше один пропущений запуск, не старший за 24 год; ' +
+  'звіт тоді показує затримку. Запуск не відбудеться, якщо попередній ще виконується або вичерпано ліміти /usage.';
+
+/** The card's line about automatic runs. */
+export function nextRunLine(task: TaskView): string {
+  if (task.scheduleKind === 'MANUAL') return 'Запуски: лише вручну («Запустити зараз»).';
+  if (task.state !== 'ACTIVE') {
+    return 'Автоматичні запуски на паузі; після відновлення — з наступного часу за розкладом, пропущені не надолужуються.';
+  }
+  return task.nextRunAt
+    ? `Наступний запуск: ${formatInZone(task.nextRunAt, task.timeZone)} (${task.timeZone}).`
+    : 'Наступний запуск: буде обчислено найближчим часом.';
+}
 
 export function truncate(text: string, maxCodePoints: number): string {
   const points = Array.from(text);
@@ -168,7 +184,9 @@ export function previewView(draft: DraftView, notice?: string): View {
     ...(editing === null || editing === 'PROMPT' ? ['Запит:', data.prompt ?? ''] : []),
     '',
     'Збереження не запускає дослідження.',
-    ...(editing === null || editing === 'SCHEDULE' ? [NOT_YET_SCHEDULED] : []),
+    ...((editing === null || editing === 'SCHEDULE') && data.scheduleKind !== 'MANUAL'
+      ? [SCHEDULE_NOTE]
+      : []),
   ];
   return {
     text: lines.join('\n'),
@@ -220,9 +238,8 @@ export function taskCardView(task: TaskView, notice?: string): View {
     `Стан: ${task.state === 'ACTIVE' ? 'активне' : 'на паузі'}`,
     `Розклад: ${describeSchedule(task)}`,
     `Часовий пояс: ${task.timeZone}`,
+    nextRunLine(task),
     `Запит: ${truncate(task.prompt, PROMPT_PREVIEW_CHARS)}`,
-    '',
-    NOT_YET_SCHEDULED,
   ];
   return {
     text: lines.join('\n'),

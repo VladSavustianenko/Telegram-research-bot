@@ -36,6 +36,12 @@ Admission transaction locks the relevant task and quota/budget records in consis
 
 Scheduler polls due rows (proposed interval: 30 seconds), locks bounded batches using SKIP LOCKED, determines missed/catch-up/overlap disposition, advances nextRunAt and admits eligible work atomically. Every occurrence receives an explicit disposition. Quota-blocked occurrences are skipped with a reason, not immediately retried forever. A notification is coalesced to avoid spam.
 
+Implementation note (TRB-070, clarification):
+- **Locking.** The scheduler selects a bounded batch of due tasks without locks, then handles each in its own transaction. It takes the owner's identity lock and user row before the task row, the order the inbox, admission and suspension use (task rows are not taken with `SKIP LOCKED` before the user).
+- **Revalidation.** Under those locks it revalidates the selected occurrence.
+- **Missed occurrences.** Earlier missed occurrences are one range record.
+- **Details** are in SCHEDULING.md.
+
 The outbox dispatcher publishes to pg-boss with a stable run ID, then marks dispatched. A crash between these steps may publish again; consumers must deduplicate in the database. Never write a business record in Prisma and assume a separate queue send is atomic. Use the outbox even if pg-boss supports transactions unless the exact shared transaction adapter is proven.
 
 Implementation note (TRB-060, clarification): admission still writes only the outbox event. The dispatcher publishes it through pg-boss's own Prisma adapter inside the transaction that marks it dispatched, which an integration test verifies. The job ID is the outbox event ID, so repeated publication of one event is also a no-op. Consumers deduplicate in the database regardless. Details are in QUEUE.md.

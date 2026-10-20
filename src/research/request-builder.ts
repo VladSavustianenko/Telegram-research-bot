@@ -1,7 +1,9 @@
+import { Temporal } from 'temporal-polyfill';
 import type { Env } from '../config/env.schema';
 import type { ProviderKind, ReasoningEffort, ResearchRequest } from './provider/provider.types';
 
-export const RESEARCH_POLICY_VERSION = 'research-policy-2026-10-18.1';
+/** 2026-10-20.1 (TRB-070): planned occurrence, delay and calendar boundaries in the context. */
+export const RESEARCH_POLICY_VERSION = 'research-policy-2026-10-20.1';
 
 /** Model label stored for simulated runs; never sent to OpenAI. */
 export const FAKE_MODEL = 'simulated';
@@ -26,9 +28,17 @@ export interface ResearchContext {
   localNow: string;
   timeZone: string;
   utcOffset: string;
+  /** Monday–Sunday of the actual execution time, in the task zone. */
   currentWeek: { monday: string; sunday: string };
+  currentMonth?: { first: string; last: string };
+  /** Rolling windows ending/starting at the actual execution time (not calendar weeks). */
+  previousSevenDays?: { from: string; to: string };
+  nextSevenDays?: { from: string; to: string };
   queuedAt: string;
+  /** Minutes from admission (or the planned occurrence, when scheduled) to the actual start. */
   delayMinutes: number;
+  /** Scheduled runs: the planned occurrence (UTC and local). */
+  scheduledFor?: { utc: string; local: string };
 }
 
 /**
@@ -61,13 +71,27 @@ function required<T>(value: T | undefined): T {
   return value;
 }
 
-export function buildResearchContext(now: Date, queuedAt: Date, timeZone: string): ResearchContext {
+/**
+ * The time reference of one execution: always the actual execution time
+ * (`now`), never the planned occurrence, which is reported separately with the
+ * delay. Calendar arithmetic is done on local dates in the task zone.
+ */
+export function buildResearchContext(
+  now: Date,
+  queuedAt: Date,
+  timeZone: string,
+  scheduledFor?: Date | null,
+): ResearchContext {
   const local = localParts(now, timeZone);
   const weekdayIndex = (local.weekday + 6) % 7; // Monday = 0
   const todayUtc = Date.UTC(local.year, local.month - 1, local.day);
   const day = 86_400_000;
+  const zoned = Temporal.Instant.fromEpochMilliseconds(now.getTime()).toZonedDateTimeISO(timeZone);
+  const stamp = (value: Temporal.ZonedDateTime) =>
+    `${value.toPlainDate().toString()} ${pad(value.hour)}:${pad(value.minute)}`;
+  const reference = scheduledFor ?? queuedAt;
   return {
-    utcNow: now.toISOString().replace(/\.\d{3}Z$/, 'Z'),
+    utcNow: utc(now),
     localNow: `${isoDate(todayUtc)} ${pad(local.hour)}:${pad(local.minute)}`,
     timeZone,
     utcOffset: local.offset,
@@ -75,10 +99,21 @@ export function buildResearchContext(now: Date, queuedAt: Date, timeZone: string
       monday: isoDate(todayUtc - weekdayIndex * day),
       sunday: isoDate(todayUtc + (6 - weekdayIndex) * day),
     },
-    queuedAt: queuedAt.toISOString().replace(/\.\d{3}Z$/, 'Z'),
-    delayMinutes: Math.max(0, Math.round((now.getTime() - queuedAt.getTime()) / 60_000)),
+    currentMonth: {
+      first: zoned.toPlainDate().with({ day: 1 }).toString(),
+      last: zoned.toPlainDate().with({ day: zoned.daysInMonth }).toString(),
+    },
+    previousSevenDays: { from: stamp(zoned.subtract({ days: 7 })), to: stamp(zoned) },
+    nextSevenDays: { from: stamp(zoned), to: stamp(zoned.add({ days: 7 })) },
+    queuedAt: utc(queuedAt),
+    delayMinutes: Math.max(0, Math.round((now.getTime() - reference.getTime()) / 60_000)),
+    ...(scheduledFor
+      ? { scheduledFor: { utc: utc(scheduledFor), local: formatLocal(scheduledFor, timeZone) } }
+      : {}),
   };
 }
+
+const utc = (instant: Date) => instant.toISOString().replace(/\.\d{3}Z$/, 'Z');
 
 export const RESEARCH_INSTRUCTIONS = `You are a careful web research assistant working for one user of a private Telegram bot.
 
@@ -109,7 +144,23 @@ export function buildResearchRequest(
     `- Current local time: ${context.localNow} (${context.timeZone}, UTC${context.utcOffset})`,
     `- Time zone for interpreting dates: ${context.timeZone}`,
     `- Current week (Monday to Sunday, ${context.timeZone}): ${context.currentWeek.monday} to ${context.currentWeek.sunday}`,
-    `- Request queued at (UTC): ${context.queuedAt}; research started ${context.delayMinutes} minute(s) later`,
+    ...(context.currentMonth
+      ? [`- Current month: ${context.currentMonth.first} to ${context.currentMonth.last}`]
+      : []),
+    ...(context.previousSevenDays && context.nextSevenDays
+      ? [
+          `- "Previous seven days" (rolling, not a calendar week): ${context.previousSevenDays.from} to ${context.previousSevenDays.to} local`,
+          `- "Next seven days" (rolling, not a calendar week): ${context.nextSevenDays.from} to ${context.nextSevenDays.to} local`,
+        ]
+      : []),
+    ...(context.scheduledFor
+      ? [
+          `- Scheduled run planned for ${context.scheduledFor.local} local (${context.scheduledFor.utc}); actually started ${context.delayMinutes} minute(s) later. Use the actual current time above as the reference.`,
+        ]
+      : [
+          `- Request queued at (UTC): ${context.queuedAt}; research started ${context.delayMinutes} minute(s) later`,
+        ]),
+    '- Use these periods only when the task asks for them; do not assume a search period the task does not state.',
     '',
     'Task written by the user (between the markers):',
     '<<<TASK',

@@ -70,6 +70,8 @@ interface Execution {
   claim: Claim;
   provider: ResearchProvider;
   stored: StoredSnapshot;
+  /** Scheduled runs: the planned occurrence (reported with the delay; never the time reference). */
+  occurrenceAt: Date | null;
 }
 
 /** What one job did: advanced a run it held, or only inspected (and possibly deferred). */
@@ -357,7 +359,7 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
   ): Promise<void> {
     const run = await this.prisma.researchRun.findUniqueOrThrow({ where: { id: claim.id } });
     const stored = run.requestSnapshot as unknown as StoredSnapshot;
-    const execution: Execution = { claim, provider, stored };
+    const execution: Execution = { claim, provider, stored, occurrenceAt: run.occurrenceAt };
 
     // Never switch providers silently (e.g. a run admitted as live must not get fake results).
     if (stored.config.providerKind !== provider.kind) {
@@ -394,9 +396,12 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
     }
 
     const submittedAt = this.clock.now();
-    // The immutable request is built once; a later attempt resubmits it unchanged.
+    // The immutable request is built once, with the actual execution time as its
+    // reference; a later attempt resubmits it unchanged, and polling a submitted
+    // response never rebuilds it.
     const context =
-      stored.context ?? buildResearchContext(submittedAt, run.createdAt, stored.config.timeZone);
+      stored.context ??
+      buildResearchContext(submittedAt, run.createdAt, stored.config.timeZone, run.occurrenceAt);
     const request =
       stored.request ?? buildResearchRequest(run.id, run.prompt, stored.config, context);
     const nextStored: StoredSnapshot = { ...stored, config: stored.config, context, request };
@@ -817,6 +822,7 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
       simulated: response.simulated || stored.config.providerKind === 'fake',
       text: report.text,
       citations: report.citations,
+      ...(execution.occurrenceAt ? { scheduledFor: execution.occurrenceAt } : {}),
     });
     await this.prisma.$transaction(async (tx) => {
       const run = await this.fenced(tx, claim, {

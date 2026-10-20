@@ -667,6 +667,74 @@ Remaining limitations:
 - **Rollout.** Rollout requires that old and new workers do not overlap.
 - **Not run:** CI, any live OpenAI request or Telegram message, Railway deployment.
 
+### TRB-060 acceptance (2026-10-20)
+
+The owner accepted TRB-060 after review of commit `5d19d297f1bd4b010c0f8b9ab9b52539bf0de98d`. The evidence and limitations above are left as recorded. Decisions carried forward: `RESEARCH_SUBMISSION_RETRY_LIMIT` stays 0, the queue maximum wait stays 3600 s and the deferred wake-up 15 s.
+
+### TRB-070 evidence (2026-10-20, local Windows 11, Node 24.19.0, PostgreSQL 17, temporal-polyfill 1.0.5)
+
+Mock validation only. A fake clock drives the scheduler and execution. Scripted providers stand in for OpenAI and a recording sender for Telegram: no network call to either, no deployment, no commit. Local `.env` keeps `TELEGRAM_MODE=disabled` and `RESEARCH_MODE=disabled`. Behaviour: docs/SCHEDULING.md.
+
+| Check | Command | Result |
+|---|---|---|
+| Static checks | `npm run format:check`, `npm run lint`, `npm run typecheck`, `npm run prisma:validate` | Pass |
+| Unit tests | `npm test` | 203 passed (15 files). New: 12 recurrence/DST tests, research context (scheduled and rolling windows), card presentation |
+| Integration tests | `npm run test:integration` | 210 passed (15 files: 24 new scheduling scenarios, all earlier suites); 0 disposable databases left |
+| Build | `npm run build` | Pass |
+| Library behaviour | Temporal disambiguation probed on Kyiv 2026-03-29 03:30 and 2026-10-25 03:30, and New York 2026-03-08 | Gap: `compatible` and `later` give 04:30, `earlier` gives 02:30; none is the SPEC rule (04:00). The gap is therefore resolved explicitly to the transition instant. Overlap: `earlier` gives the earlier instant, as SPEC requires |
+| Dependency | `npm install --save-exact temporal-polyfill@1.0.5` (published 2026-09-11) | Pinned, lockfile updated; CommonJS-compatible |
+| Migration, isolated DB | global setup and `identity-migration.int-spec.ts` (all migrations on TRB-020 records) | Pass. Existing rows unchanged apart from the new column |
+| Migration, dev DB | `migrate deploy`, `migrate status`, `migrate diff --exit-code` | `20261020180000_trb_070_scheduling` applied without reset; "up to date"; no difference (exit 0). MD5 over run evidence (including `source_update_id`) and over deliveries identical before and after; 3 attempts kept. The dev DB has no tasks |
+| Mutation check | Each guard removed in turn; recurrence unit tests and `scheduling.int-spec.ts` rerun (script outside the repository) | 8 of 9 caught. Guards: revalidation of the due occurrence; inclusive 24 h bound; latest-only catch-up; denial coalescing; resume from the future; edit cancels queued work; quiet scheduled admission; explicit gap rule. Survived: removing only the revision part of the revalidation. It is redundant, because every schedule-changing action also changes `next_run_at`, the prompt is read under the task lock, and the final advance is conditional on the revision |
+| Docker smoke | Production image, disposable database, `RESEARCH_MODE=fake`, `TELEGRAM_MODE=disabled`, `BACKGROUND_WORKERS=on`, `SCHEDULER_POLL_INTERVAL_SECONDS=1`; a daily task due 5 minutes earlier and a weekly task without `next_run_at` | Readiness `queue: up`. The scheduler admitted the due occurrence once (`ADMITTED`, catch-up), and the run (`SCHEDULED`, no update ID) SUCCEEDED through pg-boss. The legacy task got a future `next_run_at` with no event or run, and both tasks' next runs are in the future. `docker stop` ended in 3 s with exit 0 and no error lines. Database and image removed. A first attempt failed in the smoke script's own SQL (a weekly row without weekday); it was fixed and rerun |
+
+Scenarios (`test/integration/scheduling.int-spec.ts`, 24 tests). Concurrency uses a separate PostgreSQL session holding the owner's identity advisory lock until the expected sessions wait (`pg_stat_activity`), and separate application instances:
+- **On-time occurrence (Kyiv daily 09:00).**
+  - One `ADMITTED` event (lateness 20 s), and a SCHEDULED run with `occurrence_at` and no update ID, its reservation and outbox event.
+  - Next run: the following day 09:00. Re-polling does nothing, and no acknowledgement is sent.
+  - The request contains the planned and actual times; the report shows "Заплановано на" without a delay notice.
+- **DST.**
+  - Kyiv 03:30 on 2026-03-29 is planned at 04:00 +03:00, and the next is 03:30 again.
+  - New York weekly Sunday 01:30 on 2026-11-01 runs once at EDT; the later 01:30 does nothing; the next is 2026-11-08 01:30 EST.
+- **Creation** through the dialog sets the next run (today 09:00); the card shows it, and saving starts nothing. The preview explains catch-up.
+- **Initialization.** A pre-existing active task gets the next future occurrence, a paused one none; no events or runs.
+- **Short outage.** A range record (3 occurrences) and one catch-up (lateness 3 600 s); next tomorrow.
+- **Long outage.**
+  - Daily since 2025-09-01: a range record of 413, and one catch-up.
+  - Weekly whose latest occurrence is 3 days old: a range of 6 and `CATCH_UP_WINDOW_EXCEEDED`, no run.
+  - One run in total; a second pass adds nothing.
+- **24 h boundary.** Exactly 24 h is admitted; 24 h + 1 min is skipped; both advance.
+- **Pause and resume.** Resume after 3 days gives the next future occurrence with no replay, events or runs.
+- **Denials.**
+  - Budget and missing pricing: one `SKIPPED_DENIED` per occurrence, advanced. A second pass at the same instant adds nothing, and the next day's denial is silent: one notice in total. No run, reservation or outbox event.
+  - Daily quota gives `DAILY_RUN_LIMIT`; a suspended member gives `SUSPENDED` with no notice.
+- **Overlap.** A queued manual run (Run now did not move the schedule) gives `SKIPPED_OVERLAP` referencing it, with no deferred work. A still-queued scheduled run makes the next day an overlap as well.
+- **Two schedulers** blocked on the same identity lock: one `ADMITTED`, one run, one reservation, one outbox event.
+- **Rollback.** An injected failure (trigger on `schedule_event`) leaves no run, reservation or outbox event and the occurrence due. The next pass admits it once.
+- **Crash after commit before publication.** After a restart the event is published and executed once, with no second event.
+- **Races.**
+  - A deletion committed by the lock-holding session while the scheduler waits wins: no event, no run.
+  - A stale candidate after a schedule edit through the dialog does nothing (`STALE`).
+- **Lifecycle of admitted work.**
+  - Pause or prompt edit cancels the queued scheduled run (`TASK_PAUSED`/`TASK_EDITED`), with ledger RESERVE + RELEASE, and nothing executes. Suspension cancels a member's queued scheduled run.
+  - A running scheduled run keeps its original prompt through an edit. After deletion it completes with its report SUPPRESSED (`TASK_DELETED`), and the task has no next run.
+- **Delayed run and recovery.**
+  - A run started two hours late uses the actual time (UTC and local 11:00, "started 120 minute(s) later").
+  - After a shutdown hand-over, another instance resumes the saved response with no new request, and the stored request is unchanged.
+  - The report discloses the delay.
+
+Earlier suites adapted:
+- The migration test ignores `occurrence_at`.
+- The research-slice snapshot expects policy `research-policy-2026-10-20.1`.
+- The card unit test expects the new schedule lines instead of the "not yet" note.
+
+Remaining limitations:
+- **Granularity.** A run starts up to one polling interval (30 s default) after its planned time, plus queue time.
+- **Capacity.** One global run at a time. A full queue or the active-run limit makes an occurrence `SKIPPED_DENIED`, by policy.
+- **Zone rules.** They come from the runtime's ICU data.
+- **History view.** No Telegram view of schedule history yet (TRB-080/090).
+- **Not run:** CI, any live OpenAI request or Telegram message, deployment.
+
 ## Release checklist
 
 - Exact model/tool compatibility verified in official docs and an authorized sample.

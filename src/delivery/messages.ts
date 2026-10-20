@@ -93,6 +93,9 @@ export const messages = {
   runNotFound: 'Запуск не знайдено.',
   runQueued: (runId: string) => `Запуск ${runId} у черзі.`,
   runRunning: (runId: string) => `Запуск ${runId} виконується.`,
+  scheduledForLabel: 'Заплановано на',
+  delayedBy: (minutes: number) =>
+    `виконано із затримкою ${minutes} хв; дані актуальні на час перевірки, а не на запланований час`,
   runFailed: (runId: string, code: string) =>
     `Запуск ${runId} завершився помилкою (${code}). Звіту немає.`,
   runUncertain: (runId: string, code: string, simulated: boolean) =>
