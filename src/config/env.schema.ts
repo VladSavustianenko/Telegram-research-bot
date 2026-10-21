@@ -188,6 +188,22 @@ export const envSchema = z
       (seconds) => seconds <= 300,
       'must be at most 300',
     ),
+    // Retention (TRB-090, docs/RETENTION.md). Cleanup is off unless the operator enables it;
+    // enabling it permanently removes stored content past these periods.
+    RETENTION_CLEANUP: z.preprocess(emptyAsUnset, z.enum(['on', 'off']).default('off')),
+    REPORT_RETENTION_DAYS: positiveIntWithDefault(30).refine(
+      (days) => days <= 3650,
+      'must be at most 3650',
+    ),
+    METADATA_RETENTION_DAYS: positiveIntWithDefault(90).refine(
+      (days) => days >= 7 && days <= 3650,
+      'must be between 7 and 3650 (inbox records also guard against replayed updates)',
+    ),
+    RETENTION_INTERVAL_SECONDS: positiveIntWithDefault(3600),
+    RETENTION_BATCH_SIZE: positiveIntWithDefault(50).refine(
+      (size) => size <= 500,
+      'must be at most 500',
+    ),
     // Delay before a run that could not start (capacity, fairness, live gate) is inspected again.
     RESEARCH_CAPACITY_RETRY_SECONDS: positiveIntWithDefault(15),
     // A queued run not started within this time is cancelled and its reservation released.

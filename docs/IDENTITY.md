@@ -247,7 +247,7 @@ Verified against a database containing representative TRB-020 records (`test/int
 - `USER_SUSPENDED` (counts);
 - `USER_REACTIVATED`.
 
-Viewing them is deferred to TRB-090.
+Since TRB-090 they are listed by `/admin audit`, with the new kinds `LIMIT_CHANGED` and `INVITATION_REVOKED` (docs/ADMINISTRATION.md).
 
 ## Deferred
 
@@ -256,5 +256,5 @@ Viewing them is deferred to TRB-090.
 | TRB-040 | `/settings` (changing the time zone after onboarding), task CRUD, persisted drafts |
 | TRB-050 | Budgets and quotas; then live research for members |
 | TRB-080 | Blocked-destination handling; a fresh `/start` revalidating the chat |
-| TRB-090 | Administration views (users, invitations, audit), invitation revocation, limits, retention |
+| TRB-090 | Administration views (users, invitations, audit), invitation revocation, limits, retention: implemented (docs/ADMINISTRATION.md, docs/RETENTION.md) |
 | TRB-100 | Webhook registration with `allowed_updates = ["message", "callback_query"]` |

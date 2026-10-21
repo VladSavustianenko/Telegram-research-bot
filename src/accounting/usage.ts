@@ -5,6 +5,7 @@ import { denialMessage } from '../delivery/messages';
 import type { AppUser } from '../generated/prisma/client';
 import { isAdministrator, userOperationDenial } from '../identity/authorization';
 import { usageTotals } from './ledger';
+import { effectiveLimits } from './limits';
 import { formatUsd, periodsOf } from './pricing';
 
 /**
@@ -24,6 +25,7 @@ export async function showUsage(
     return { disposition: 'REJECTED', reason: denial };
   }
   const { day, month } = periodsOf(input.now);
+  const limits = effectiveLimits(user, config);
   const counted = {
     userId: user.id,
     admittedDay: day,
@@ -37,13 +39,14 @@ export async function showUsage(
   ]);
   const lines = [
     `Облік за UTC: доба ${day}, місяць ${month}.`,
-    `Досліджень сьогодні: ${today} з ${config.USER_DAILY_RUN_LIMIT} (ручних: ${manualToday} з ${config.USER_DAILY_MANUAL_RUN_LIMIT}).`,
-    `Активних зараз: ${active} з ${config.USER_ACTIVE_RUN_LIMIT}.`,
+    `Досліджень сьогодні: ${today} з ${limits.dailyRuns} (ручних: ${manualToday} з ${limits.dailyManualRuns}; ручний ліміт не стосується запусків за розкладом).`,
+    `Активних зараз: ${active} з ${limits.activeRuns}.`,
     'Скасовані до звернення до провайдера запуски не враховуються.',
   ];
   if (config.RESEARCH_MODE === 'live' || reservations > 0) {
     const totals = await usageTotals(tx, month, user.id);
-    const budget = config.USER_MONTHLY_BUDGET_USD;
+    const budget =
+      config.USER_MONTHLY_BUDGET_USD === undefined ? undefined : limits.monthlyBudgetMicros;
     lines.push(
       '',
       `Live-витрати за ${month} (оцінки застосунку, не рахунок OpenAI):`,

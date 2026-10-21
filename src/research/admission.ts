@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { exposureMicros, registerPricing, reserve } from '../accounting/ledger';
+import { effectiveLimits } from '../accounting/limits';
 import { livePolicy, periodsOf, type ReservationPolicy } from '../accounting/pricing';
 import type { Env } from '../config/env.schema';
 import type { Tx } from '../database/prisma-errors';
@@ -75,6 +76,9 @@ export async function admitResearch(
     return { disposition: 'REJECTED', reason, ...(input.quiet ? { message: text } : {}) };
   };
   const scheduled = input.source.kind === 'schedule' ? input.source : null;
+  // The user row is held by the caller (identity lock, then the row), so a limit
+  // change committed before this admission is seen, and a later one waits for it.
+  const limits = effectiveLimits(user, config);
 
   // The task (if any) supplies the prompt and zone, read under its row lock.
   let prompt: string;
@@ -125,8 +129,8 @@ export async function admitResearch(
   const userActive = await tx.researchRun.count({
     where: { userId: user.id, state: { in: ['QUEUED', 'RUNNING'] } },
   });
-  if (userActive >= config.USER_ACTIVE_RUN_LIMIT) {
-    return refuse('USER_ACTIVE_LIMIT', messages.userActiveLimit(config.USER_ACTIVE_RUN_LIMIT));
+  if (userActive >= limits.activeRuns) {
+    return refuse('USER_ACTIVE_LIMIT', messages.userActiveLimit(limits.activeRuns));
   }
   const { day, month } = periodsOf(input.now);
   const counted = {
@@ -135,20 +139,17 @@ export async function admitResearch(
     // Runs cancelled before submission do not count against quotas.
     NOT: { state: 'CANCELLED' as const, submissionState: 'NOT_SUBMITTED' as const },
   };
-  if ((await tx.researchRun.count({ where: counted })) >= config.USER_DAILY_RUN_LIMIT) {
-    return refuse('DAILY_RUN_LIMIT', messages.dailyRunLimit(config.USER_DAILY_RUN_LIMIT));
+  if ((await tx.researchRun.count({ where: counted })) >= limits.dailyRuns) {
+    return refuse('DAILY_RUN_LIMIT', messages.dailyRunLimit(limits.dailyRuns));
   }
   // The manual-run quota applies to manual sources only (/research, Run now);
   // scheduled occurrences count against the total daily quota above.
   if (
     !scheduled &&
     (await tx.researchRun.count({ where: { ...counted, trigger: 'MANUAL' } })) >=
-      config.USER_DAILY_MANUAL_RUN_LIMIT
+      limits.dailyManualRuns
   ) {
-    return refuse(
-      'DAILY_MANUAL_LIMIT',
-      messages.dailyManualLimit(config.USER_DAILY_MANUAL_RUN_LIMIT),
-    );
+    return refuse('DAILY_MANUAL_LIMIT', messages.dailyManualLimit(limits.dailyManualRuns));
   }
 
   let policy: ReservationPolicy | null = null;
@@ -171,7 +172,7 @@ export async function admitResearch(
       await exposureMicros(tx, month, user.id),
       await exposureMicros(tx, month),
     ];
-    if (userExposure + reservation > (config.USER_MONTHLY_BUDGET_USD ?? 0n)) {
+    if (userExposure + reservation > (limits.monthlyBudgetMicros ?? 0n)) {
       return refuse('USER_BUDGET_EXHAUSTED', messages.budgetExhausted('user', month));
     }
     if (globalExposure + reservation > (config.GLOBAL_MONTHLY_BUDGET_USD ?? 0n)) {

@@ -38,7 +38,14 @@ export async function requestResultResend(
   }
   const run = await tx.researchRun.findFirst({
     where: { id: runId, ...visibleRunsOf(user.id) },
-    select: { id: true, state: true, failureCode: true, providerKind: true, reconciledAt: true },
+    select: {
+      id: true,
+      state: true,
+      failureCode: true,
+      providerKind: true,
+      reconciledAt: true,
+      contentPurgedAt: true,
+    },
   });
   if (!run) {
     await createStatusDelivery(tx, chatId, messages.runNotFound);
@@ -61,17 +68,42 @@ export async function requestResultResend(
     await createStatusDelivery(tx, chatId, text, run.id);
     return { disposition: 'RESULT_REQUESTED', reason: `RUN_${run.state}`, runId: run.id };
   }
+  if (run.contentPurgedAt) {
+    // Retention removed the report (TRB-090): nothing to resend, and no new research.
+    await createStatusDelivery(
+      tx,
+      chatId,
+      messages.resultExpired(run.id, config.REPORT_RETENTION_DAYS),
+      run.id,
+    );
+    return { disposition: 'RESULT_REQUESTED', reason: 'RESULT_EXPIRED', runId: run.id };
+  }
   const report = await tx.delivery.findFirst({
     where: { runId: run.id, kind: 'REPORT' },
     select: {
       state: true,
       parts: {
         orderBy: { ordinal: 'asc' },
-        select: { kind: true, html: true, fileName: true, fileContent: true },
+        select: {
+          kind: true,
+          html: true,
+          fileName: true,
+          fileContent: true,
+          contentPurgedAt: true,
+        },
       },
     },
   });
   if (!report) throw new Error('succeeded run without report delivery');
+  if (report.parts.some((part) => part.contentPurgedAt)) {
+    await createStatusDelivery(
+      tx,
+      chatId,
+      messages.resultExpired(run.id, config.REPORT_RETENTION_DAYS),
+      run.id,
+    );
+    return { disposition: 'RESULT_REQUESTED', reason: 'RESULT_EXPIRED', runId: run.id };
+  }
   if (report.state === 'UNKNOWN') {
     await createStatusDelivery(tx, chatId, messages.resendAfterUnknown(run.id), run.id);
   }

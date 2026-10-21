@@ -24,7 +24,7 @@ import { estimateRun, pricingHash, type ReservationPolicy } from './pricing';
  */
 
 type Entry = {
-  kind: 'RESERVE' | 'RELEASE' | 'SETTLE' | 'UNRESOLVED' | 'OVERRUN' | 'RESOLVE';
+  kind: 'RESERVE' | 'RELEASE' | 'SETTLE' | 'UNRESOLVED' | 'OVERRUN' | 'RESOLVE' | 'CORRECT';
   amount: bigint;
   key: string;
   basis: Record<string, unknown>;
@@ -433,6 +433,24 @@ export async function usageTotals(tx: Tx, month: string, userId?: string): Promi
       confirmedMicros: true,
     },
   });
+  return sumComponents(rows);
+}
+
+export interface ReservationAmounts {
+  status: 'RESERVED' | 'RELEASED' | 'SETTLED' | 'UNRESOLVED' | 'RESOLVED';
+  exposureMicros: bigint;
+  estimatedMicros: bigint | null;
+  uncertainMicros: bigint | null;
+  confirmedMicros: bigint | null;
+}
+
+/**
+ * The one definition of cost categories (TRB-050), shared by /usage, run
+ * history and the administrator views. A known partial estimate of an
+ * UNRESOLVED reservation is counted as estimated, and only the rest of its
+ * exposure as unresolved.
+ */
+export function sumComponents(rows: readonly ReservationAmounts[]): UsageTotals {
   const totals: UsageTotals = {
     reservedMicros: 0n,
     estimatedMicros: 0n,
@@ -448,7 +466,6 @@ export async function usageTotals(tx: Tx, month: string, userId?: string): Promi
       totals.unresolvedMicros += row.uncertainMicros ?? 0n;
     }
     if (row.status === 'UNRESOLVED') {
-      // A known partial estimate is shown as estimated; the rest of the exposure is unresolved.
       totals.estimatedMicros += row.estimatedMicros ?? 0n;
       totals.unresolvedMicros +=
         row.estimatedMicros === null ? row.exposureMicros : (row.uncertainMicros ?? 0n);
@@ -456,4 +473,57 @@ export async function usageTotals(tx: Tx, month: string, userId?: string): Promi
     if (row.status === 'RESOLVED') totals.confirmedMicros += row.confirmedMicros ?? 0n;
   }
   return totals;
+}
+
+/**
+ * Operator correction of an already RESOLVED amount (TRB-090), when later
+ * billing evidence differs. Appends a CORRECT entry with the operator, note and
+ * previous amount; earlier entries are never rewritten. The reservation stays
+ * RESOLVED with the new confirmed amount as its exposure. Each correction has
+ * its own operation key (sequence under the reservation's row lock); repeating
+ * the same amount is refused as a no-op.
+ */
+export async function correctResolution(
+  tx: Tx,
+  input: { runId: string; confirmedMicros: bigint; operator: string; note: string },
+): Promise<{ previousExposureMicros: bigint; exposureMicros: bigint; correction: number }> {
+  if (input.confirmedMicros < 0n) throw new AccountingResolutionError('NEGATIVE_AMOUNT');
+  if (!input.operator.trim() || !input.note.trim())
+    throw new AccountingResolutionError('OPERATOR_AND_NOTE_REQUIRED');
+  const reservation = await lockReservation(tx, input.runId);
+  if (!reservation) throw new AccountingResolutionError('NO_RESERVATION');
+  if (reservation.status !== 'RESOLVED') {
+    throw new AccountingResolutionError(`NOT_CORRECTABLE_${reservation.status}`);
+  }
+  if (reservation.exposureMicros === input.confirmedMicros) {
+    throw new AccountingResolutionError('SAME_AMOUNT');
+  }
+  const previous = await tx.usageLedger.count({
+    where: { reservationId: reservation.id, kind: 'CORRECT' },
+  });
+  const correction = previous + 1;
+  const updated = await tx.budgetReservation.updateMany({
+    where: { id: reservation.id, status: 'RESOLVED', exposureMicros: reservation.exposureMicros },
+    data: { exposureMicros: input.confirmedMicros, confirmedMicros: input.confirmedMicros },
+  });
+  if (updated.count !== 1) throw new AccountingResolutionError('CONCURRENT_CHANGE');
+  await writeEntries(tx, reservation, [
+    {
+      kind: 'CORRECT',
+      amount: input.confirmedMicros - reservation.exposureMicros,
+      key: `correct:${reservation.id}:${correction}`,
+      basis: {
+        operator: input.operator.trim(),
+        note: input.note.trim(),
+        previousExposureMicros: reservation.exposureMicros,
+        confirmedMicros: input.confirmedMicros,
+        correction,
+      },
+    },
+  ]);
+  return {
+    previousExposureMicros: reservation.exposureMicros,
+    exposureMicros: input.confirmedMicros,
+    correction,
+  };
 }

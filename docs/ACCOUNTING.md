@@ -198,7 +198,8 @@ Provider-terminal reconciliation and financial resolution are separate:
   - Resolution requires a finished run and an explicit amount (`0` must be typed), and is allowed **once**.
   - It sets RESOLVED with exposure equal to the confirmed amount and appends a `RESOLVE` entry with the operator, note and previous exposure.
   - It never contacts OpenAI or Telegram, and never changes the run.
-  - Corrections after resolution are not supported yet (TRB-090).
+  - Corrections after resolution (TRB-090): `npm run ops:accounting -- --correct --run <id> --confirmed-usd <amount> --operator <name> --note "<evidence>"` appends a `CORRECT` entry (previous amount, operator, note, correction number); earlier entries are never rewritten (docs/ADMINISTRATION.md).
+  - Per-user budget overrides and retention: docs/ADMINISTRATION.md and docs/RETENTION.md. Cleanup never deletes or changes reservations or ledger entries.
 
 **Procedure:**
 1. Find the run's response ID and submission time (`--list`).

@@ -32,18 +32,20 @@ enum TelegramUpdateDisposition {
 /// One row per Telegram update_id; inserting it is the deduplication step.
 /// Stores no message text.
 model TelegramUpdate {
-  updateId         BigInt                    @id @map("update_id")
-  senderTelegramId BigInt?                   @map("sender_telegram_id")
-  chatType         String?                   @map("chat_type")
-  disposition      TelegramUpdateDisposition
-  reason           String?
-  runId            String?                   @map("run_id") @db.Uuid
-  receivedAt       DateTime                  @default(now()) @map("received_at") @db.Timestamptz(3)
+  updateId            BigInt                    @id @map("update_id")
+  senderTelegramId    BigInt?                   @map("sender_telegram_id")
+  chatType            String?                   @map("chat_type")
+  disposition         TelegramUpdateDisposition
+  reason              String?
+  runId               String?                   @map("run_id") @db.Uuid
+  receivedAt          DateTime                  @default(now()) @map("received_at") @db.Timestamptz(3)
   /// TRB-080 follow-up: the update passed the transport checks (the sender's own
   /// private chat, a non-bot sender, a supported message or button) and was routed
   /// as the sender's interaction. Only such updates prove the private chat works.
-  privateChatVerified Boolean                @default(false) @map("private_chat_verified")
+  privateChatVerified Boolean                   @default(false) @map("private_chat_verified")
 
+  /// TRB-090 retention: inbox records are deleted by age.
+  @@index([receivedAt], map: "telegram_update_received_at")
   @@map("telegram_update")
 }
 
@@ -135,6 +137,9 @@ model ResearchRun {
   /// Set only by operator reconciliation of an UNCERTAIN run; the run keeps its
   /// state, failure code, response ID and usage as evidence.
   reconciledAt              DateTime?               @map("reconciled_at") @db.Timestamptz(3)
+  /// TRB-090 retention: prompt, request text, report text, citations and sources were
+  /// removed (docs/RETENTION.md); accounting and outcome metadata remain.
+  contentPurgedAt           DateTime?               @map("content_purged_at") @db.Timestamptz(3)
   reconciliation            ResearchReconciliation?
   /// Durable suspension decision (TRB-030): set when the owner is suspended while the
   /// run is queued or running. Automatic deliveries for this run are created
@@ -198,38 +203,38 @@ enum DeliveryPartKind {
 }
 
 model Delivery {
-  id            String         @id @default(uuid()) @db.Uuid
+  id                        String          @id @default(uuid()) @db.Uuid
   /// TRB-080: creation order; deliveries to one chat are sent in this order.
-  seq           BigInt         @unique @default(autoincrement())
-  runId         String?        @map("run_id") @db.Uuid
-  run           ResearchRun?   @relation(fields: [runId], references: [id])
-  kind          DeliveryKind
-  chatId        BigInt         @map("chat_id")
-  state         DeliveryState  @default(PENDING)
-  attempts      Int            @default(0)
-  nextAttemptAt DateTime       @default(now()) @map("next_attempt_at") @db.Timestamptz(3)
-  leaseOwner    String?        @map("lease_owner")
-  leaseUntil    DateTime?      @map("lease_until") @db.Timestamptz(3)
-  fencingToken  Int            @default(0) @map("fencing_token")
-  lastErrorCode String?        @map("last_error_code")
+  seq                       BigInt          @unique @default(autoincrement())
+  runId                     String?         @map("run_id") @db.Uuid
+  run                       ResearchRun?    @relation(fields: [runId], references: [id])
+  kind                      DeliveryKind
+  chatId                    BigInt          @map("chat_id")
+  state                     DeliveryState   @default(PENDING)
+  attempts                  Int             @default(0)
+  nextAttemptAt             DateTime        @default(now()) @map("next_attempt_at") @db.Timestamptz(3)
+  leaseOwner                String?         @map("lease_owner")
+  leaseUntil                DateTime?       @map("lease_until") @db.Timestamptz(3)
+  fencingToken              Int             @default(0) @map("fencing_token")
+  lastErrorCode             String?         @map("last_error_code")
   /// Durable suppression decision: once set the delivery never sends another part
   /// (a part already handed to Telegram may still complete). Never cleared.
-  suppressedAt  DateTime?      @map("suppressed_at") @db.Timestamptz(3)
+  suppressedAt              DateTime?       @map("suppressed_at") @db.Timestamptz(3)
   /// TRB-080 review fix: Telegram confirmed this chat unavailable when sending this
   /// delivery (BOT_BLOCKED, USER_DEACTIVATED) at destination_refused_at. Durable
   /// evidence of the decision; destination_block_applied_at is set once its
   /// effects (or its supersession by a later message from the user) are committed.
-  destinationBlockReason    String?   @map("destination_block_reason")
-  destinationRefusedAt      DateTime? @map("destination_refused_at") @db.Timestamptz(3)
-  destinationBlockAppliedAt DateTime? @map("destination_block_applied_at") @db.Timestamptz(3)
+  destinationBlockReason    String?         @map("destination_block_reason")
+  destinationRefusedAt      DateTime?       @map("destination_refused_at") @db.Timestamptz(3)
+  destinationBlockAppliedAt DateTime?       @map("destination_block_applied_at") @db.Timestamptz(3)
   /// Set only for kind INVITATION.
-  invitationId  String?        @map("invitation_id") @db.Uuid
-  invitation    Invitation?    @relation(fields: [invitationId], references: [id], onDelete: Restrict)
-  createdAt     DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt     DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
-  parts         DeliveryPart[]
+  invitationId              String?         @map("invitation_id") @db.Uuid
+  invitation                Invitation?     @relation(fields: [invitationId], references: [id], onDelete: Restrict)
+  createdAt                 DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt                 DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
+  parts                     DeliveryPart[]
   /// TRB-080: durable wake-ups published to the delivery queue (docs/DELIVERY.md).
-  events        DeliveryEvent[]
+  events                    DeliveryEvent[]
 
   @@index([state, nextAttemptAt])
   @@map("delivery")
@@ -255,6 +260,9 @@ model DeliveryPart {
   sentAt            DateTime?         @map("sent_at") @db.Timestamptz(3)
   /// Send intent: when the part was marked SENDING, right before the Telegram call.
   sendStartedAt     DateTime?         @map("send_started_at") @db.Timestamptz(3)
+  /// TRB-090 retention: the payload (HTML, buttons, file text) was removed; the
+  /// content hash, state and Telegram message ID remain as evidence.
+  contentPurgedAt   DateTime?         @map("content_purged_at") @db.Timestamptz(3)
   /// Last classified failure of this part (Telegram error code), if any.
   errorCode         String?           @map("error_code")
 
@@ -352,40 +360,48 @@ enum OnboardingState {
 /// A Telegram user known to the bot. Identity is the immutable Telegram user ID
 /// (a trigger rejects changes); usernames and display names are not stored.
 model AppUser {
-  id                 String              @id @default(uuid()) @db.Uuid
-  telegramUserId     BigInt              @unique @map("telegram_user_id")
+  id                       String              @id @default(uuid()) @db.Uuid
+  telegramUserId           BigInt              @unique @map("telegram_user_id")
   /// Private chat with the bot, recorded from the user's own private messages.
-  privateChatId      BigInt?             @map("private_chat_id")
+  privateChatId            BigInt?             @map("private_chat_id")
   /// Mirror of ADMIN_TELEGRAM_IDS, which is authoritative (synchronized at startup
   /// and on each update from the user). Invitations never grant ADMIN.
-  role               UserRole            @default(MEMBER)
-  status             UserStatus          @default(ACTIVE)
-  onboardingState    OnboardingState     @default(AWAITING_TIME_ZONE) @map("onboarding_state")
+  role                     UserRole            @default(MEMBER)
+  status                   UserStatus          @default(ACTIVE)
+  onboardingState          OnboardingState     @default(AWAITING_TIME_ZONE) @map("onboarding_state")
   /// Confirmed IANA time zone; required once onboarding is COMPLETED.
-  timeZone           String?             @map("time_zone")
+  timeZone                 String?             @map("time_zone")
   /// Incremented on every onboarding or lifecycle change; callbacks carry it, so stale buttons do nothing.
-  revision           Int                 @default(0)
+  revision                 Int                 @default(0)
   /// Set when the user redeemed an invitation. Members need it; administrators do not.
-  invitedAt          DateTime?           @map("invited_at") @db.Timestamptz(3)
-  onboardedAt        DateTime?           @map("onboarded_at") @db.Timestamptz(3)
-  suspendedAt        DateTime?           @map("suspended_at") @db.Timestamptz(3)
+  invitedAt                DateTime?           @map("invited_at") @db.Timestamptz(3)
+  onboardedAt              DateTime?           @map("onboarded_at") @db.Timestamptz(3)
+  suspendedAt              DateTime?           @map("suspended_at") @db.Timestamptz(3)
   /// TRB-080: Telegram confirmed the private chat cannot receive messages (bot
   /// blocked, account deactivated). Automatic research is paused; cleared only
   /// when the user writes to the bot again (docs/DELIVERY.md).
-  chatBlockedAt      DateTime?           @map("chat_blocked_at") @db.Timestamptz(3)
-  chatBlockReason    String?             @map("chat_block_reason")
-  createdAt          DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt          DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
-  runs               ResearchRun[]
-  invitationsCreated Invitation[]        @relation("InvitationCreator")
-  invitationRedeemed Invitation?         @relation("InvitationRedeemer")
-  auditAsActor       AuditEvent[]        @relation("AuditActor")
-  auditAsSubject     AuditEvent[]        @relation("AuditSubject")
-  tasks              Task[]
-  taskDraft          TaskDraft?
-  reservations       BudgetReservation[]
-  ledgerEntries      UsageLedger[]
-  scheduleEvents     ScheduleEvent[]
+  chatBlockedAt            DateTime?           @map("chat_blocked_at") @db.Timestamptz(3)
+  chatBlockReason          String?             @map("chat_block_reason")
+  /// TRB-090: per-user limit overrides (null: the environment default applies).
+  /// Resolution: src/accounting/limits.ts, docs/ADMINISTRATION.md.
+  limitSavedTasks          Int?                @map("limit_saved_tasks")
+  limitActiveTasks         Int?                @map("limit_active_tasks")
+  limitDailyRuns           Int?                @map("limit_daily_runs")
+  limitDailyManualRuns     Int?                @map("limit_daily_manual_runs")
+  limitActiveRuns          Int?                @map("limit_active_runs")
+  limitMonthlyBudgetMicros BigInt?             @map("limit_monthly_budget_micros")
+  createdAt                DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt                DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
+  runs                     ResearchRun[]
+  invitationsCreated       Invitation[]        @relation("InvitationCreator")
+  invitationRedeemed       Invitation?         @relation("InvitationRedeemer")
+  auditAsActor             AuditEvent[]        @relation("AuditActor")
+  auditAsSubject           AuditEvent[]        @relation("AuditSubject")
+  tasks                    Task[]
+  taskDraft                TaskDraft?
+  reservations             BudgetReservation[]
+  ledgerEntries            UsageLedger[]
+  scheduleEvents           ScheduleEvent[]
 
   @@map("app_user")
 }
@@ -401,6 +417,9 @@ model Invitation {
   redeemedByUserId String?      @unique @map("redeemed_by_user_id") @db.Uuid
   redeemedBy       AppUser?     @relation("InvitationRedeemer", fields: [redeemedByUserId], references: [id], onDelete: Restrict)
   redeemedAt       DateTime?    @map("redeemed_at") @db.Timestamptz(3)
+  /// TRB-090: revoked by an administrator before redemption; never redeemable afterwards.
+  revokedAt        DateTime?    @map("revoked_at") @db.Timestamptz(3)
+  revokedByUserId  String?      @map("revoked_by_user_id") @db.Uuid
   createdAt        DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
   deliveries       Delivery[]
   auditEvents      AuditEvent[]
@@ -419,6 +438,10 @@ enum AuditEventKind {
   DESTINATION_BLOCKED
   /// TRB-080: the user wrote to the bot again after a confirmed block.
   DESTINATION_RESTORED
+  /// TRB-090: an administrator set or cleared a per-user limit override.
+  LIMIT_CHANGED
+  /// TRB-090: an administrator revoked an unredeemed invitation.
+  INVITATION_REVOKED
 }
 
 /// Append-only access audit (UPDATE and DELETE are rejected by a trigger).
@@ -478,6 +501,8 @@ model Task {
   /// Next planned occurrence (UTC) of an active daily/weekly task; null otherwise (TRB-070).
   nextRunAt          DateTime?       @map("next_run_at") @db.Timestamptz(3)
   deletedAt          DateTime?       @map("deleted_at") @db.Timestamptz(3)
+  /// TRB-090 retention: name and prompt of a deleted task were removed.
+  contentPurgedAt    DateTime?       @map("content_purged_at") @db.Timestamptz(3)
   createdAt          DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt          DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
   drafts             TaskDraft[]
@@ -616,6 +641,8 @@ enum LedgerKind {
   UNRESOLVED
   OVERRUN
   RESOLVE
+  /// TRB-090: an operator correction of a RESOLVED amount (later billing evidence).
+  CORRECT
 }
 
 /// Append-only accounting evidence (UPDATE and DELETE are rejected by a trigger).

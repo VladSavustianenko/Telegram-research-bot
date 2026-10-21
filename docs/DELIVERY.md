@@ -179,7 +179,7 @@ A malformed callback, or an ID that does not decode to exactly 16 canonical byte
 - **Owner-scoped queries.** Every query uses `user_id` together with the object ID.
 - **No disclosure.** Foreign and nonexistent run IDs both get "Запуск не знайдено."; foreign and deleted tasks both get "Завдання не знайдено.".
 - **Deleted tasks.** Runs of deleted tasks are hidden everywhere: history, run cards, latest result, the resend button and `/result`. This follows TASKS.md: actions on deleted tasks answer like a nonexistent task. Before TRB-080, `/result` still resent them; that is now closed.
-- **Out of scope.** No administration view or retention cleanup is added (TRB-090).
+- **Out of scope here.** Administration views and retention cleanup came with TRB-090 (docs/ADMINISTRATION.md, docs/RETENTION.md). A purged result answers that it is no longer available.
 
 ## Explicit resend
 
@@ -273,5 +273,5 @@ All values are proposals.
 - **One-part race.** A suspension, deletion or block committed while a part is in flight cannot stop that part.
 - **Head-of-line waiting.** Per-chat order means a delivery waiting for a retry holds back later messages to the same chat, at most until its retry ends: the full Retry-After (up to 30 days), or 5 claims.
 - **Auto-linking.** Telegram clients may auto-link bare URLs written by the model; they are not presented as sources.
-- **No retention.** Deleted-task content is hidden, not purged; retention is TRB-090.
+- **Retention (TRB-090).** When cleanup is enabled, delivery payloads are emptied after the retention period through the one allowed purge path; states, message IDs and hashes stay. Waiting copies of an expired run end `SUPPRESSED / CONTENT_EXPIRED` (docs/RETENTION.md).
 - **Mock validation only.** Telegram behaviour was validated with a recording sender and scripted errors. No real Telegram message was sent, so the classification relies on the documented contract and grammY's error types.

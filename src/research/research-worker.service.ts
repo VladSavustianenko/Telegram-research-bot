@@ -9,6 +9,7 @@ import {
   Optional,
 } from '@nestjs/common';
 import { exposureMicros, reserve, settleRun, type RunAccounting } from '../accounting/ledger';
+import { effectiveLimits } from '../accounting/limits';
 import type { ReservationPolicy } from '../accounting/pricing';
 import { abortableSleep } from '../common/abortable-sleep';
 import { CLOCK, type Clock } from '../common/clock';
@@ -572,9 +573,16 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
       select: { userId: true, periodMonth: true, policy: true },
     });
     if (!first) return 'ACCOUNTING_MISSING';
-    const userBudget = this.config.USER_MONTHLY_BUDGET_USD;
+    // The owner's effective budget (override or default), read under the owner's row lock.
+    const userBudget = effectiveLimits(owner, this.config).monthlyBudgetMicros;
     const globalBudget = this.config.GLOBAL_MONTHLY_BUDGET_USD;
-    if (userBudget === undefined || globalBudget === undefined) return 'BUDGETS_NOT_CONFIGURED';
+    if (
+      userBudget === undefined ||
+      globalBudget === undefined ||
+      this.config.USER_MONTHLY_BUDGET_USD === undefined
+    ) {
+      return 'BUDGETS_NOT_CONFIGURED';
+    }
     const policy = first.policy as unknown as ReservationPolicy;
     const reservation = BigInt(policy.reservedMicros);
     if ((await exposureMicros(tx, first.periodMonth, first.userId)) + reservation > userBudget) {

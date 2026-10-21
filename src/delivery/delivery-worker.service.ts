@@ -269,6 +269,11 @@ export class DeliveryWorker implements OnApplicationBootstrap, OnModuleDestroy {
         await this.handOver(claim);
         return 'stopped';
       }
+      if (part.contentPurgedAt) {
+        // Retention removed the payload (TRB-090): never send an empty or partial message.
+        await this.finish(claim, 'SUPPRESSED', 'CONTENT_EXPIRED', true);
+        return 'stopped';
+      }
       const denial = await this.denial(claim);
       if (denial) {
         this.logger.log({ message: 'Delivery suppressed', deliveryId: claim.id, code: denial });
@@ -574,10 +579,16 @@ export class DeliveryWorker implements OnApplicationBootstrap, OnModuleDestroy {
     if (!secret || !claim.invitationId) return null;
     const invitation = await this.prisma.invitation.findUnique({
       where: { id: claim.invitationId },
-      select: { tokenHash: true },
+      select: { tokenHash: true, revokedAt: true },
     });
     const token = deriveInvitationToken(secret, claim.invitationId);
-    if (!invitation || hashInvitationToken(token) !== invitation.tokenHash) return null;
+    if (
+      !invitation ||
+      invitation.revokedAt ||
+      hashInvitationToken(token) !== invitation.tokenHash
+    ) {
+      return null;
+    }
     return html.split(INVITATION_TOKEN_PLACEHOLDER).join(token);
   }
 

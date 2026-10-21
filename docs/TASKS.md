@@ -52,7 +52,7 @@ Creation steps: **name → prompt → schedule kind (Вручну / Щодня /
 - **An expired draft is never resumed or saved.** The next interaction with it ends it and says so. This applies to text, a draft button, `/new`, or starting an edit:
   - "Чернетку нового завдання прострочено (24 год без змін); нічого не збережено. Почніть знову: /new"
   - "Чернетку редагування прострочено…; завдання не змінено."
-- **Abandoned drafts.** An expired draft left untouched stays in the table until the user's next interaction; retention cleanup belongs to TRB-090.
+- **Abandoned drafts.** An expired draft left untouched stays in the table until the user's next interaction; retention cleanup belongs to TRB-090. Since TRB-090, when cleanup is enabled, expired drafts are deleted and deleted tasks' names and prompts are redacted after the retention period (docs/RETENTION.md).
 - **Resumption.** `/new` (or a card's edit button) while a draft is open offers to continue it or to discard it explicitly. "Продовжити" re-sends the current step with fresh buttons.
 
 ## Revisions and stale actions
@@ -93,7 +93,7 @@ Creation steps: **name → prompt → schedule kind (Вручну / Щодня /
   2. If the task changed after the confirmation was requested, the confirmation does nothing and the current card is shown.
   3. Otherwise the task is **soft-deleted**: state `DELETED`, `deleted_at` set, revision incremented.
 - **Deleted tasks** disappear from `/tasks` and cards. Every action on them answers like a nonexistent task. An edit draft targeting one ends safely at its next interaction.
-- **Preserved.** Nothing cascades: foreign keys are `RESTRICT`, and research runs, reports, deliveries and audit records are untouched. Purging deleted content is TRB-090 retention.
+- **Preserved.** Nothing cascades: foreign keys are `RESTRICT`, and research runs, reports, deliveries and audit records are untouched. Purging deleted content is TRB-090 retention (docs/RETENTION.md).
 
 ## Ownership
 

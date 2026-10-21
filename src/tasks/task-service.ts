@@ -1,5 +1,6 @@
 import type { Env } from '../config/env.schema';
 import type { Tx } from '../database/prisma-errors';
+import { effectiveLimits } from '../accounting/limits';
 import { createDelivery } from '../delivery/delivery-records';
 import { denialMessage } from '../delivery/messages';
 import { escapeHtml } from '../delivery/telegram-html';
@@ -167,8 +168,8 @@ async function counts(ctx: TaskContext) {
   return {
     saved,
     active,
-    savedLimit: ctx.config.TASK_SAVED_LIMIT,
-    activeLimit: ctx.config.TASK_ACTIVE_LIMIT,
+    savedLimit: limitsOfUser(ctx).savedTasks,
+    activeLimit: limitsOfUser(ctx).activeTasks,
   };
 }
 
@@ -258,7 +259,7 @@ async function setPaused(ctx: TaskContext, task: Task, pause: boolean): Promise<
       taskCardView(task, pause ? 'Завдання вже на паузі.' : 'Завдання вже активне.'),
     );
   }
-  if (!pause && (await counts(ctx)).active >= ctx.config.TASK_ACTIVE_LIMIT) {
+  if (!pause && (await counts(ctx)).active >= limitsOfUser(ctx).activeTasks) {
     return reply(ctx, 'REJECTED', 'TASK_LIMIT_ACTIVE', taskCardView(task, activeLimitText(ctx)));
   }
   const updated = await ctx.tx.task.updateMany({
@@ -323,10 +324,13 @@ async function deleteTask(ctx: TaskContext, task: Task): Promise<TaskOutcome> {
   return { ...outcome, reason: 'TASK_DELETED' };
 }
 
+/** Effective task limits of the sender (TRB-090): override or default, from the locked user row. */
+const limitsOfUser = (ctx: TaskContext) => effectiveLimits(ctx.user, ctx.config);
+
 const activeLimitText = (ctx: TaskContext) =>
-  `Досягнуто ліміту активних завдань (${ctx.config.TASK_ACTIVE_LIMIT}). Призупиніть або видаліть інше завдання.`;
+  `Досягнуто ліміту активних завдань (${limitsOfUser(ctx).activeTasks}). Призупиніть або видаліть інше завдання.`;
 const savedLimitText = (ctx: TaskContext) =>
-  `Досягнуто ліміту збережених завдань (${ctx.config.TASK_SAVED_LIMIT}). Видаліть непотрібне завдання.`;
+  `Досягнуто ліміту збережених завдань (${limitsOfUser(ctx).savedTasks}). Видаліть непотрібне завдання.`;
 
 // ---------------------------------------------------------------------------
 // Drafts
@@ -446,7 +450,7 @@ export async function startCreate(ctx: TaskContext): Promise<TaskOutcome> {
   } else if (open) {
     return reply(ctx, 'REPLIED', 'DRAFT_EXISTS', draftConflictView(viewOf(open.draft), 'new'));
   }
-  if ((await counts(ctx)).saved >= ctx.config.TASK_SAVED_LIMIT) {
+  if ((await counts(ctx)).saved >= limitsOfUser(ctx).savedTasks) {
     return reply(ctx, 'REJECTED', 'TASK_LIMIT_SAVED', { text: savedLimitText(ctx) });
   }
   const draft = await insertDraft(ctx, {
@@ -622,10 +626,10 @@ async function saveCreate(ctx: TaskContext, draft: DraftRow): Promise<TaskOutcom
   if (!config)
     return previewOnly(ctx, draft, 'DRAFT_INCOMPLETE', 'Чернетка неповна; перевірте кроки.');
   const total = await counts(ctx);
-  if (total.saved >= ctx.config.TASK_SAVED_LIMIT) {
+  if (total.saved >= limitsOfUser(ctx).savedTasks) {
     return previewOnly(ctx, draft, 'TASK_LIMIT_SAVED', savedLimitText(ctx));
   }
-  if (total.active >= ctx.config.TASK_ACTIVE_LIMIT) {
+  if (total.active >= limitsOfUser(ctx).activeTasks) {
     return previewOnly(ctx, draft, 'TASK_LIMIT_ACTIVE', activeLimitText(ctx));
   }
   const task = await ctx.tx.task.create({

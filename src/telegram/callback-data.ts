@@ -14,6 +14,9 @@
  *                                 the sender's runs); o/n = the page older/newer than <run>
  *   r:<run>:<scope>               the card of one of the sender's runs, opened from <scope>
  *   rs:<run>                      explicit resend of the sender's stored result
+ *   au:<page>                     administrator: user list page (TRB-090)
+ *   av:<user>                     administrator: one user's view
+ *   ax:<user>:<revision>:<s|r>    administrator: suspend / reactivate the user at <revision>
  * In h/r/rs, IDs are UUIDs in base64url form (22 characters) to fit the limit.
  */
 const MAX_CALLBACK_BYTES = 64;
@@ -26,6 +29,9 @@ const LIST_CALLBACK = /^tl:(0|[1-9]\d{0,3})$/;
 const HISTORY_CALLBACK = /^h:(\*|[A-Za-z0-9_-]{22})(?::([on]):([A-Za-z0-9_-]{22}))?$/;
 const RUN_CALLBACK = /^r:([A-Za-z0-9_-]{22}):(\*|[A-Za-z0-9_-]{22})$/;
 const RESEND_CALLBACK = /^rs:([A-Za-z0-9_-]{22})$/;
+const ADMIN_LIST_CALLBACK = /^au:(0|[1-9]\d{0,3})$/;
+const ADMIN_USER_CALLBACK = /^av:([A-Za-z0-9_-]{22})$/;
+const ADMIN_ACCESS_CALLBACK = /^ax:([A-Za-z0-9_-]{22}):(0|[1-9]\d{0,8}):([sr])$/;
 
 /**
  * Draft operations: b back, x cancel, k keep the current value, s save,
@@ -55,7 +61,10 @@ export type CallbackAction =
   | { kind: 'task_new' }
   | { kind: 'history'; scope: HistoryScope; cursor: HistoryCursor | null }
   | { kind: 'run'; runId: string; scope: HistoryScope }
-  | { kind: 'resend'; runId: string };
+  | { kind: 'resend'; runId: string }
+  | { kind: 'admin_users'; page: number }
+  | { kind: 'admin_user'; userId: string }
+  | { kind: 'admin_access'; userId: string; revision: number; op: 'suspend' | 'reactivate' };
 
 function bounded(data: string): string {
   if (Buffer.byteLength(data) > MAX_CALLBACK_BYTES) throw new Error('callback data too long');
@@ -127,6 +136,24 @@ export function runCallbackData(runId: string, scope: HistoryScope): string {
   return bounded(`r:${compactId(runId)}:${scopeToken(scope)}`);
 }
 
+export function adminUsersCallbackData(page: number): string {
+  const data = `au:${page}`;
+  if (!ADMIN_LIST_CALLBACK.test(data)) throw new Error('admin list callback data out of bounds');
+  return data;
+}
+
+export function adminUserCallbackData(userId: string): string {
+  return bounded(`av:${compactId(userId)}`);
+}
+
+export function adminAccessCallbackData(
+  userId: string,
+  revision: number,
+  op: 'suspend' | 'reactivate',
+): string {
+  return bounded(`ax:${compactId(userId)}:${revision}:${op === 'suspend' ? 's' : 'r'}`);
+}
+
 export function resendCallbackData(runId: string): string {
   return bounded(`rs:${compactId(runId)}`);
 }
@@ -174,6 +201,25 @@ export function parseCallbackData(data: string | null): CallbackAction | null {
     const runId = expandId(match[1] ?? '');
     const scope = parseScope(match[2] ?? '');
     return runId && scope ? { kind: 'run', runId, scope } : null;
+  }
+  match = ADMIN_LIST_CALLBACK.exec(data);
+  if (match) return { kind: 'admin_users', page: Number(match[1]) };
+  match = ADMIN_USER_CALLBACK.exec(data);
+  if (match) {
+    const userId = expandId(match[1] ?? '');
+    return userId ? { kind: 'admin_user', userId } : null;
+  }
+  match = ADMIN_ACCESS_CALLBACK.exec(data);
+  if (match) {
+    const userId = expandId(match[1] ?? '');
+    return userId
+      ? {
+          kind: 'admin_access',
+          userId,
+          revision: Number(match[2]),
+          op: match[3] === 's' ? 'suspend' : 'reactivate',
+        }
+      : null;
   }
   match = RESEND_CALLBACK.exec(data);
   if (match) {

@@ -12,7 +12,7 @@ import { restoreDestination } from '../delivery/destination';
 import { resendFromHistory, showHistory, showRun } from '../delivery/history';
 import { requestResultResend } from '../delivery/result-resend';
 import type { AppUser } from '../generated/prisma/client';
-import { runAdminCommand } from '../identity/admin-actions';
+import { runAdminCallback, runAdminCommand } from '../identity/admin-actions';
 import { accountAccess, isAdministrator, mayRedeemInvitation } from '../identity/authorization';
 import { redeemInvitation } from '../identity/invitations';
 import { confirmTimeZone, timeZoneKeyboard } from '../identity/onboarding';
@@ -190,6 +190,7 @@ export class TelegramIngressService {
         actor: user,
         chatId: update.chatId,
         args: command.args,
+        now: this.clock.now(),
       });
     }
 
@@ -225,6 +226,17 @@ export class TelegramIngressService {
         return showTasks(this.taskContext(context, user));
       case 'history':
         return showHistory(this.taskContext(context, user), 'all');
+      case 'privacy':
+        return this.reply(
+          context,
+          'REPLIED',
+          'PRIVACY',
+          messages.privacy({
+            live: this.config.RESEARCH_MODE === 'live',
+            days: this.config.REPORT_RETENTION_DAYS,
+            cleanup: this.config.RETENTION_CLEANUP === 'on',
+          }),
+        );
       case 'new':
         return startCreate(this.taskContext(context, user));
       case 'cancel':
@@ -356,6 +368,19 @@ export class TelegramIngressService {
     }
     if (access === 'SUSPENDED') {
       return { disposition: 'REJECTED', reason: 'SUSPENDED', callbackAnswer: messages.suspended };
+    }
+    if (
+      action.kind === 'admin_users' ||
+      action.kind === 'admin_user' ||
+      action.kind === 'admin_access'
+    ) {
+      // Administrator buttons: authorized by the service (onboarding not required).
+      return runAdminCallback(tx, this.config, {
+        actor: user,
+        chatId: update.chatId,
+        now: this.clock.now(),
+        action,
+      });
     }
     if (action.kind !== 'confirm_time_zone') {
       // Task and draft buttons need a completed account; services recheck access.

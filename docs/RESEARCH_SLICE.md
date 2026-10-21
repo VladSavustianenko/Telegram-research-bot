@@ -168,7 +168,7 @@ Entering a budget amount without turning on "Enforce a hard limit" leaves only n
 | TRB-050 | Budget reservations, pricing snapshots, usage ledger, quotas, retries with fresh reservation |
 | TRB-060 | Done in TRB-060 (READY FOR REVIEW): pg-boss with outbox, attempts table, bounded retry policy, fair dispatch. Process roles remain for TRB-100 |
 | TRB-080 | Full-text document fallback, history, blocked-destination handling that pauses automatic work |
-| TRB-090 | Retention cleanup: prompts and reports are currently stored without automatic purge |
+| TRB-090 | Retention cleanup: implemented, off by default (docs/RETENTION.md) |
 | TRB-100 | Webhook registration runbook, migration release step (the runtime image has no Prisma CLI), deployment |
 
 ## Authorized live sample procedure (performed 2026-10-19)

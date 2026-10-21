@@ -13,6 +13,7 @@ import { QueueService } from '../../src/queue/queue.service';
 import { OutboxDispatcher } from '../../src/research/outbox-dispatcher';
 import { RESEARCH_PROVIDER } from '../../src/research/provider/provider.types';
 import { ResearchWorker } from '../../src/research/research-worker.service';
+import { RetentionService } from '../../src/retention/retention.service';
 import { SchedulerService } from '../../src/scheduling/scheduler.service';
 import { TELEGRAM_SENDER } from '../../src/telegram/telegram-sender';
 import { FakeClock, RecordingSender, ScriptedProvider } from './fakes';
@@ -63,6 +64,7 @@ export interface Harness {
   dispatcher: OutboxDispatcher;
   delivery: DeliveryWorker;
   deliveryDispatcher: DeliveryDispatcher;
+  retention: RetentionService;
   provider: ScriptedProvider;
   sender: RecordingSender;
   clock: FakeClock;
@@ -125,6 +127,7 @@ export async function startHarness(
     dispatcher: app.get(OutboxDispatcher),
     delivery: app.get(DeliveryWorker),
     deliveryDispatcher: app.get(DeliveryDispatcher),
+    retention: app.get(RetentionService),
     provider,
     sender,
     clock,

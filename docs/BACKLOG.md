@@ -99,7 +99,7 @@ Implement durable chunks, separate delivery queue, citation rendering, Unicode-s
 
 Acceptance: Telegram failure does not invoke OpenAI; confirmed parts are not resent after restart; uncertain sends become UNKNOWN; malicious HTML/URLs cannot alter markup; long Unicode results retain citations; blocked chat pauses automatic research; resend costs no research quota; all history actions enforce ownership.
 
-Status: READY FOR REVIEW (2026-10-20). Mock validation only: recording/scripted Telegram sender (no Telegram message), fake and scripted providers (no network), real PostgreSQL and pg-boss 12.37.0; Docker smoke with the fake provider and a local test sender. Telegram delivery is not live-tested. Behaviour: docs/DELIVERY.md. Evidence: docs/VALIDATION.md, "TRB-080 evidence" and "TRB-080 review fixes" (review of commit f23221c, applied 2026-10-21: suppression during a send no longer strands the chat; a confirmed block is recorded durably and applied by recovery; Retry-After is honoured in full; additive migration `20261021090000_trb_080_review_fixes`) and "TRB-080 follow-up fix" (review of commit f3789b8, applied 2026-10-21: only a verified interaction in the private chat supersedes a recorded block; additive migration `20261021120000_trb_080_verified_private_updates`). New command: `/history`. Rollout: the old and new delivery mechanisms must not overlap (docs/DELIVERY.md, "Schema and migration").
+Status: DONE — accepted by the owner on 2026-10-21 after review of commit 298bed3fd396d9ffb4e6d740b36d10db9b34073a (implementation, the review fixes for f23221c and the follow-up fix for f3789b8). Mock validation only: recording/scripted Telegram sender (no Telegram message), fake and scripted providers (no network), real PostgreSQL and pg-boss 12.37.0; Docker smoke with the fake provider and a local test sender. Telegram delivery is not live-tested. Behaviour: docs/DELIVERY.md. Evidence: docs/VALIDATION.md, "TRB-080 evidence" and "TRB-080 review fixes" (review of commit f23221c, applied 2026-10-21: suppression during a send no longer strands the chat; a confirmed block is recorded durably and applied by recovery; Retry-After is honoured in full; additive migration `20261021090000_trb_080_review_fixes`) and "TRB-080 follow-up fix" (review of commit f3789b8, applied 2026-10-21: only a verified interaction in the private chat supersedes a recorded block; additive migration `20261021120000_trb_080_verified_private_updates`). New command: `/history`. Rollout: the old and new delivery mechanisms must not overlap (docs/DELIVERY.md, "Schema and migration").
 
 ## TRB-090 — Telegram administration and data lifecycle
 
@@ -108,6 +108,11 @@ Depends on: 030, 050, 080.
 Implement invitations, suspension/reactivation, limits, aggregate usage/failure views, audit events and retention cleanup. Make proposed defaults explicit in configuration and docs.
 
 Acceptance: admin operations are authorized and auditable; user suspension prevents new work and pending delivery; no routine admin view reveals user report content; retention clears content on schedule while unresolved accounting survives; reactivation does not release stale reports in bulk.
+
+Status: READY FOR REVIEW (2026-10-21). Mock validation only: fake and scripted providers (no network), recording Telegram sender, real PostgreSQL and pg-boss; Docker smoke with the fake provider and a local Bot API double; no live request or Telegram message. Behaviour: docs/ADMINISTRATION.md and docs/RETENTION.md. Evidence: docs/VALIDATION.md, "TRB-090 evidence". Migration `20261021150000_trb_090_admin_retention` (additive).
+- **Cleanup is off by default.** `RETENTION_CLEANUP=off`. Enabling it is an owner decision, and it was not enabled on the development data.
+- **Owner decision needed.** Redacted run records and accounting evidence are kept rather than deleted after 90 days (docs/RETENTION.md, a suggested change to SPEC §7).
+- **Defaults unchanged.** Numeric defaults stay configurable beta proposals; live research stays administrator-only.
 
 ## TRB-100 — Railway readiness and operational runbook
 

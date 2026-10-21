@@ -8,7 +8,9 @@ export type AuditKind =
   | 'USER_SUSPENDED'
   | 'USER_REACTIVATED'
   | 'DESTINATION_BLOCKED'
-  | 'DESTINATION_RESTORED';
+  | 'DESTINATION_RESTORED'
+  | 'LIMIT_CHANGED'
+  | 'INVITATION_REVOKED';
 
 /** Identifiers, codes and counts only; never tokens, prompts or report content. */
 export type AuditDetails = Record<string, string | number | boolean | null>;

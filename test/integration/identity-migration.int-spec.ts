@@ -115,6 +115,16 @@ const NEW_COLUMNS = [
   'destination_refused_at',
   'destination_block_applied_at',
   'private_chat_verified',
+  // TRB-090
+  'limit_saved_tasks',
+  'limit_active_tasks',
+  'limit_daily_runs',
+  'limit_daily_manual_runs',
+  'limit_active_runs',
+  'limit_monthly_budget_micros',
+  'revoked_at',
+  'revoked_by_user_id',
+  'content_purged_at',
 ];
 /** TRB-080 columns whose names also exist on other tables (delivery.kind is original). */
 const NEW_PART_COLUMNS = ['kind'];

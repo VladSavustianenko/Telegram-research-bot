@@ -1,3 +1,4 @@
+import { sumComponents } from '../accounting/ledger';
 import { formatUsd } from '../accounting/pricing';
 import type { Env } from '../config/env.schema';
 import type { Tx } from '../database/prisma-errors';
@@ -49,6 +50,7 @@ const RUN_FIELDS = {
   providerKind: true,
   reconciledAt: true,
   prompt: true,
+  contentPurgedAt: true,
   occurrenceAt: true,
   createdAt: true,
   startedAt: true,
@@ -229,7 +231,9 @@ export async function showRun(
   lines.push(
     run.task
       ? `Завдання: «${run.task.name}»`
-      : `Разовий запит (/research): ${truncate(run.prompt, PROMPT_PREVIEW_CHARS)}`,
+      : run.contentPurgedAt
+        ? 'Разовий запит (/research); текст запиту видалено за політикою зберігання'
+        : `Разовий запит (/research): ${truncate(run.prompt, PROMPT_PREVIEW_CHARS)}`,
   );
   lines.push(`Тип: ${run.trigger === 'SCHEDULED' ? 'за розкладом' : 'вручну'}`);
   if (run.occurrenceAt) lines.push(`Заплановано на: ${at(run.occurrenceAt)}`);
@@ -248,6 +252,9 @@ export async function showRun(
   if (run.completedAt) lines.push(`Завершено: ${at(run.completedAt)}`);
   lines.push(`Дослідження: ${stateText(run)}`);
   if (run.outcome) lines.push(`Підсумок: ${OUTCOME_LABELS[run.outcome]}`);
+  if (run.contentPurgedAt) {
+    lines.push(messages.reportExpiredLine(ctx.config.REPORT_RETENTION_DAYS));
+  }
   if (report) {
     lines.push(`Доставка звіту: ${deliveryLabel(report.state, report.lastErrorCode)}`);
     if (report.state === 'UNKNOWN') lines.push(messages.unknownDeliveryWarning);
@@ -264,7 +271,7 @@ export async function showRun(
   lines.push('', 'Стан дослідження і стан доставки — окремі: збій доставки не змінює результат.');
 
   const buttons: InlineKeyboard['inline_keyboard'] = [];
-  if (run.state === 'SUCCEEDED' && report) {
+  if (run.state === 'SUCCEEDED' && report && !run.contentPurgedAt) {
     buttons.push([
       {
         text: report.state === 'UNKNOWN' ? 'Надіслати ще раз (можливий дубль)' : 'Надіслати звіт',
@@ -450,6 +457,8 @@ const SUPPRESSION_LABELS: Record<string, string> = {
   CHAT_BLOCKED: 'чат був недоступний',
   ACCESS_REVOKED: 'доступ відкликано',
   OWNER_UNRESOLVED: 'власника не визначено',
+  CONTENT_EXPIRED: 'вміст видалено за політикою зберігання',
+  INVITATION_REVOKED: 'запрошення відкликано',
 };
 
 /** Estimated usage versus amounts that are still unresolved or reserved (local estimates). */
@@ -459,29 +468,11 @@ function usage(run: RunRow): { short: string; long: string } {
       ? { short: 'симуляція', long: 'немає (симуляція, реального запиту не було)' }
       : { short: '', long: 'не обліковувалися (запуск до введення обліку)' };
   }
-  let estimated = 0n;
-  let unresolved = 0n;
-  let reserved = 0n;
-  let confirmed = 0n;
-  for (const reservation of run.reservations) {
-    switch (reservation.status) {
-      case 'SETTLED':
-        estimated += reservation.estimatedMicros ?? 0n;
-        unresolved += reservation.uncertainMicros ?? 0n;
-        break;
-      case 'UNRESOLVED':
-        unresolved += reservation.exposureMicros;
-        break;
-      case 'RESERVED':
-        reserved += reservation.reservedMicros;
-        break;
-      case 'RESOLVED':
-        confirmed += reservation.confirmedMicros ?? reservation.exposureMicros;
-        break;
-      case 'RELEASED':
-        break;
-    }
-  }
+  const totals = sumComponents(run.reservations);
+  const estimated = totals.estimatedMicros;
+  const unresolved = totals.unresolvedMicros;
+  const reserved = totals.reservedMicros;
+  const confirmed = totals.confirmedMicros;
   const long: string[] = [];
   const short: string[] = [];
   if (estimated > 0n) {

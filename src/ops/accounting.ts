@@ -1,6 +1,6 @@
 import 'reflect-metadata';
 import { parseArgs } from 'node:util';
-import { AccountingResolutionError, resolveRun } from '../accounting/ledger';
+import { AccountingResolutionError, correctResolution, resolveRun } from '../accounting/ledger';
 import { formatUsd } from '../accounting/pricing';
 import { ConfigValidationError, parseUsdMicros } from '../config/env.schema';
 import { loadConfig } from '../config/load-config';
@@ -10,6 +10,8 @@ import { PrismaService } from '../database/prisma.service';
  * Operator command for financial resolution of live runs (docs/ACCOUNTING.md).
  *   node dist/ops/accounting.js --list
  *   node dist/ops/accounting.js --run <id> --confirmed-usd <amount> --operator <name> --note <text>
+ *   node dist/ops/accounting.js --correct --run <id> --confirmed-usd <amount> --operator <name> --note <text>
+ * --correct (TRB-090) changes an already RESOLVED amount with an appended CORRECT entry.
  * Records an amount confirmed from billing evidence (once, append-only ledger).
  * Never contacts OpenAI or Telegram; never changes the run or its research
  * reconciliation. "0" must be stated explicitly.
@@ -18,6 +20,7 @@ async function main(): Promise<number> {
   const { values } = parseArgs({
     options: {
       list: { type: 'boolean' },
+      correct: { type: 'boolean' },
       run: { type: 'string' },
       'confirmed-usd': { type: 'string' },
       operator: { type: 'string' },
@@ -62,7 +65,7 @@ async function main(): Promise<number> {
     const amount = values['confirmed-usd'];
     if (!values.run || amount === undefined || !values.operator || !values.note) {
       process.stderr.write(
-        'Usage: --list | --run <id> --confirmed-usd <amount> --operator <name> --note <text>\n',
+        'Usage: --list | [--correct] --run <id> --confirmed-usd <amount> --operator <name> --note <text>\n',
       );
       return 2;
     }
@@ -74,8 +77,9 @@ async function main(): Promise<number> {
       return 2;
     }
     const runId = values.run;
+    const resolve = values.correct ? correctResolution : resolveRun;
     const result = await prisma.$transaction((tx) =>
-      resolveRun(tx, {
+      resolve(tx, {
         runId,
         confirmedMicros,
         operator: values.operator ?? '',
@@ -83,7 +87,7 @@ async function main(): Promise<number> {
       }),
     );
     process.stdout.write(
-      `Resolved ${runId}: exposure ${formatUsd(result.previousExposureMicros)} -> ${formatUsd(result.exposureMicros)}\n`,
+      `${values.correct ? 'Corrected' : 'Resolved'} ${runId}: exposure ${formatUsd(result.previousExposureMicros)} -> ${formatUsd(result.exposureMicros)}\n`,
     );
     return 0;
   } finally {

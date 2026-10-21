@@ -7,6 +7,7 @@ import { DeliveryModule } from './delivery/delivery.module';
 import { HealthModule } from './health/health.module';
 import { IdentityModule } from './identity/identity.module';
 import { ResearchModule } from './research/research.module';
+import { RetentionModule } from './retention/retention.module';
 import { SchedulingModule } from './scheduling/scheduling.module';
 import { TelegramModule } from './telegram/telegram.module';
 
@@ -25,6 +26,7 @@ export class AppModule {
         ResearchModule,
         SchedulingModule,
         DeliveryModule,
+        RetentionModule,
       ],
     };
   }

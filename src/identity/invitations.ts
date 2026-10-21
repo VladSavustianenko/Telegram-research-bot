@@ -72,7 +72,8 @@ export async function redeemInvitation(
   const tokenHash = hashInvitationToken(input.payload);
   const [invitation] = await tx.$queryRaw<{ id: string; createdByUserId: string }[]>`
     SELECT id, created_by_user_id AS "createdByUserId" FROM invitation
-     WHERE token_hash = ${tokenHash} AND redeemed_at IS NULL AND expires_at > now()
+     WHERE token_hash = ${tokenHash} AND redeemed_at IS NULL AND revoked_at IS NULL
+       AND expires_at > now()
      FOR UPDATE`;
   if (!invitation) return { ok: false };
 

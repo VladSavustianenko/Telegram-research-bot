@@ -113,6 +113,15 @@ Details, retry matrix, rollout and operator procedures: [docs/QUEUE.md](docs/QUE
 
 Details, state transitions, retry classification, document format and rollout: [docs/DELIVERY.md](docs/DELIVERY.md).
 
+### Administration and data lifecycle (TRB-090)
+
+- **Administration.** `/admin users`, `/admin user <ID>`, `/admin limit <ID> <name> <value|default>`, `/admin usage`, `/admin invites`, `/admin revoke <ID>` and `/admin audit` extend `/admin invite|suspend|reactivate`. The views show metadata only, never prompts or reports.
+- **Limits.** Per-user overrides of the task, run, active-run and budget limits fall back to the environment defaults. Global budget, concurrency, model and pricing stay operator-controlled.
+- **Retention.** Cleanup is off by default (`RETENTION_CLEANUP=off`). When enabled, it removes prompts, reports, documents and message copies after `REPORT_RETENTION_DAYS` (30), and inbox and queue bookkeeping after `METADATA_RETENTION_DAYS` (90). Accounting evidence is kept.
+- **Privacy.** `/privacy` tells users what is stored and for how long.
+
+Details: [docs/ADMINISTRATION.md](docs/ADMINISTRATION.md) and [docs/RETENTION.md](docs/RETENTION.md).
+
 Prisma owns the `public` schema and its migrations in `prisma/migrations`; pg-boss owns a separate schema (`QUEUE_SCHEMA`, default `pgboss`), which the application installs at startup (TRB-060). The generated Prisma client is written to `src/generated/prisma` (not committed).
 
 ## Reference documentation
