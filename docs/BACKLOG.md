@@ -131,6 +131,7 @@ Acceptance: restart/deployment-overlap recovery demonstrated locally or in autho
 Status: READY FOR REVIEW (2026-10-21). Deployment preparation and local validation only: nothing deployed, no Railway resource created or changed, no webhook registered, no Telegram message, no OpenAI call. Runbook: docs/OPERATIONS.md. Evidence: docs/VALIDATION.md, "TRB-100 evidence" (production image, migration step, shutdown and recovery with signals, two-instance overlap, backup and isolated restore; fake provider, local Bot API double, disposable databases). Migration `20261022090000_trb_100_operational_hold` (additive).
 - **Railway behaviour** is taken from the documentation (checked 2026-10-21), not observed; assumptions and open questions are in docs/OPERATIONS.md, section 2.
 - **No Railway config file.** Railway's config as code is deprecated (until 2026-12-01) and its replacement applies resources, so the service settings are a documented checklist.
+- **Review fix for 9dedc75** (2026-10-21, VALIDATION "TRB-100 review fix"). The restore procedure could not be completed under the hold, so it now has an operator command: `ops:restore-quarantine`, with audit kinds `RESTORE_RUN_QUARANTINED` and `RESTORE_DELIVERY_SUPPRESSED` (additive migration `20261022120000_trb_100_restore_quarantine`). docs/OPERATIONS.md §11.3 is rewritten as executable steps.
 
 ## TRB-110 — Beta acceptance
 

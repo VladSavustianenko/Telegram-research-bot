@@ -1230,6 +1230,77 @@ The owner accepted TRB-090 after review of commit `a095519f30266cf15d6c36b6ea5db
 - **Stale restores.** Restoring an older backup cannot undo OpenAI requests or Telegram messages after it; the runbook's reconciliation reduces, but cannot remove, duplicates and unknown spend.
 - **Image size.** 896 MB, with the Prisma CLI included for migrations.
 
+### TRB-100 review fix (2026-10-21, reviewed commit 9dedc75)
+
+Local validation only: scripted providers and recording senders in tests; in the container smoke, the fake provider and the local Bot API double; disposable databases. No deployment, Telegram, OpenAI or commit. The development database received only the additive migration, and no business record changed.
+
+**Finding.** The restore reconciliation in docs/OPERATIONS.md §11.3 could not be completed while the hold was set. Its instructions to delete tasks or suspend users needed Telegram commands, and the hold answers ingress with 503. Configured administrators cannot be suspended (`TARGET_IS_ADMIN`), and standalone `/research` runs have no task. `accounting.js` refuses RESERVED reservations and unfinished runs. Clearing the hold first lets workers execute restored queued runs and send restored pending deliveries that may already have happened after the backup.
+
+**Root cause.** No operation existed that marks restored work as "outcome unknown" while nothing executes. The only cancellation path (`cancelQueuedRuns`) assumes a queued run was never submitted and releases its reservation, which is wrong for an older backup.
+
+**Fix.** `ops:restore-quarantine` (`src/operations/restore-quarantine.ts`, `src/ops/restore-quarantine.ts`):
+- **Commands.** `--list` shows candidates by ID. Selecting IDs previews by default; `--confirm` with `--operator` and `--reason` applies.
+- **Preconditions.** Mutations require the hold (row locked for share, so it cannot be cleared concurrently) and no live research or delivery lease.
+- **Atomic and audited.** Everything changes in one transaction with one audit event per record; a repeat is a no-op.
+- **Run** (QUEUED or RUNNING) → UNCERTAIN / `RESTORE_QUARANTINED`.
+  - Kept: response ID, attempts, usage and pricing.
+  - A recorded open attempt is closed as UNCERTAIN; no attempt is invented.
+  - A RESERVED reservation becomes UNRESOLVED (`settleRun` "unresolved") with its full exposure, never released.
+  - Pending execution events are cancelled and the lease is fenced.
+  - Afterwards: `ops:reconcile` records the finding (`PROVIDER_REQUEST_ABSENT` for a confirmed non-execution) and `ops:accounting` the amount.
+- **Delivery** (PENDING, RETRYABLE_FAILURE, SENDING) → SUPPRESSED / `RESTORE_QUARANTINED`, with a durable suppression.
+  - Confirmed parts are untouched; unconfirmed parts become UNKNOWN (they may have been sent).
+  - Events are cancelled and the next delivery in the chat is woken.
+- **Migration** `20261022120000_trb_100_restore_quarantine` (two audit enum values).
+
+| Check | Command | Result |
+|---|---|---|
+| Reproduction before the fix | a test using only the existing tools, against the reviewed code | Under hold: `resolveRun` and `reconcileUncertainRun` refused; `/admin suspend` got 503. After clearing the hold, the restored queued run was submitted again (`submit = 1`, expected 0) |
+| New tests | `restore-quarantine.int-spec.ts` | 5 passed |
+| Restore end to end | `backup-restore.int-spec.ts` | Passed. The backup now really contains a queued administrator run (previously refused at admission because of the unreconciled run, so the earlier "runs unchanged" check was vacuous). Under hold, the documented steps ran: list, preview, quarantine of the queued run and one pending reply, reconciliation. After clearing: 0 submissions, the suppressed reply not sent, the other waiting parts sent once, total exposure unchanged |
+| Static checks, unit, build | `npm run format:check`, `lint`, `typecheck`, `prisma:validate`, `npm test`, `npm run build`, `docker build` | Pass; unit 224 |
+| Integration | `TRB_PG_TOOLS_CONTAINER=telegram-research-bot-postgres-test-1 npm run test:integration` | 287 passed (21 files) |
+| Migration, dev DB | `migrate deploy`, `migrate status`, `migrate diff --from-config-datasource --to-schema prisma/schema.prisma --exit-code` | Applied without reset; "up to date"; exit 0. MD5 over every public table identical before and after |
+
+**Scenarios** (`restore-quarantine.int-spec.ts`; real PostgreSQL and pg-boss, live configuration with a scripted provider):
+1. **Queued administrator `/research`** (standalone, `NOT_SUBMITTED` in the copy).
+   - Preview changed nothing.
+   - Apply: UNCERTAIN, no attempt invented, reservation UNRESOLVED at 284 000 micro-USD (ledger RESERVE, UNRESOLVED), events cancelled, one audit event.
+   - Repeat: `ALREADY_QUARANTINED`, no new audit or ledger entry.
+   - Reopened with workers plus a stale job: 0 submissions.
+   - Then `PROVIDER_REQUEST_ABSENT` and an explicit 0 → RESOLVED.
+2. **Restored RUNNING with a response ID** → UNCERTAIN; response ID and attempt kept, attempt UNCERTAIN, exposure retained. After reopening and a stale job: 0 submits, 0 retrieves, 0 cancels.
+3. **Restored RUNNING while submitting (no response ID).**
+   - Refused with `NOT_QUIESCED` while the lease was live; nothing changed.
+   - After the lease expired: UNCERTAIN, attempt UNCERTAIN without an ID.
+   - After reopening: no submission, exposure still 284 000 until the operator resolved 150 000.
+4. **Deliveries.**
+   - A two-part delivery: the confirmed part kept message ID 777 and its content; the waiting part became UNKNOWN with its content.
+   - A pending delivery delivered after the backup: SUPPRESSED, no pending event.
+   - Stale jobs and the recovery sweep sent nothing; a later `/help` in the same chat was sent.
+5. **Refusals.**
+   - Without the hold: `HOLD_REQUIRED`. Empty operator or reason, or an invalid ID: refused.
+   - A missing delivery ID in the same command rolled back the valid run: still QUEUED, reservation RESERVED, ledger and audit unchanged.
+   - Already finished runs: `NOT_APPLICABLE`.
+
+**Container smoke** (production image, disposable database, Bot API double). The queued `/research` and its pending reply were created by the app with workers off. The CLI then showed:
+- `--list` and the preview worked ("Nothing changed").
+- `--confirm` without the hold: exit 1, `HOLD_REQUIRED`; without an operator: exit 2.
+- With the hold: both records quarantined (a fake run has no reservation: `NO_RESERVATION`), one audit event each; a repeat gave `ALREADY_QUARANTINED`.
+- `reconcile-run.js` worked under the hold.
+- Reopened (clear the hold, app with workers): 1 Telegram send in total, the later `/help`. The run stayed UNCERTAIN with 0 attempts.
+
+**Not tested:**
+- Railway;
+- real Telegram or OpenAI;
+- a restore of work absent from the backup (by definition nothing in the database represents it; documented as unknown);
+- the catch-up of a scheduled occurrence that ran after the backup (documented mitigation: open with `RESEARCH_MODE=disabled` first and pause tasks).
+
+**Remaining limitations:**
+- Quarantine records the decision, not the external truth: whether a quarantined run was billed or a part delivered stays unknown until external evidence settles it.
+- Work entirely absent from the backup cannot be reconciled from the database; its costs must be taken from OpenAI billing.
+- A hold set while a process is running takes effect only after a restart; the command refuses only while a lease is live.
+
 ## Release checklist
 
 - Exact model/tool compatibility verified in official docs and an authorized sample.

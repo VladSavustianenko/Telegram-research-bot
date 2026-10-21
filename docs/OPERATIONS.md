@@ -21,7 +21,7 @@ How to deploy the bot to Railway, upgrade it, roll it back, back it up, restore 
 | Build | `Dockerfile` (multi-stage; base `node:24.19.0-bookworm-slim@sha256:a9f5f7c9…`) | Railway builds it |
 | Pre-deploy (migrations) | same image | `node dist/ops/migrate.js` |
 | Start | same image, user `node` | `CMD ["node", "dist/main.js"]` (no start command override) |
-| Operator commands | same image (`railway ssh` into the service, or `docker run` locally) | `node dist/ops/<command>.js` (section 9) |
+| Operator commands | same image (`railway ssh` into the service, or `docker run` locally) | `node dist/ops/<command>.js` (sections 9 and 11.3) |
 
 The image contains the compiled application, production dependencies, the Prisma CLI and its schema engine for Debian/OpenSSL 3, `prisma/schema.prisma`, `prisma/migrations` and `prisma.config.ts`. No build argument or secret is used, so Railway variables never enter the image.
 
@@ -328,21 +328,76 @@ Never restore over the production or development database.
      pg_restore --no-owner --no-privileges --exit-on-error --single-transaction \
        --dbname="<new database>" /backups/<file>.dump
    ```
-3. **Hold immediately, before any application connects:** `node dist/ops/hold.js --set --reason "restored <file>" --operator <name>` with `DATABASE_URL` of the new database (e.g. `docker run --rm -e DATABASE_URL=… <image> node dist/ops/hold.js …`, or `railway ssh` after pointing a held service at it).
-4. **Keep external effects off** for the first start on the restored copy: `TELEGRAM_MODE=webhook` is harmless while held (503), but do not register the webhook to it yet; keep `RESEARCH_MODE` as it was or `disabled`.
-5. **Verify** (`status.js` and SQL):
+3. **Hold immediately, before any application connects.** Operator commands run from the production image against the new database; put its connection into an env file (`restored.env`: `NODE_ENV=production`, `DATABASE_URL=<new database URL>`, chmod 600):
+   ```sh
+   OPS="docker run --rm --env-file restored.env <image> node dist/ops"
+   $OPS/hold.js --set --reason "restored <file>" --operator <name>
+   ```
+   (On Railway: point a service at the new database only after this, or run the same commands with `railway ssh -- node dist/ops/…` in a service that already starts held.)
+4. **Establish that nothing executes.** A hold stops only processes that **start** after it; a process that was already running on this database keeps executing.
+   - Stop or restart every application process that uses the new database (Railway: restart or redeploy the service) and check that `/health/ready` answers `"status": "held"` on each.
+   - `$OPS/status.js --quiesced` must exit 0 (no live research lease, no delivery being sent, no active queue job). A lease copied from a very recent backup can still look live: wait 60 s, then check again.
+   - Keep the webhook unregistered for this database, and keep `RESEARCH_MODE` as it was or `disabled`.
+   - The quarantine command below refuses to change anything without the hold or while a lease is live.
+5. **Verify the copy** (`$OPS/status.js` and SQL):
    - **schema:** no pending or failed migrations, pg-boss version 45;
    - **accounting:** reservation exposure per status and ledger sums match the source at backup time (or the last known report);
    - **deduplication:** `telegram_update` count and tombstones present;
    - **deliveries:** confirmed Telegram message IDs present, `UNKNOWN` deliveries still `UNKNOWN`, purged parts still purged;
-   - **work:** task schedules (`next_run_at`), queued and running runs, pending deliveries, recorded refusals;
    - **holds:** `OPERATIONAL_HOLD_SET` is the only expected new warning.
-6. **Reconcile before reopening** (the backup is older than reality):
-   - **OpenAI:** every request after the backup time is unknown to the restored database. Compare the OpenAI dashboard (requests and usage since the backup) with the restored runs. Runs that are `QUEUED` or `RUNNING` in the copy may already have been executed and billed: if so, cancel them deliberately (e.g. delete the task or suspend temporarily) rather than letting them run again; record known costs with `accounting.js`.
-   - **Telegram:** messages sent after the backup time are unknown; pending deliveries in the copy may already have arrived. Decide whether to let them go out (possible duplicates) or to suppress them (suspend and reactivate the user, which never re-sends a backlog).
-   - **Inbox:** updates processed after the backup time are not in the copy, so a redelivery of one of them would be processed again. Telegram does not redeliver acknowledged updates; updates still pending at Telegram are delivered once the webhook is set again.
-   - **Configuration:** confirm budgets, pricing and modes.
-7. **Open:** point the service's `DATABASE_URL` at the new database (deploy; it starts held), then `hold.js --clear --operator <name> --confirm`, then `webhook.js --set --confirm`.
+6. **Inspect what would act on reopening:** `$OPS/restore-quarantine.js --list`. It lists, by ID and without content:
+   - runs that are `QUEUED` or `RUNNING` (submission state, response ID, reservation, requester, task or standalone `/research`);
+   - deliveries still waiting (`PENDING`, `RETRYABLE_FAILURE`, `SENDING`), with part counts;
+   - active scheduled tasks with their next occurrence.
+
+   Compare them with external evidence for the time after the backup: the OpenAI dashboard (requests, usage) and what the users received in Telegram.
+   - **A queued or running run** may already have been submitted after the backup, even when the copy says `QUEUED` / `NOT_SUBMITTED`. Quarantine it unless you know it never ran and want it to run now.
+   - **A waiting delivery** may already have arrived. Quarantine it unless a possible duplicate is acceptable.
+7. **Preview, then apply the decisions** (one command for all selected records):
+   ```sh
+   $OPS/restore-quarantine.js --run <run-id> --run <run-id> --delivery <delivery-id>        # preview, changes nothing
+   $OPS/restore-quarantine.js --run <run-id> --run <run-id> --delivery <delivery-id> \
+     --operator <name> --reason "restored <file>; may have executed after the backup" --confirm
+   ```
+   - **Run:** becomes `UNCERTAIN / RESTORE_QUARANTINED` and is never submitted or polled again, also by stale jobs.
+     - Kept: response ID, attempts, usage and pricing snapshot.
+     - A recorded open attempt is closed as `UNCERTAIN`.
+     - A `RESERVED` reservation becomes `UNRESOLVED` with its full exposure (never released as unused).
+     - Pending execution events are cancelled.
+   - **Delivery:** becomes `SUPPRESSED / RESTORE_QUARANTINED` (durable, never sent automatically).
+     - Confirmed parts keep their message IDs and content.
+     - Unconfirmed parts become `UNKNOWN` (they may have been sent), never "unsent".
+     - The next message in the chat is no longer held back.
+   - **Evidence and safety.** Each change writes an audit event (`RESTORE_RUN_QUARANTINED`, `RESTORE_DELIVERY_SUPPRESSED`) with operator and reason. All records change in one transaction: an unknown ID or any error changes nothing, and repeating the command changes nothing.
+   - **What it does not need.** No Telegram command, no OpenAI call, no ingress or worker. It works for administrator-owned records and standalone `/research` runs, and leaves the prohibition on suspending administrators untouched.
+8. **Reconcile the money and the provider finding** for each quarantined run (both commands exist already and work under the hold):
+   ```sh
+   $OPS/reconcile-run.js --run <run-id> --resolution <R> --operator <name> --note "<evidence>"
+   $OPS/accounting.js --run <run-id> --confirmed-usd <amount> --operator <name> --note "<evidence>"   # live runs
+   ```
+   - **Resolution:**
+     - `PROVIDER_REQUEST_ABSENT`: confirmed non-execution, e.g. no request in the OpenAI logs for the period;
+     - `PROVIDER_CONFIRMED_TERMINAL`: the request ran and finished;
+     - `OPERATOR_ACCEPTED_RISK`: the evidence is inconclusive.
+   - **Effect.** Until reconciled, a quarantined live run blocks live research like any unreconciled UNCERTAIN run.
+   - **Amount.** It must come from billing evidence; `0` only when the evidence shows no usage. Without evidence, leave the reservation `UNRESOLVED`: its exposure keeps counting against the budgets. Missing billing evidence is never reconstructed automatically.
+9. **Verify the result:**
+   - `$OPS/restore-quarantine.js --list` shows only what you chose to let run or send;
+   - `$OPS/status.js` shows the expected warnings (`ACCOUNTING_UNRESOLVED` while amounts are open);
+   - `$OPS/accounting.js --list` shows the open reservations;
+   - SQL check of the audit: `SELECT kind, details FROM audit_event WHERE kind::text LIKE 'RESTORE_%'`.
+10. **Open, explicitly:**
+    1. Point the service's `DATABASE_URL` at the new database (deploy; it starts held).
+    2. `$OPS/hold.js --clear --operator <name> --confirm`. Held processes open within 30 s.
+    3. `node dist/ops/webhook.js --set --confirm`.
+    4. **Scheduled tasks.** An occurrence due between the backup and now gets the usual catch-up (at most one per task, if not older than 24 h), even if it already ran after the backup. To avoid that, open first with `RESEARCH_MODE=disabled`: the scheduler then does not run, and Telegram commands work, so tasks can be paused. Switch research back on afterwards.
+
+**What stays unknown after restoring an older backup:**
+- **Work absent from the backup entirely.** Runs admitted after the backup, their submissions and costs, and messages and invitations sent after it have no record in the copy. They cannot be quarantined, reconciled or deduplicated from the database; only the OpenAI and Telegram records show them. Record their costs outside the application, or as an operator note, until a supported correction exists.
+- **Quarantined records.** Whether a quarantined run was submitted, or a quarantined part delivered, stays unknown until external evidence settles it.
+- **Duplicates.** Records you chose not to quarantine may repeat work or messages.
+- **Inbox.** Updates processed after the backup are not in the copy; Telegram does not redeliver acknowledged updates, but a replay of one would be processed again.
+- **Configuration.** Confirm budgets, pricing and modes.
 
 **Limitation.** PostgreSQL cannot undo external effects. After restoring an older backup the application may forget submissions, sends, accounting changes and deduplication evidence created after the backup. The hold and the checklist reduce the risk; they cannot guarantee that no request is repeated or no message duplicated.
 

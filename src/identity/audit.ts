@@ -10,7 +10,9 @@ export type AuditKind =
   | 'DESTINATION_BLOCKED'
   | 'DESTINATION_RESTORED'
   | 'LIMIT_CHANGED'
-  | 'INVITATION_REVOKED';
+  | 'INVITATION_REVOKED'
+  | 'RESTORE_RUN_QUARANTINED'
+  | 'RESTORE_DELIVERY_SUPPRESSED';
 
 /** Identifiers, codes and counts only; never tokens, prompts or report content. */
 export type AuditDetails = Record<string, string | number | boolean | null>;

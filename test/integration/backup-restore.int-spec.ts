@@ -4,6 +4,12 @@ import { Client } from 'pg';
 import { afterAll, describe, expect, inject, it, vi } from 'vitest';
 import { resolveRun } from '../../src/accounting/ledger';
 import { clearHold, readHold, setHold } from '../../src/operations/hold';
+import {
+  applyQuarantine,
+  listCandidates,
+  previewQuarantine,
+  type Target,
+} from '../../src/operations/restore-quarantine';
 import { readSchemaState } from '../../src/operations/schema-state';
 import { reconcileUncertainRun } from '../../src/research/reconciliation';
 import { telegramBlocked, telegramTimeout, unknownOutcome } from '../support/fakes';
@@ -123,9 +129,13 @@ describe.skipIf(!CONTAINER)('TRB-100 backup → isolated restore → verificatio
     // 3. retention: old content purged, inbox reduced to tombstones
     live.clock.advance(91 * DAY);
     await live.retention.runPass();
-    // 4. ambiguous submission left UNRESOLVED and unreconciled (blocks live work)
-    await say('/research left uncertain');
+    // 4. a queued administrator run (its job already dispatched), and an ambiguous
+    //    submission of the other administrator, left UNRESOLVED and unreconciled.
+    //    The other administrator was never served, so the worker picks that run first.
+    await say('/research queued at backup time');
+    await say('/research left uncertain', OTHER_ADMIN_ID);
     await live.research.tick();
+    expect(await live.prisma.researchRun.count({ where: { state: 'QUEUED' } })).toBe(1);
     // 5. an ambiguous Telegram send (UNKNOWN), a recorded refusal not yet applied
     live.sender.failNext(telegramTimeout());
     await say('/help');
@@ -151,7 +161,6 @@ describe.skipIf(!CONTAINER)('TRB-100 backup → isolated restore → verificatio
         nextRunAt: new Date(Date.now() + DAY),
       },
     });
-    await say('/research queued at backup time', OTHER_ADMIN_ID);
     await say('/tasks');
     await live.close();
     open.splice(0);
@@ -270,8 +279,34 @@ describe.skipIf(!CONTAINER)('TRB-100 backup → isolated restore → verificatio
     expect(restored.sender.attempts).toHaveLength(0);
     expect(await summary(restoredUrl.toString())).toEqual(beforeSummary);
 
-    // After the operator's checks: clear the hold. The unreconciled live UNCERTAIN
-    // run still keeps live research closed; queued live work does not start.
+    // Under the hold (docs/OPERATIONS.md 11.3): the queued run and one pending reply
+    // may already have executed after the backup; the operator neutralizes them.
+    const candidates = await listCandidates(verifier.prisma);
+    expect(candidates.runs.length).toBeGreaterThan(0);
+    const suppressed = candidates.deliveries.at(-1)!;
+    const targets: Target[] = [
+      ...candidates.runs.map((r) => ({ kind: 'run' as const, id: String(r['id']) })),
+      { kind: 'delivery', id: String(suppressed['id']) },
+    ];
+    expect(
+      (await previewQuarantine(verifier.prisma, targets)).every((i) => i.action === 'QUARANTINE'),
+    ).toBe(true);
+    await applyQuarantine(verifier.prisma, {
+      targets,
+      operator: 'owner',
+      reason: 'restored from backup; may have executed after it',
+    });
+    for (const target of targets.filter((t) => t.kind === 'run')) {
+      await reconcileUncertainRun(verifier.prisma, {
+        runId: target.id,
+        resolution: 'OPERATOR_ACCEPTED_RISK',
+        operator: 'owner',
+        note: 'OpenAI logs inconclusive for the period after the backup',
+      });
+    }
+
+    // Then clear the hold. The older unreconciled live UNCERTAIN run still keeps
+    // live research closed; nothing restored is submitted.
     expect(await clearHold(verifier.prisma)).toBe(true);
     expect(await readHold(verifier.prisma)).toBeNull();
     expect(await restored.gate.evaluateNow()).toBe('open');
@@ -292,7 +327,9 @@ describe.skipIf(!CONTAINER)('TRB-100 backup → isolated restore → verificatio
     await new Promise((resolve) => setTimeout(resolve, 1_000));
     expect(restored.provider.calls.submit).toBe(0);
     const after = await summary(restoredUrl.toString());
-    expect(after.exposure).toEqual(beforeSummary.exposure); // accounting unchanged
+    const total = (rows: unknown[]) =>
+      rows.reduce<bigint>((sum, row) => sum + BigInt((row as { sum: string }).sum), 0n);
+    expect(total(after.exposure)).toBe(total(beforeSummary.exposure)); // no cost released
     expect(after.ledger).toEqual(beforeSummary.ledger);
     const confirmedBefore = String(
       (beforeSummary.confirmedParts[0] as { string_agg: string }).string_agg,
@@ -304,9 +341,14 @@ describe.skipIf(!CONTAINER)('TRB-100 backup → isolated restore → verificatio
     // Each part still waiting at backup time was attempted once; nothing confirmed was resent.
     const waiting = (beforeSummary.waitingParts[0] as { count: number }).count;
     expect(waiting).toBeGreaterThan(0);
-    expect(restored.sender.attempts).toHaveLength(waiting);
+    expect(restored.sender.attempts).toHaveLength(waiting - Number(suppressed['parts']));
     expect(JSON.stringify(after.deliveries)).toContain('UNKNOWN'); // ambiguous send stays UNKNOWN
-    expect(after.runs).toEqual(beforeSummary.runs); // queued live run waits; nothing resubmitted
+    expect(
+      await restored.prisma.researchRun.count({ where: { state: { in: ['QUEUED', 'RUNNING'] } } }),
+    ).toBe(0);
+    expect(
+      await restored.prisma.delivery.findUniqueOrThrow({ where: { id: String(suppressed['id']) } }),
+    ).toMatchObject({ state: 'SUPPRESSED', lastErrorCode: 'RESTORE_QUARANTINED' });
 
     // A replay of an update processed before the backup is still a duplicate.
     const inboxBefore = await restored.prisma.telegramUpdate.count();

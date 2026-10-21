@@ -134,7 +134,13 @@ export async function chatBlocked(tx: Tx | PrismaService, chatId: bigint): Promi
   return rows[0]?.blocked ?? false;
 }
 
-const SUPPRESSION_CODES = new Set(['RECIPIENT_SUSPENDED', 'TASK_DELETED', 'CHAT_BLOCKED']);
+const SUPPRESSION_CODES = new Set([
+  'RECIPIENT_SUSPENDED',
+  'TASK_DELETED',
+  'CHAT_BLOCKED',
+  // TRB-100: an operator suppressed a delivery restored from a backup.
+  'RESTORE_QUARANTINED',
+]);
 
 /**
  * Code for a delivery stopped by a durable decision recorded while it was being

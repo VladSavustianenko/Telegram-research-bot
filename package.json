@@ -32,7 +32,8 @@
     "ops:migrate": "node dist/ops/migrate.js",
     "ops:status": "node dist/ops/status.js",
     "ops:hold": "node dist/ops/hold.js",
-    "ops:webhook": "node dist/ops/webhook.js"
+    "ops:webhook": "node dist/ops/webhook.js",
+    "ops:restore-quarantine": "node dist/ops/restore-quarantine.js"
   },
   "dependencies": {
     "@nestjs/common": "12.1.2",

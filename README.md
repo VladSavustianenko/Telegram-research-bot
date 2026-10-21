@@ -131,6 +131,7 @@ Not deployed yet. [docs/OPERATIONS.md](docs/OPERATIONS.md) is the Railway runboo
 | `migrate` | Deployment step: `prisma migrate deploy`, pg-boss schema, verification |
 | `status` | Read-only diagnostics: schema, hold, queue age, stalled work, scheduler lag, UNCERTAIN runs, UNKNOWN and failed deliveries, pending blocks, accounting, retention. `--quiesced` checks that nothing executes |
 | `hold` | Durable execution hold for restored or suspect databases |
+| `restore-quarantine` | Under the hold: lists restored runs and deliveries that would act on reopening, previews and applies targeted quarantine (runs UNCERTAIN with cost retained, deliveries suppressed), with audit |
 | `webhook` | Explicit `getWebhookInfo` / `setWebhook` / `deleteWebhook`; never drops pending updates |
 | `reconcile`, `accounting`, `tool-telemetry` | Existing operator commands (TRB-020, TRB-050) |
 

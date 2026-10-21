@@ -446,6 +446,10 @@ enum AuditEventKind {
   LIMIT_CHANGED
   /// TRB-090: an administrator revoked an unredeemed invitation.
   INVITATION_REVOKED
+  /// TRB-100: an operator quarantined a run restored from a backup (ops:restore-quarantine).
+  RESTORE_RUN_QUARANTINED
+  /// TRB-100: an operator suppressed a delivery restored from a backup.
+  RESTORE_DELIVERY_SUPPRESSED
 }
 
 /// Append-only access audit (UPDATE and DELETE are rejected by a trigger).
