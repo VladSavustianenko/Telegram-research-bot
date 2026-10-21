@@ -7,11 +7,13 @@ import {
 } from '@nestjs/common';
 import { CLOCK, type Clock } from '../common/clock';
 import { errorInfo } from '../common/error-info';
-import { WorkerLoop } from '../common/worker-loop';
+import { AppLifecycle } from '../common/lifecycle';
+import { WorkerLoop, loopStaleAfterMs } from '../common/worker-loop';
 import { APP_CONFIG } from '../config/config.module';
 import type { Env } from '../config/env.schema';
 import type { Tx } from '../database/prisma-errors';
 import { PrismaService } from '../database/prisma.service';
+import { ExecutionGate } from '../operations/execution-gate';
 import { createStatusDelivery } from '../delivery/delivery-records';
 import type { ScheduleDisposition, Task } from '../generated/prisma/client';
 import { accountAccess } from '../identity/authorization';
@@ -87,6 +89,8 @@ export class SchedulerService implements OnApplicationBootstrap, OnModuleDestroy
     private readonly prisma: PrismaService,
     @Inject(APP_CONFIG) private readonly config: Env,
     @Inject(CLOCK) private readonly clock: Clock,
+    private readonly lifecycle: AppLifecycle,
+    private readonly gate: ExecutionGate,
   ) {}
 
   /**
@@ -96,13 +100,15 @@ export class SchedulerService implements OnApplicationBootstrap, OnModuleDestroy
    */
   onApplicationBootstrap(): void {
     if (this.config.BACKGROUND_WORKERS !== 'on' || this.config.RESEARCH_MODE === 'disabled') return;
-    this.loop = new WorkerLoop(
-      'Scheduler',
-      this.config.SCHEDULER_POLL_INTERVAL_SECONDS * 1_000,
-      () => this.tick(),
-      this.logger,
-    );
-    this.loop.start();
+    const interval = this.config.SCHEDULER_POLL_INTERVAL_SECONDS * 1_000;
+    this.lifecycle.register('scheduler', { staleAfterMs: loopStaleAfterMs(interval) });
+    this.gate.whenOpen(() => {
+      this.loop = new WorkerLoop('Scheduler', interval, () => this.tick(), this.logger, {
+        lifecycle: this.lifecycle,
+        component: 'scheduler',
+      });
+      this.loop.start();
+    });
   }
 
   async onModuleDestroy(): Promise<void> {

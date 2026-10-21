@@ -764,7 +764,17 @@ describe('TRB-060 queue execution (real pg-boss, scripted provider, real Postgre
     it('reports the started queue in readiness without external calls', async () => {
       await request(httpServer(h.app))
         .get('/health/ready')
-        .expect(200, { status: 'ok', checks: { config: 'up', database: 'up', queue: 'up' } });
+        .expect(200, {
+          status: 'ok',
+          checks: {
+            config: 'up',
+            database: 'up',
+            queue: 'up',
+            schema: 'up',
+            workers: 'disabled',
+            execution: 'open',
+          },
+        });
       expect(h.provider.calls).toEqual({ submit: 0, retrieve: 0, cancel: 0 });
       expect(h.sender.attempts).toHaveLength(0);
     });

@@ -1111,6 +1111,125 @@ Mock validation only: fake and scripted providers, a recording Telegram sender, 
 - Inbox rows deleted by the reviewed code on other databases cannot be restored; there were none on the development database.
 - A run being sent or protected is cleaned only after it finishes or is resolved, as intended.
 
+### TRB-090 acceptance (2026-10-21)
+
+The owner accepted TRB-090 after review of commit `a095519f30266cf15d6c36b6ea5db096e7e2683b` (implementation and the review fixes for 979352d). The evidence and limitations above are left as recorded. Accepted: minimal inbox deduplication records and redacted accounting and audit metadata may remain indefinitely during beta; retention cleanup stays off by default.
+
+### TRB-100 evidence (2026-10-21, local Windows 11, Docker Desktop, Node 24.19.0, PostgreSQL 17.11, pg-boss 12.37.0)
+
+**Local validation only.**
+- **Not done:** deployment, Railway resources, webhook registration, Telegram messages, OpenAI calls, hosted CI, commits.
+- **Research:** the fake provider (in containers, with `FAKE_PROVIDER_LATENCY_MS` to hold a call open) and scripted providers in tests; no network.
+- **Telegram:** a recording sender in tests; in containers, a local Bot API double on the Docker network that can delay its answers. It recorded no token.
+- **Databases:** disposable databases on the tmpfs test server, plus one temporary PostgreSQL container for the outage check; all dropped afterwards. The development database only received the additive migration.
+- **Railway:** behaviour is taken from its documentation (docs/OPERATIONS.md, section 2), not observed.
+
+**What changed:**
+- **Image.** Base pinned by multi-platform index digest (`node:24.19.0-bookworm-slim@sha256:a9f5f7c9…`, built 2026-08-25, verified with `docker buildx imagetools inspect`).
+  - The Prisma CLI moved to production dependencies, and the build prunes dev dependencies. The image carries the schema engine (`debian-openssl-3.0.x`), `openssl`, `prisma.config.ts` and the migrations.
+  - It still runs as `node`; 896 MB uncompressed.
+  - The lockfile changed only in dev flags.
+- **Migration step.** `node dist/ops/migrate.js`: configuration validation, `prisma migrate deploy`, pg-boss schema, verification.
+- **Execution gate.** No acting component starts, and the webhook answers 503, while a shipped migration is missing or failed or while a durable operational hold exists.
+- **Migration** `20261022090000_trb_100_operational_hold` (additive; empty table).
+- **Lifecycle.** SIGTERM stops every component's new work at once, then drains within `SHUTDOWN_TIMEOUT_SECONDS` (55).
+- **Readiness** gains `schema`, `workers` (required components started and not stalled) and `execution`, plus status `held` (HTTP 200).
+- **Startup waits** for the first queue start (5 s) and administrator bootstrap (3 s) are bounded, so HTTP comes up even when the database host does not resolve.
+- **Webhook secret rotation** (`TELEGRAM_WEBHOOK_SECRET_PREVIOUS`, both compared in constant time).
+- **Operator commands** `ops:status` (with `--quiesced`), `ops:hold`, `ops:webhook`, `ops:migrate`.
+
+| Check | Command | Result |
+|---|---|---|
+| Static checks | `npm run format:check`, `npm run lint`, `npm run typecheck`, `npm run prisma:validate` | Pass |
+| Unit tests | `npm test` | 224 passed (6 new: lifecycle, secret rotation, operations settings) |
+| Integration tests | `TRB_PG_TOOLS_CONTAINER=telegram-research-bot-postgres-test-1 npm run test:integration` | 282 passed (20 files), including `operations.int-spec.ts` (5) and `backup-restore.int-spec.ts` (1). Without the variable the restore suite is skipped |
+| Build | `npm run build`; `docker build -t trb:trb100 .` | Pass |
+| Migration, dev DB | `migrate deploy`, `migrate status`, `migrate diff --from-config-datasource --to-schema prisma/schema.prisma --exit-code` | Applied without reset; "up to date"; exit 0. MD5 over every public table except the new one and `_prisma_migrations` identical before and after; hold table empty |
+| Mutations | gate check removed from the webhook; shutdown signal removed from the queue and the delivery worker | The gate removal failed both gate tests. Removing only one shutdown layer was not detected, because the other layer also prevents the send (defence in depth); removing both failed the shutdown test (a send after shutdown began) |
+
+**Container scenarios** (production image `trb:trb100`, `NODE_ENV=production`, webhook mode against the Bot API double, fake research):
+1. **Fresh database.** `docker run … node dist/ops/migrate.js` applied all 15 migrations and pg-boss schema 45, exit 0; again: "No pending migrations", exit 0; also from another working directory.
+2. **Existing database.** A database at the TRB-090 migration set with rows got only the TRB-100 migration; `app_user` and `telegram_update` hashes unchanged. An older migration set against a newer database: "No pending migrations", exit 0 (rollback case).
+3. **Failed migration.** A conflicting table made `migrate.js` exit 1 with `P3018`.
+   - The application started on that database answered live 200, ready 503 (`schema: down`, `execution: pending`) and webhook 503 with no inbox row, and logged the failed migration name.
+   - Recovery per the runbook: drop the conflict, `migrate resolve --rolled-back`, `migrate.js` exit 0. The gate opened within 15 s, and a webhook update was processed and answered.
+   - An invalid configuration (`RESEARCH_MODE=live` without its variables) also exits 1, naming the variables only.
+4. **Health.** Ready `ok` with all checks up.
+   - Database host unreachable at startup: live 200 after about 9 s, ready 503 (`database`, `queue`, `schema` down), webhook 503. Ready 200 four seconds after the database started.
+   - Database stopped while running: live 200, ready 503 (`database: down`); ready again within 1 s of its return, and the next update was processed.
+   - No connection string or password in the logs.
+5. **Webhook.** No secret 401, wrong secret 401, correct 200. The same update twice: both 200, one inbox row, one delivery, one Telegram send. No token in application logs.
+6. **SIGTERM while idle.** `docker stop` took 0.6–0.9 s, exit 0, "Shutdown complete" after 25 ms.
+7. **SIGTERM during a provider submission** (8 s latency). Stop took 7.2 s, exit 0; the run was left RUNNING / SUBMITTED with its response ID and released lease. After restart: SUCCEEDED, 1 attempt.
+8. **SIGTERM during polling.** The retrieve in flight finished, and the run SUCCEEDED before exit (6.6 s); same response ID, 1 attempt. Hand-over of a run still in progress is covered in-process (below).
+9. **SIGKILL during a provider submission.** After restart, the lease expired and recovery marked the run UNCERTAIN / SUBMISSION_INTERRUPTED, with no response ID and 1 attempt; no further submission was logged.
+10. **SIGTERM during a Telegram send** (8 s answer). Stop took 8.05 s, exit 0, part SENT with its message ID. After restart the part was not sent again (1 received, 1 answered).
+11. **SIGKILL during a Telegram send.** The double still answered, as Telegram may. After restart: delivery and part UNKNOWN / INTERRUPTED_WHILE_SENDING, and the part was not resent.
+12. **Two instances of the same version**, 6 runs from two administrators, the first instance stopped mid-work.
+    - 6 runs, 6 response IDs, 6 attempts, from 2 workers.
+    - 12 parts, all SENT with 12 distinct message IDs; 12 Telegram sends.
+    - No UNKNOWN.
+13. **Operator commands from the image.**
+    - `status.js` reported `UNCERTAIN_RUNS_UNRECONCILED`; on the database with a conflicting table it reported `SCHEMA_NOT_AT_THIS_BUILD` (fixed during validation: it first failed with P2022).
+    - `status.js --quiesced` exited 0 with the app stopped and 1 with a research run active.
+    - `hold.js`: set, status, clear without `--confirm` refused (exit 2), clear.
+    - `reconcile-run.js --list` and `accounting.js --list` worked.
+    - `webhook.js`:
+      - `--info` worked;
+      - `--set` printed a dry run, and `--set --confirm` registered the webhook (`allowed_updates` message and callback_query, `drop_pending_updates: false`, secret length 17);
+      - `--info` then showed `urlMatches` and `allowedUpdatesMatch` true;
+      - `--delete` without `--confirm` was refused, and with it the double recorded `drop_pending_updates: false`.
+    - Polling configuration in production is refused.
+14. **Documented backup commands** (`postgres:17.11-alpine@sha256:b0f9560a…`, built 2026-09-17; credentials in an env file).
+    - `pg_dump --format=custom` of a database with state: 31 table-data entries (public and pgboss).
+    - `pg_restore --single-transaction --exit-on-error` into a new database, exit 0.
+    - `hold.js --set` ran before any application connected. A combined hash over all table contents (except the new hold row) was identical in the source and the copy.
+    - `status.js` on the copy: `OPERATIONAL_HOLD_SET`, plus the source's own `UNCERTAIN_RUNS_UNRECONCILED` and `RESEARCH_LEASE_EXPIRED` (a run handed over at shutdown).
+    - The application on the copy answered ready 200 `held` and webhook 503, and sent nothing.
+
+**In-process scenarios** (`operations.int-spec.ts`, real PostgreSQL and pg-boss):
+- **Missing migration.** Ready 503 without the migration name in the body; the webhook answers 503 and stores nothing. Once the migration is applied, the gate opens and Telegram's retry of the same update is processed.
+- **Failed and newer migrations.** A failed migration blocks; a database with an unknown newer migration is allowed.
+- **Hold.** A queued run and a pending reply stay untouched for 1.5 s (0 provider calls, 0 sends, no dispatch); ready `held`. After clearing, the run succeeds with exactly one submission.
+- **Shutdown during a submission.**
+  - After `beginShutdown()`: ready 503, the HTTP update is still stored, and a job published after shutdown began is not sent.
+  - The submission in flight completes and its response ID is saved, with the lease released.
+  - A new instance resumes polling: 0 new submissions, 1 attempt; the reply is sent once.
+- **Same-version overlap.** Two instances, 4 runs, the first stopped mid-work: 4 submissions, 4 distinct response IDs, sends equal to stored parts, no UNKNOWN.
+
+**Backup and restore** (`backup-restore.int-spec.ts`; `pg_dump`/`pg_restore` 17.11 inside the test server's container):
+- **Synthetic state:**
+  - a settled live run (reservation and ledger);
+  - a research-reconciled, financially resolved run;
+  - an UNRESOLVED, unreconciled live UNCERTAIN run;
+  - purged content and inbox tombstones from a retention pass;
+  - an UNKNOWN delivery and a recorded but unapplied refusal;
+  - a daily task, a queued live run and pending replies.
+- **Restore.** Into a new database: per-table content hashes of every table in `public` and `pgboss`, and the migration list, identical. So were exposure per status, ledger sums, reconciliations, run states, tombstones, delivery states, confirmed message IDs, purged parts, pending refusals, schedules and pending events.
+- **Held.** With the hold set before the first start: 0 provider calls, 0 sends, state unchanged, webhook 503.
+- **After clearing:**
+  - the pending refusal was applied;
+  - each part still waiting at backup time was attempted once, and no confirmed part was resent;
+  - UNKNOWN stayed UNKNOWN;
+  - accounting was unchanged;
+  - the queued live run did not start, because the unreconciled live UNCERTAIN run keeps live research closed (0 submissions);
+  - a replay of an update processed before the backup was a duplicate.
+
+**Not run:**
+- anything on Railway (deployment, pre-deploy, health checks, draining, rollback, volume backups, PITR, `railway ssh`);
+- a real webhook or Telegram message;
+- OpenAI;
+- hosted CI;
+- arbitrary cross-version overlap (only same-version, and TRB-090 → TRB-100 is classified B by review, not by test);
+- SIGTERM during polling of a response still in progress inside a container (the fake provider completes on the first poll; covered in-process).
+
+**Remaining limitations:**
+- **Platform facts unconfirmed.** The Railway assumptions and open questions in docs/OPERATIONS.md, section 2.
+- **Draining time.** It must be set to 60 s; with Railway's default of 0, in-flight work is recovered as UNCERTAIN or UNKNOWN instead of finishing.
+- **A hold set while running** takes effect only after a restart.
+- **Stale restores.** Restoring an older backup cannot undo OpenAI requests or Telegram messages after it; the runbook's reconciliation reduces, but cannot remove, duplicates and unknown spend.
+- **Image size.** 896 MB, with the Prisma CLI included for migrations.
+
 ## Release checklist
 
 - Exact model/tool compatibility verified in official docs and an authorized sample.

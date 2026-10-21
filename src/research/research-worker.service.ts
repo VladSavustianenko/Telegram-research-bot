@@ -14,6 +14,7 @@ import type { ReservationPolicy } from '../accounting/pricing';
 import { abortableSleep } from '../common/abortable-sleep';
 import { CLOCK, type Clock } from '../common/clock';
 import { errorInfo } from '../common/error-info';
+import { AppLifecycle } from '../common/lifecycle';
 import { APP_CONFIG } from '../config/config.module';
 import {
   MAX_SUBMISSION_RETRY_DELAY_SECONDS,
@@ -28,6 +29,7 @@ import { renderReport } from '../delivery/report-renderer';
 import { Prisma, type AppUser } from '../generated/prisma/client';
 import { submissionDenial } from '../identity/authorization';
 import { lockUserForShare } from '../identity/users';
+import { ExecutionGate } from '../operations/execution-gate';
 import { QueueService, RESEARCH_QUEUE, type ResearchJob } from '../queue/queue.service';
 import { ADMISSION_LOCK_KEY } from './admission';
 import { cancelOverdueQueued, cancelUnadmitted } from './lifecycle';
@@ -183,12 +185,27 @@ export class ResearchWorker implements OnApplicationBootstrap, OnModuleDestroy {
     @Inject(CLOCK) private readonly clock: Clock,
     private readonly queue: QueueService,
     private readonly dispatcher: OutboxDispatcher,
+    private readonly lifecycle: AppLifecycle,
+    private readonly gate: ExecutionGate,
     @Optional() @Inject(RESEARCH_PROVIDER) private readonly provider: ResearchProvider | null,
-  ) {}
+  ) {
+    lifecycle.shutdownSignal.addEventListener('abort', () => this.shutdown.abort(), { once: true });
+  }
 
   onApplicationBootstrap(): void {
     if (this.config.BACKGROUND_WORKERS !== 'on' || !this.provider) return;
-    this.queue.onUp(() => this.queue.work((job) => this.process(job)));
+    this.lifecycle.register('research-worker');
+    this.gate.whenOpen(() =>
+      this.queue.onUp(async () => {
+        try {
+          await this.queue.work((job) => this.process(job));
+          this.lifecycle.mark('research-worker', 'up');
+        } catch (error) {
+          this.lifecycle.mark('research-worker', 'failed');
+          throw error;
+        }
+      }),
+    );
   }
 
   /**

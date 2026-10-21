@@ -3,10 +3,12 @@ import { Test } from '@nestjs/testing';
 import request from 'supertest';
 import { afterEach, describe, expect, it } from 'vitest';
 import { httpServer } from '../../test/support/http';
+import { openGate } from '../../test/support/open-gate';
 import { TcpFixture } from '../../test/support/tcp-fixture';
 import { AppModule } from '../app.module';
 import { parseEnv } from '../config/env.schema';
 import { PrismaService } from '../database/prisma.service';
+import { ExecutionGate } from '../operations/execution-gate';
 import { READINESS_TIMEOUT_MS } from './health.service';
 
 // Real pg driver against a loopback TCP server that accepts connections but
@@ -30,6 +32,8 @@ describe('readiness against a stalled database endpoint', () => {
     const moduleRef = await Test.createTestingModule({ imports: [AppModule.forRoot(config)] })
       .overrideProvider(READINESS_TIMEOUT_MS)
       .useValue(READINESS_TIMEOUT)
+      .overrideProvider(ExecutionGate)
+      .useValue(openGate())
       .compile();
     app = moduleRef.createNestApplication({ logger: false });
     await app.init();

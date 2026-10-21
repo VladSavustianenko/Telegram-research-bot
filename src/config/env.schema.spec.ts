@@ -214,3 +214,38 @@ describe('queue execution settings (TRB-060)', () => {
     ).toBe(2);
   });
 });
+
+describe('operations settings (TRB-100)', () => {
+  it('bounds shutdown, keeps fake latency off and retention cleanup off by default', () => {
+    expect(parseEnv(base)).toMatchObject({
+      SHUTDOWN_TIMEOUT_SECONDS: 55,
+      FAKE_PROVIDER_LATENCY_MS: 0,
+      RETENTION_CLEANUP: 'off',
+      TELEGRAM_MODE: 'disabled',
+      RESEARCH_MODE: 'disabled',
+    });
+    expect(problemsOf({ ...base, SHUTDOWN_TIMEOUT_SECONDS: '5' })).toEqual([
+      'SHUTDOWN_TIMEOUT_SECONDS must be between 10 and 300',
+    ]);
+    expect(problemsOf({ ...base, FAKE_PROVIDER_LATENCY_MS: '-1' })).toHaveLength(1);
+  });
+
+  it('accepts a previous webhook secret for rotation only when it differs', () => {
+    const webhook = {
+      ...base,
+      TELEGRAM_MODE: 'webhook',
+      TELEGRAM_BOT_TOKEN: 'token',
+      ADMIN_TELEGRAM_IDS: '1',
+      TELEGRAM_WEBHOOK_SECRET: 'new_secret',
+    };
+    expect(
+      parseEnv({ ...webhook, TELEGRAM_WEBHOOK_SECRET_PREVIOUS: 'old_secret' })
+        .TELEGRAM_WEBHOOK_SECRET_PREVIOUS,
+    ).toBe('old_secret');
+    const problems = problemsOf({ ...webhook, TELEGRAM_WEBHOOK_SECRET_PREVIOUS: 'new_secret' });
+    expect(problems).toEqual([
+      'TELEGRAM_WEBHOOK_SECRET_PREVIOUS must differ from TELEGRAM_WEBHOOK_SECRET',
+    ]);
+    expect(problems.join()).not.toContain('new_secret');
+  });
+});

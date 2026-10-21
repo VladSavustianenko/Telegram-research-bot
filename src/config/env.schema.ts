@@ -136,6 +136,16 @@ export const envSchema = z
           'must be 1-256 characters of A-Z, a-z, 0-9, "_" or "-" (Telegram secret_token rules)',
         ),
     ),
+    // TRB-100 secret rotation (docs/OPERATIONS.md): also accepted while Telegram may still
+    // send it; remove it once setWebhook with the new secret succeeded.
+    TELEGRAM_WEBHOOK_SECRET_PREVIOUS: optional(
+      z
+        .string()
+        .regex(
+          /^[A-Za-z0-9_-]{1,256}$/,
+          'must be 1-256 characters of A-Z, a-z, 0-9, "_" or "-" (Telegram secret_token rules)',
+        ),
+    ),
     PUBLIC_BASE_URL: optional(z.url({ protocol: /^https?$/, error: 'must be an http(s) URL' })),
     ADMIN_TELEGRAM_IDS: optional(telegramIdList),
     // Optional bot username (without "@") for t.me invitation links; without it the
@@ -224,6 +234,22 @@ export const envSchema = z
       `must be at most ${MAX_SUBMISSION_RETRY_DELAY_SECONDS}`,
     ),
     WORKER_POLL_INTERVAL_MS: positiveIntWithDefault(2_000),
+    // TRB-100 shutdown bound (docs/OPERATIONS.md): after SIGTERM the process exits at the
+    // latest after this time, even if work is still draining. Must stay below the
+    // platform's SIGTERM-to-SIGKILL window (Railway: drainingSeconds).
+    SHUTDOWN_TIMEOUT_SECONDS: positiveIntWithDefault(55).refine(
+      (seconds) => seconds >= 10 && seconds <= 300,
+      'must be between 10 and 300',
+    ),
+    // Simulated provider latency for RESEARCH_MODE=fake only (rehearsing shutdown and
+    // recovery locally); 0 = immediate. Ignored in live mode.
+    FAKE_PROVIDER_LATENCY_MS: z
+      .preprocess(
+        emptyAsUnset,
+        z.string().regex(/^\d+$/, 'must be a non-negative integer').transform(Number).optional(),
+      )
+      .default(0)
+      .refine((ms) => ms <= 60_000, 'must be at most 60000'),
     OPENAI_POLL_INTERVAL_MS: positiveIntWithDefault(3_000),
 
     // OpenAI (required when RESEARCH_MODE=live). No default model: the operator must choose one.
@@ -298,6 +324,12 @@ export const envSchema = z
     }
     if (env.TELEGRAM_MODE === 'webhook') {
       requireFor('TELEGRAM_MODE=webhook', ['TELEGRAM_WEBHOOK_SECRET']);
+    }
+    if (
+      env.TELEGRAM_WEBHOOK_SECRET_PREVIOUS !== undefined &&
+      env.TELEGRAM_WEBHOOK_SECRET_PREVIOUS === env.TELEGRAM_WEBHOOK_SECRET
+    ) {
+      problem('TELEGRAM_WEBHOOK_SECRET_PREVIOUS', 'must differ from TELEGRAM_WEBHOOK_SECRET');
     }
     if (env.TELEGRAM_MODE === 'polling' && env.NODE_ENV === 'production') {
       problem('TELEGRAM_MODE', 'polling is for development only; use webhook in production');

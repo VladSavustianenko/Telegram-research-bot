@@ -5,10 +5,13 @@ import request from 'supertest';
 import { inject } from 'vitest';
 import { AppModule } from '../../src/app.module';
 import { CLOCK } from '../../src/common/clock';
+import { AppLifecycle } from '../../src/common/lifecycle';
 import { parseEnv } from '../../src/config/env.schema';
 import { PrismaService } from '../../src/database/prisma.service';
 import { DeliveryDispatcher } from '../../src/delivery/delivery-dispatcher';
 import { DeliveryWorker } from '../../src/delivery/delivery-worker.service';
+import { ExecutionGate, SHIPPED_MIGRATIONS } from '../../src/operations/execution-gate';
+import { shippedMigrations } from '../../src/operations/schema-state';
 import { QueueService } from '../../src/queue/queue.service';
 import { OutboxDispatcher } from '../../src/research/outbox-dispatcher';
 import { RESEARCH_PROVIDER } from '../../src/research/provider/provider.types';
@@ -65,6 +68,8 @@ export interface Harness {
   delivery: DeliveryWorker;
   deliveryDispatcher: DeliveryDispatcher;
   retention: RetentionService;
+  lifecycle: AppLifecycle;
+  gate: ExecutionGate;
   provider: ScriptedProvider;
   sender: RecordingSender;
   clock: FakeClock;
@@ -81,6 +86,8 @@ export async function startHarness(
     sender?: RecordingSender;
     clock?: FakeClock;
     databaseUrl?: string;
+    /** Migrations this "build" ships (TRB-100 schema check); default: prisma/migrations. */
+    shippedMigrations?: () => string[];
   } = {},
 ): Promise<Harness> {
   const config = parseEnv({
@@ -114,6 +121,8 @@ export async function startHarness(
     .useValue(sender)
     .overrideProvider(CLOCK)
     .useValue(clock)
+    .overrideProvider(SHIPPED_MIGRATIONS)
+    .useValue(deps.shippedMigrations ?? (() => shippedMigrations()))
     .compile();
   const app = moduleRef.createNestApplication({ logger });
   await app.init();
@@ -128,6 +137,8 @@ export async function startHarness(
     delivery: app.get(DeliveryWorker),
     deliveryDispatcher: app.get(DeliveryDispatcher),
     retention: app.get(RetentionService),
+    lifecycle: app.get(AppLifecycle),
+    gate: app.get(ExecutionGate),
     provider,
     sender,
     clock,
@@ -152,7 +163,7 @@ export async function resetDatabase(
   options: { onboardedAdmins?: boolean } = {},
 ): Promise<void> {
   await prisma.$executeRawUnsafe(
-    'TRUNCATE usage_ledger, budget_reservation, pricing_version, outbox_event, task_draft, task, audit_event, invitation, research_tool_item, research_reconciliation, research_attempt, schedule_event, delivery_event, delivery_part, delivery, research_run, telegram_update, app_user RESTART IDENTITY CASCADE',
+    'TRUNCATE operational_hold, usage_ledger, budget_reservation, pricing_version, outbox_event, task_draft, task, audit_event, invitation, research_tool_item, research_reconciliation, research_attempt, schedule_event, delivery_event, delivery_part, delivery, research_run, telegram_update, app_user RESTART IDENTITY CASCADE',
   );
   // Jobs of earlier tests (pg-boss's own schema, installed by the global setup).
   await prisma.$executeRawUnsafe('TRUNCATE pgboss.job');

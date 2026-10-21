@@ -177,6 +177,18 @@ describe('TRB-030 migration on a database with TRB-020 records', () => {
     for (const name of migrations.slice(firstTrb030)) {
       await client.query(readFileSync(join(MIGRATIONS, name, 'migration.sql'), 'utf8'));
     }
+    // Record them as Prisma does, so the application's schema check (TRB-100) sees them applied.
+    await client.query(`CREATE TABLE _prisma_migrations (
+      id varchar(36) PRIMARY KEY, checksum varchar(64) NOT NULL, finished_at timestamptz,
+      migration_name varchar(255) NOT NULL, logs text, rolled_back_at timestamptz,
+      started_at timestamptz NOT NULL DEFAULT now(), applied_steps_count integer NOT NULL DEFAULT 0)`);
+    for (const name of migrations) {
+      await client.query(
+        `INSERT INTO _prisma_migrations (id, checksum, finished_at, migration_name, applied_steps_count)
+         VALUES (gen_random_uuid(), 'test', now(), $1, 1)`,
+        [name],
+      );
+    }
   });
 
   afterAll(async () => {

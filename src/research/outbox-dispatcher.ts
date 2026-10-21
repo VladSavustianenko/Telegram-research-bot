@@ -5,10 +5,12 @@ import {
   OnApplicationBootstrap,
   OnModuleDestroy,
 } from '@nestjs/common';
-import { WorkerLoop } from '../common/worker-loop';
+import { AppLifecycle } from '../common/lifecycle';
+import { WorkerLoop, loopStaleAfterMs } from '../common/worker-loop';
 import { APP_CONFIG } from '../config/config.module';
 import type { Env } from '../config/env.schema';
 import { PrismaService } from '../database/prisma.service';
+import { ExecutionGate } from '../operations/execution-gate';
 import { QueueService, RESEARCH_QUEUE } from '../queue/queue.service';
 import { cancelOverdueQueued, cancelUnadmitted } from './lifecycle';
 import { EXECUTE_EVENT, TERMINAL_RUN_STATES, WAKE_EVENT } from './wake';
@@ -57,20 +59,25 @@ export class OutboxDispatcher implements OnApplicationBootstrap, OnModuleDestroy
     private readonly prisma: PrismaService,
     @Inject(APP_CONFIG) private readonly config: Env,
     private readonly queue: QueueService,
+    private readonly lifecycle: AppLifecycle,
+    private readonly gate: ExecutionGate,
   ) {}
 
   onApplicationBootstrap(): void {
-    if (this.config.BACKGROUND_WORKERS !== 'on') return;
-    this.queue.onUp(() => {
-      this.loop = new WorkerLoop(
-        'Outbox dispatcher',
-        this.config.WORKER_POLL_INTERVAL_MS,
-        () => this.tick(),
-        this.logger,
-      );
-      this.loop.start();
-      return Promise.resolve();
-    });
+    // Runs whenever this process has a queue (as before TRB-100: started by queue.onUp).
+    if (this.config.BACKGROUND_WORKERS !== 'on' || this.queue.status === 'disabled') return;
+    const interval = this.config.WORKER_POLL_INTERVAL_MS;
+    this.lifecycle.register('outbox-dispatcher', { staleAfterMs: loopStaleAfterMs(interval) });
+    this.gate.whenOpen(() =>
+      this.queue.onUp(() => {
+        this.loop = new WorkerLoop('Outbox dispatcher', interval, () => this.tick(), this.logger, {
+          lifecycle: this.lifecycle,
+          component: 'outbox-dispatcher',
+        });
+        this.loop.start();
+        return Promise.resolve();
+      }),
+    );
   }
 
   async onModuleDestroy(): Promise<void> {

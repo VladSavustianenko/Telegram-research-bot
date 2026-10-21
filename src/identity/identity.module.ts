@@ -1,4 +1,5 @@
 import { Inject, Injectable, Logger, Module, OnApplicationBootstrap } from '@nestjs/common';
+import { abortableSleep } from '../common/abortable-sleep';
 import { errorInfo } from '../common/error-info';
 import { APP_CONFIG } from '../config/config.module';
 import type { Env } from '../config/env.schema';
@@ -10,7 +11,11 @@ import { bootstrapAdministrators } from './users';
  * database is unreachable) is logged, not fatal: the same configuration is
  * applied lazily to each sender on their next update, and authorization
  * always requires the current ADMIN_TELEGRAM_IDS as well as the stored role.
+ * Startup waits for it at most BOOTSTRAP_WAIT_MS (TRB-100) so that HTTP comes
+ * up promptly while the database is unreachable.
  */
+const BOOTSTRAP_WAIT_MS = 3_000;
+
 @Injectable()
 export class AdminBootstrapService implements OnApplicationBootstrap {
   private readonly logger = new Logger(AdminBootstrapService.name);
@@ -21,6 +26,10 @@ export class AdminBootstrapService implements OnApplicationBootstrap {
   ) {}
 
   async onApplicationBootstrap(): Promise<void> {
+    await Promise.race([this.run(), abortableSleep(BOOTSTRAP_WAIT_MS)]);
+  }
+
+  private async run(): Promise<void> {
     try {
       const summary = await bootstrapAdministrators(this.prisma, this.config);
       if (!summary.skipped) this.logger.log({ message: 'Administrator bootstrap', ...summary });

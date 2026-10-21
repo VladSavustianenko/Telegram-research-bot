@@ -1,6 +1,6 @@
 # Telegram Research Bot — implementation brief
 
-Version: 1.0 · 2026-10-18 · Documentation package, project foundation (TRB-010, DONE), first research-to-Telegram slice (TRB-020, DONE; tool-call metering unresolved) invitations, identity and authorization (TRB-030, DONE), task management with durable dialogs (TRB-040, DONE; schedules are not executed yet) and atomic admission, quotas and cost accounting (TRB-050, ready for review).
+Version: 1.0 · 2026-10-18 · Documentation package and implementation: TRB-010 to TRB-090 DONE (TRB-020: tool-call metering unresolved); TRB-100 (Railway readiness and operational runbook) ready for review; not deployed. Status per task: docs/BACKLOG.md.
 
 Build a private-beta, multi-user Telegram bot that runs user-authored research prompts manually or on a schedule, uses OpenAI web search, and delivers sourced results. Deploy one NestJS application and PostgreSQL on Railway.
 
@@ -54,7 +54,7 @@ Checks:
 | `npm test` | Unit tests; no database and no external network (stalled-database tests use a loopback TCP fixture), `DATABASE_URL` is removed from the test environment |
 | `npm run test:integration` | Creates a uniquely named database on the `TEST_DATABASE_URL` server, applies migrations, runs tests, drops it. Refuses non-loopback hosts (unless `TEST_DATABASE_ALLOW_NON_LOCAL=true`), endpoint-overriding query parameters (`host`, `hostaddr`, `port`, `service`, `servicefile`) in either URL, and any server that may be the one used by `DATABASE_URL` (same port and same host or both loopback aliases) |
 | `npm run build` | Compiles to `dist/` |
-| `docker build -t telegram-research-bot .` | Production image; `node dist/main.js` as non-root user |
+| `docker build -t telegram-research-bot .` | Production image (pinned base digest): `node dist/main.js` as non-root user; `node dist/ops/migrate.js` is the deployment migration step (TRB-100) |
 
 The dev database uses port 5434 so that it does not collide with a locally installed PostgreSQL on 5432. CI (`.github/workflows/ci.yml`) runs the same checks against a PostgreSQL service container, with no secrets and no paid external calls.
 
@@ -122,7 +122,19 @@ Details, state transitions, retry classification, document format and rollout: [
 
 Details: [docs/ADMINISTRATION.md](docs/ADMINISTRATION.md) and [docs/RETENTION.md](docs/RETENTION.md).
 
-Prisma owns the `public` schema and its migrations in `prisma/migrations`; pg-boss owns a separate schema (`QUEUE_SCHEMA`, default `pgboss`), which the application installs at startup (TRB-060). The generated Prisma client is written to `src/generated/prisma` (not committed).
+### Deployment and operations (TRB-100)
+
+Not deployed yet. [docs/OPERATIONS.md](docs/OPERATIONS.md) is the Railway runbook: deployment design, service settings, environment checklist, migrations, release classes and rollback, webhook registration and secret rotation, shutdown and recovery, diagnostics, backup and restore, incident procedures. Operator commands run from the production image (`node dist/ops/<name>.js`; locally `npm run ops:<name>` after `npm run build`):
+
+| Command | Purpose |
+|---|---|
+| `migrate` | Deployment step: `prisma migrate deploy`, pg-boss schema, verification |
+| `status` | Read-only diagnostics: schema, hold, queue age, stalled work, scheduler lag, UNCERTAIN runs, UNKNOWN and failed deliveries, pending blocks, accounting, retention. `--quiesced` checks that nothing executes |
+| `hold` | Durable execution hold for restored or suspect databases |
+| `webhook` | Explicit `getWebhookInfo` / `setWebhook` / `deleteWebhook`; never drops pending updates |
+| `reconcile`, `accounting`, `tool-telemetry` | Existing operator commands (TRB-020, TRB-050) |
+
+Prisma owns the `public` schema and its migrations in `prisma/migrations`; pg-boss owns a separate schema (`QUEUE_SCHEMA`, default `pgboss`), which the deployment step and the application install (TRB-060, TRB-100). The generated Prisma client is written to `src/generated/prisma` (not committed).
 
 ## Reference documentation
 

@@ -7,10 +7,12 @@ import {
   Optional,
 } from '@nestjs/common';
 import { errorInfo } from '../common/error-info';
-import { WorkerLoop } from '../common/worker-loop';
+import { AppLifecycle } from '../common/lifecycle';
+import { WorkerLoop, loopStaleAfterMs } from '../common/worker-loop';
 import { APP_CONFIG } from '../config/config.module';
 import type { Env } from '../config/env.schema';
 import { PrismaService } from '../database/prisma.service';
+import { ExecutionGate } from '../operations/execution-gate';
 import { DELIVERY_QUEUE, QueueService } from '../queue/queue.service';
 import { TELEGRAM_SENDER, type TelegramSender } from '../telegram/telegram-sender';
 import {
@@ -62,21 +64,31 @@ export class DeliveryDispatcher implements OnApplicationBootstrap, OnModuleDestr
     private readonly prisma: PrismaService,
     @Inject(APP_CONFIG) private readonly config: Env,
     private readonly queue: QueueService,
+    private readonly lifecycle: AppLifecycle,
+    private readonly gate: ExecutionGate,
     @Optional() @Inject(TELEGRAM_SENDER) private readonly sender: TelegramSender | null,
   ) {}
 
   onApplicationBootstrap(): void {
     if (this.config.BACKGROUND_WORKERS !== 'on' || !this.sender) return;
-    this.queue.onUp(() => {
-      this.loop = new WorkerLoop(
-        'Delivery dispatcher',
-        this.config.WORKER_POLL_INTERVAL_MS,
-        () => this.tick(),
-        this.logger,
-      );
-      this.loop.start();
-      return Promise.resolve();
-    });
+    const interval = this.config.WORKER_POLL_INTERVAL_MS;
+    this.lifecycle.register('delivery-dispatcher', { staleAfterMs: loopStaleAfterMs(interval) });
+    this.gate.whenOpen(() =>
+      this.queue.onUp(() => {
+        this.loop = new WorkerLoop(
+          'Delivery dispatcher',
+          interval,
+          () => this.tick(),
+          this.logger,
+          {
+            lifecycle: this.lifecycle,
+            component: 'delivery-dispatcher',
+          },
+        );
+        this.loop.start();
+        return Promise.resolve();
+      }),
+    );
   }
 
   async onModuleDestroy(): Promise<void> {

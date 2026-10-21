@@ -8,11 +8,14 @@ import {
 import { Api, GrammyError } from 'grammy';
 import { abortableSleep } from '../common/abortable-sleep';
 import { errorInfo } from '../common/error-info';
+import { AppLifecycle } from '../common/lifecycle';
 import { APP_CONFIG } from '../config/config.module';
 import type { Env } from '../config/env.schema';
+import { ExecutionGate } from '../operations/execution-gate';
 import { TelegramIngressService } from './ingress.service';
 
 const LONG_POLL_SECONDS = 25;
+const COMPONENT = 'telegram-polling';
 
 /**
  * Development-only long polling (TELEGRAM_MODE=polling). It never deletes a
@@ -29,16 +32,29 @@ export class TelegramPollingService implements OnApplicationBootstrap, OnModuleD
   constructor(
     private readonly ingress: TelegramIngressService,
     @Inject(APP_CONFIG) private readonly config: Env,
-  ) {}
+    private readonly lifecycle: AppLifecycle,
+    private readonly gate: ExecutionGate,
+  ) {
+    lifecycle.shutdownSignal.addEventListener('abort', () => this.controller.abort(), {
+      once: true,
+    });
+  }
 
   onApplicationBootstrap(): void {
     if (this.config.TELEGRAM_MODE !== 'polling' || this.config.BACKGROUND_WORKERS !== 'on') return;
-    if (!this.config.TELEGRAM_BOT_TOKEN) return;
-    const api = new Api(this.config.TELEGRAM_BOT_TOKEN, {
-      timeoutSeconds: LONG_POLL_SECONDS + 10,
-      ...(this.config.TELEGRAM_API_ROOT ? { apiRoot: this.config.TELEGRAM_API_ROOT } : {}),
+    const token = this.config.TELEGRAM_BOT_TOKEN;
+    if (!token) return;
+    // A stopped poller (409 conflict) reports not ready; a long poll lasts at most ~35 s.
+    this.lifecycle.register(COMPONENT, { staleAfterMs: 300_000 });
+    this.gate.whenOpen(() => {
+      if (this.controller.signal.aborted) return;
+      const api = new Api(token, {
+        timeoutSeconds: LONG_POLL_SECONDS + 10,
+        ...(this.config.TELEGRAM_API_ROOT ? { apiRoot: this.config.TELEGRAM_API_ROOT } : {}),
+      });
+      this.lifecycle.mark(COMPONENT, 'up');
+      this.running = this.run(api);
     });
-    this.running = this.run(api);
   }
 
   async onModuleDestroy(): Promise<void> {
@@ -58,6 +74,7 @@ export class TelegramPollingService implements OnApplicationBootstrap, OnModuleD
           // grammY types its signal with the abort-controller polyfill; Node's is compatible.
           signal as unknown as Parameters<Api['getUpdates']>[1],
         );
+        this.lifecycle.heartbeat(COMPONENT);
         for (const update of updates) {
           await this.ingress.handle(update);
           offset = update.update_id + 1;
@@ -68,6 +85,7 @@ export class TelegramPollingService implements OnApplicationBootstrap, OnModuleD
           this.logger.error({
             message: 'Polling conflicts with a webhook or another poller; stopping',
           });
+          this.lifecycle.mark(COMPONENT, 'failed');
           return;
         }
         this.logger.warn({ message: 'Telegram polling failed', ...errorInfo(error) });

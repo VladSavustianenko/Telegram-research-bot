@@ -17,14 +17,22 @@ import {
 export class FakeResearchProvider implements ResearchProvider {
   readonly kind = 'fake' as const;
 
+  /** `latencyMs` (FAKE_PROVIDER_LATENCY_MS) delays submit and retrieve, for shutdown rehearsals. */
+  constructor(private readonly latencyMs = 0) {}
+
   submit(request: ResearchRequest): Promise<ProviderSnapshot> {
     const key = fixtureFor(request.input);
     const id = `fake_${key}_${request.maxOutputTokens}_${request.maxToolCalls}_${randomUUID()}`;
-    return Promise.resolve().then(() => this.snapshot(id, 'queued'));
+    return this.delay().then(() => this.snapshot(id, 'queued'));
   }
 
   retrieve(responseId: string): Promise<ProviderSnapshot> {
-    return Promise.resolve().then(() => this.snapshot(responseId, 'completed'));
+    return this.delay().then(() => this.snapshot(responseId, 'completed'));
+  }
+
+  private delay(): Promise<void> {
+    if (this.latencyMs === 0) return Promise.resolve();
+    return new Promise((resolve) => setTimeout(resolve, this.latencyMs));
   }
 
   cancel(responseId: string): Promise<ProviderSnapshot> {

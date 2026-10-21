@@ -7,11 +7,13 @@ import {
 } from '@nestjs/common';
 import { CLOCK, type Clock } from '../common/clock';
 import { errorInfo } from '../common/error-info';
-import { WorkerLoop } from '../common/worker-loop';
+import { AppLifecycle } from '../common/lifecycle';
+import { WorkerLoop, loopStaleAfterMs } from '../common/worker-loop';
 import { APP_CONFIG } from '../config/config.module';
 import type { Env } from '../config/env.schema';
 import type { Tx } from '../database/prisma-errors';
 import { PrismaService } from '../database/prisma.service';
+import { ExecutionGate } from '../operations/execution-gate';
 import { cancelDeliveryEvents, wakeNextInChat } from '../delivery/delivery-records';
 import { lockTelegramIdentity, lockUserByTelegramId } from '../identity/users';
 
@@ -65,17 +67,21 @@ export class RetentionService implements OnApplicationBootstrap, OnModuleDestroy
     private readonly prisma: PrismaService,
     @Inject(APP_CONFIG) private readonly config: Env,
     @Inject(CLOCK) private readonly clock: Clock,
+    private readonly lifecycle: AppLifecycle,
+    private readonly gate: ExecutionGate,
   ) {}
 
   onApplicationBootstrap(): void {
     if (this.config.BACKGROUND_WORKERS !== 'on' || this.config.RETENTION_CLEANUP !== 'on') return;
-    this.loop = new WorkerLoop(
-      'Retention cleanup',
-      this.config.RETENTION_INTERVAL_SECONDS * 1_000,
-      () => this.tick(),
-      this.logger,
-    );
-    this.loop.start();
+    const interval = this.config.RETENTION_INTERVAL_SECONDS * 1_000;
+    this.lifecycle.register('retention', { staleAfterMs: loopStaleAfterMs(interval) });
+    this.gate.whenOpen(() => {
+      this.loop = new WorkerLoop('Retention cleanup', interval, () => this.tick(), this.logger, {
+        lifecycle: this.lifecycle,
+        component: 'retention',
+      });
+      this.loop.start();
+    });
   }
 
   async onModuleDestroy(): Promise<void> {

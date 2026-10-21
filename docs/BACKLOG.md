@@ -109,12 +109,16 @@ Implement invitations, suspension/reactivation, limits, aggregate usage/failure 
 
 Acceptance: admin operations are authorized and auditable; user suspension prevents new work and pending delivery; no routine admin view reveals user report content; retention clears content on schedule while unresolved accounting survives; reactivation does not release stale reports in bulk.
 
-Status: READY FOR REVIEW (2026-10-21). Mock validation only: fake and scripted providers (no network), recording Telegram sender, real PostgreSQL and pg-boss; Docker smoke with the fake provider and a local Bot API double; no live request or Telegram message. Behaviour: docs/ADMINISTRATION.md and docs/RETENTION.md. Evidence: docs/VALIDATION.md, "TRB-090 evidence". Migration `20261021150000_trb_090_admin_retention` (additive). Review fixes for 979352d (2026-10-21, "TRB-090 review fixes"):
+Status: DONE — accepted by the owner on 2026-10-21 after review of commit a095519f30266cf15d6c36b6ea5db096e7e2683b (implementation and the review fixes for 979352d). Mock validation only: fake and scripted providers (no network), recording Telegram sender, real PostgreSQL and pg-boss; Docker smoke with the fake provider and a local Bot API double; no live request or Telegram message. Behaviour: docs/ADMINISTRATION.md and docs/RETENTION.md. Evidence: docs/VALIDATION.md, "TRB-090 evidence" and "TRB-090 review fixes". Migrations `20261021150000_trb_090_admin_retention` and `20261021180000_trb_090_inbox_tombstones` (additive). Review fixes for 979352d (2026-10-21):
 - protected or busy runs no longer starve retention cleanup;
-- inbox records are kept as deduplication tombstones instead of being deleted (additive migration `20261021180000_trb_090_inbox_tombstones`).
+- inbox records are kept as deduplication tombstones instead of being deleted.
+
+Accepted policies and limitations:
 - **Cleanup is off by default.** `RETENTION_CLEANUP=off`. Enabling it is an owner decision, and it was not enabled on the development data.
 - **Owner decision needed.** Redacted run records and accounting evidence are kept rather than deleted after 90 days (docs/RETENTION.md, a suggested change to SPEC §7).
 - **Defaults unchanged.** Numeric defaults stay configurable beta proposals; live research stays administrator-only.
+- **Kept indefinitely during beta.** Minimal inbox deduplication records (tombstones) and redacted accounting and audit metadata. The inbox grows by one small row per update.
+- **Not reconstructible.** Inbox rows deleted by the reviewed pre-fix code on other databases cannot be restored (none on the development database).
 
 ## TRB-100 — Railway readiness and operational runbook
 
@@ -123,6 +127,10 @@ Depends on: 060, 070, 080, 090.
 Prepare deployment configuration, migrations, webhook registration procedure, graceful shutdown, liveness/readiness, logs, backup/restore and rollback instructions. Deployment itself requires the owner's request and secrets.
 
 Acceptance: restart/deployment-overlap recovery demonstrated locally or in authorized staging; no paid calls in health checks; backup restore checked against an isolated DB; runbook explains UNKNOWN states and budget reconciliation; no public rollout is claimed until actually performed.
+
+Status: READY FOR REVIEW (2026-10-21). Deployment preparation and local validation only: nothing deployed, no Railway resource created or changed, no webhook registered, no Telegram message, no OpenAI call. Runbook: docs/OPERATIONS.md. Evidence: docs/VALIDATION.md, "TRB-100 evidence" (production image, migration step, shutdown and recovery with signals, two-instance overlap, backup and isolated restore; fake provider, local Bot API double, disposable databases). Migration `20261022090000_trb_100_operational_hold` (additive).
+- **Railway behaviour** is taken from the documentation (checked 2026-10-21), not observed; assumptions and open questions are in docs/OPERATIONS.md, section 2.
+- **No Railway config file.** Railway's config as code is deprecated (until 2026-12-01) and its replacement applies resources, so the service settings are a documented checklist.
 
 ## TRB-110 — Beta acceptance
 

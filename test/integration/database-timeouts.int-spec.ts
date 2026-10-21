@@ -6,7 +6,9 @@ import { AppModule } from '../../src/app.module';
 import { parseEnv } from '../../src/config/env.schema';
 import { PrismaService } from '../../src/database/prisma.service';
 import { READINESS_TIMEOUT_MS } from '../../src/health/health.service';
+import { ExecutionGate } from '../../src/operations/execution-gate';
 import { httpServer } from '../support/http';
+import { openGate } from '../support/open-gate';
 import { TcpFixture } from '../support/tcp-fixture';
 
 describe('database timeouts against real PostgreSQL', () => {
@@ -18,6 +20,9 @@ describe('database timeouts against real PostgreSQL', () => {
     const moduleRef = await Test.createTestingModule({ imports: [AppModule.forRoot(config)] })
       .overrideProvider(READINESS_TIMEOUT_MS)
       .useValue(200)
+      // Connection-count assertions: the gate's own query is not part of what is measured.
+      .overrideProvider(ExecutionGate)
+      .useValue(openGate())
       .compile();
     app = moduleRef.createNestApplication({ logger: false });
     await app.init();

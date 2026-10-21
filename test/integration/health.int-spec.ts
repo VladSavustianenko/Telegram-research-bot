@@ -31,7 +31,14 @@ describe('health against real PostgreSQL', () => {
       .get('/health/ready')
       .expect(200, {
         status: 'ok',
-        checks: { config: 'up', database: 'up', queue: 'disabled' },
+        checks: {
+          config: 'up',
+          database: 'up',
+          queue: 'disabled',
+          schema: 'up',
+          workers: 'disabled',
+          execution: 'open',
+        },
       });
 
     const prisma = started.get(PrismaService);

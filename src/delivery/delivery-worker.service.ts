@@ -9,6 +9,7 @@ import {
   Optional,
 } from '@nestjs/common';
 import { errorInfo } from '../common/error-info';
+import { AppLifecycle } from '../common/lifecycle';
 import { APP_CONFIG } from '../config/config.module';
 import type { Env } from '../config/env.schema';
 import type { Tx } from '../database/prisma-errors';
@@ -20,6 +21,7 @@ import {
   deriveInvitationToken,
   hashInvitationToken,
 } from '../identity/invitation-token';
+import { ExecutionGate } from '../operations/execution-gate';
 import { DELIVERY_QUEUE, QueueService, type DeliveryJob } from '../queue/queue.service';
 import {
   TELEGRAM_SENDER,
@@ -121,12 +123,27 @@ export class DeliveryWorker implements OnApplicationBootstrap, OnModuleDestroy {
     @Inject(APP_CONFIG) private readonly config: Env,
     private readonly queue: QueueService,
     private readonly dispatcher: DeliveryDispatcher,
+    private readonly lifecycle: AppLifecycle,
+    private readonly gate: ExecutionGate,
     @Optional() @Inject(TELEGRAM_SENDER) private readonly sender: TelegramSender | null,
-  ) {}
+  ) {
+    lifecycle.shutdownSignal.addEventListener('abort', () => this.shutdown.abort(), { once: true });
+  }
 
   onApplicationBootstrap(): void {
     if (this.config.BACKGROUND_WORKERS !== 'on' || !this.sender) return;
-    this.queue.onUp(() => this.queue.workDelivery((job) => this.process(job)));
+    this.lifecycle.register('delivery-worker');
+    this.gate.whenOpen(() =>
+      this.queue.onUp(async () => {
+        try {
+          await this.queue.workDelivery((job) => this.process(job));
+          this.lifecycle.mark('delivery-worker', 'up');
+        } catch (error) {
+          this.lifecycle.mark('delivery-worker', 'failed');
+          throw error;
+        }
+      }),
+    );
   }
 
   /**

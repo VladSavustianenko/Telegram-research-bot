@@ -236,6 +236,10 @@ Migration `20261020120000_trb_060_queue_execution` is additive. It rewrites no a
 
 **Rollback.** Stop the new version first. Roll back only when no run is QUEUED or RUNNING. The old worker would cancel published queued runs without releasing their reservations (see above), and it does not know retry delays or attempt reservations. The old code ignores the new columns. Dropping the pg-boss schema is optional; it holds no evidence.
 
+### Deployment (TRB-100)
+
+The pg-boss schema is installed or upgraded by the deployment step `node dist/ops/migrate.js` (after Prisma's migrations), and again, idempotently, by every application start (`migrate: true`). pg-boss 12.37.0 uses schema version 45 and migrates under its own advisory lock. Its jobs are transport only; the recovery sweeps rebuild missing ones from the outbox tables. Shutdown order, release classes and backup are in docs/OPERATIONS.md.
+
 ## Operator handling
 
 - **UNCERTAIN runs.** Procedure unchanged (`npm run ops:reconcile -- --list`, docs/RESEARCH_SLICE.md); financial resolution goes through `npm run ops:accounting` (docs/ACCOUNTING.md). Reconciliation now wakes queued runs immediately. Never resubmit an uncertain request manually; a deliberate new `/research` creates a new run with a new reservation.

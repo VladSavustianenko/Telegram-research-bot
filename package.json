@@ -28,7 +28,11 @@
     "postinstall": "prisma generate",
     "ops:reconcile": "node dist/ops/reconcile-run.js",
     "ops:tool-telemetry": "node dist/ops/tool-telemetry.js",
-    "ops:accounting": "node dist/ops/accounting.js"
+    "ops:accounting": "node dist/ops/accounting.js",
+    "ops:migrate": "node dist/ops/migrate.js",
+    "ops:status": "node dist/ops/status.js",
+    "ops:hold": "node dist/ops/hold.js",
+    "ops:webhook": "node dist/ops/webhook.js"
   },
   "dependencies": {
     "@nestjs/common": "12.1.2",
@@ -40,6 +44,7 @@
     "openai": "7.27.0",
     "pg": "8.23.1",
     "pg-boss": "12.37.0",
+    "prisma": "7.10.0",
     "reflect-metadata": "0.2.2",
     "rxjs": "7.8.2",
     "temporal-polyfill": "1.0.5",
@@ -60,7 +65,6 @@
     "globals": "17.13.0",
     "pg-connection-string": "2.14.1",
     "prettier": "3.9.9",
-    "prisma": "7.10.0",
     "supertest": "7.3.1",
     "typescript": "6.0.3",
     "typescript-eslint": "8.71.0",

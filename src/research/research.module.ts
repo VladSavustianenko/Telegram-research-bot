@@ -10,7 +10,8 @@ import { ResearchWorker } from './research-worker.service';
 
 /** Provider selection is explicit: live only when RESEARCH_MODE=live; never a silent fallback. */
 export function createResearchProvider(config: Env): ResearchProvider | null {
-  if (config.RESEARCH_MODE === 'fake') return new FakeResearchProvider();
+  if (config.RESEARCH_MODE === 'fake')
+    return new FakeResearchProvider(config.FAKE_PROVIDER_LATENCY_MS);
   if (config.RESEARCH_MODE !== 'live') return null;
   if (!config.OPENAI_API_KEY) throw new Error('RESEARCH_MODE=live requires OPENAI_API_KEY');
   return OpenAiResearchProvider.create({

@@ -139,6 +139,14 @@ describe('webhookSecretMatches', () => {
     expect(webhookSecretMatches('', '')).toBe(false);
     expect(webhookSecretMatches('abc_123', undefined)).toBe(false);
   });
+
+  it('also accepts the previous secret during a rotation (TRB-100)', () => {
+    expect(webhookSecretMatches('old_1', 'new_1', 'old_1')).toBe(true);
+    expect(webhookSecretMatches('new_1', 'new_1', 'old_1')).toBe(true);
+    expect(webhookSecretMatches('other', 'new_1', 'old_1')).toBe(false);
+    expect(webhookSecretMatches('old_1', 'new_1')).toBe(false);
+    expect(webhookSecretMatches('old_1', undefined, 'old_1')).toBe(false);
+  });
 });
 
 describe('classifyTelegramError', () => {

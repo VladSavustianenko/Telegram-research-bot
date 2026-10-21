@@ -94,4 +94,6 @@ Provide /health/live and /health/ready; readiness checks DB/config/worker readin
 
 Railway: use platform PORT, HTTPS public webhook, internal database connection, migration release step, graceful shutdown, PostgreSQL backup/recovery runbook and retention cleanup. On shutdown stop new claims and preserve recoverable in-flight state. Multi-replica overlap during deployments is expected: database constraints/leases remain mandatory even with one configured replica.
 
+Implementation note (TRB-100, clarification): the migration release step is `node dist/ops/migrate.js` from the production image (Railway pre-deploy command): Prisma `migrate deploy`, then the pg-boss schema. At startup an execution gate keeps every acting component stopped while the database lacks a shipped migration, or while an operator-set durable hold exists (restored databases). On SIGTERM all components stop taking work at once, then drain within a bound. Details, Railway settings, backup/restore and incident procedures are in OPERATIONS.md.
+
 Future worker separation uses the same codebase with explicit process roles, not a rewrite. Durable state remains in PostgreSQL. No automatic public deployment is part of this documentation delivery.

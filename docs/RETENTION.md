@@ -114,3 +114,5 @@ Review-fix migration `20261021180000_trb_090_inbox_tombstones` (additive): `tele
 3. Only with the owner's decision, set `RETENTION_CLEANUP=on`. The first passes catch up in batches. A backup taken before enabling it is the only way to recover purged content.
 
 Cleanup was validated only on disposable test databases.
+
+**Backups** (TRB-100, docs/OPERATIONS.md, section 11) are separate copies of the database. Cleanup never deletes content from existing backups; an older backup keeps content that was purged later. Backup retention and access are a separate owner decision.

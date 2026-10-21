@@ -7,7 +7,9 @@ import {
   Optional,
 } from '@nestjs/common';
 import { PgBoss, fromPrisma, type Job, type Queue } from 'pg-boss';
+import { abortableSleep } from '../common/abortable-sleep';
 import { errorInfo } from '../common/error-info';
+import { AppLifecycle } from '../common/lifecycle';
 import { APP_CONFIG } from '../config/config.module';
 import { MAX_RUN_DEADLINE_SECONDS, type Env } from '../config/env.schema';
 import type { Tx } from '../database/prisma-errors';
@@ -86,6 +88,12 @@ export type QueueStatus = 'disabled' | 'starting' | 'up' | 'down' | 'stopped';
 /** Delays between start attempts while the database is unavailable. */
 const START_RETRY_MIN_MS = 1_000;
 const START_RETRY_MAX_MS = 30_000;
+/**
+ * Startup waits at most this long for the first start attempt (TRB-100), so
+ * that HTTP (liveness, readiness) is served promptly even when the database
+ * host does not resolve or answer; the attempt continues in the background.
+ */
+const FIRST_START_WAIT_MS = 5_000;
 
 /**
  * Owns the pg-boss instance. pg-boss lives in its own schema (QUEUE_SCHEMA),
@@ -109,17 +117,38 @@ export class QueueService implements OnModuleInit, BeforeApplicationShutdown {
   private stopping = false;
   private retryTimer: NodeJS.Timeout | undefined;
   private readonly upCallbacks: (() => Promise<void>)[] = [];
+  /** Queues with a registered background handler in this process. */
+  private readonly working = new Set<QueueName>();
 
   private readonly queues: { name: QueueName; options: Omit<Queue, 'name'> }[] = [];
 
   constructor(
     @Inject(APP_CONFIG) private readonly config: Env,
+    lifecycle: AppLifecycle,
     @Optional() @Inject(RESEARCH_PROVIDER) provider: ResearchProvider | null,
     @Optional() @Inject(TELEGRAM_SENDER) sender: TelegramSender | null = null,
   ) {
     if (provider) this.queues.push({ name: RESEARCH_QUEUE, options: RESEARCH_QUEUE_OPTIONS });
     if (sender) this.queues.push({ name: DELIVERY_QUEUE, options: DELIVERY_QUEUE_OPTIONS });
     this.state = this.queues.length > 0 ? 'starting' : 'disabled';
+    lifecycle.shutdownSignal.addEventListener('abort', () => this.stopFetching(), { once: true });
+  }
+
+  /**
+   * Process shutdown began (TRB-100): every worker stops fetching new jobs at
+   * once, without waiting; the workers' own shutdown hooks then wait (bounded)
+   * for the handlers already running. No new start attempt is made.
+   */
+  private stopFetching(): void {
+    this.stopping = true;
+    clearTimeout(this.retryTimer);
+    const boss = this.boss;
+    if (!boss || this.state !== 'up') return;
+    for (const name of this.working) {
+      boss.offWork(name, { wait: false }).catch((error: unknown) => {
+        this.logger.warn({ message: 'Queue offWork failed', queue: name, ...errorInfo(error) });
+      });
+    }
   }
 
   /** Whether this process has the named queue (research needs a provider, delivery a sender). */
@@ -138,7 +167,7 @@ export class QueueService implements OnModuleInit, BeforeApplicationShutdown {
   /** Before any bootstrap hook, so that an available database gives a started queue at once. */
   async onModuleInit(): Promise<void> {
     if (this.state === 'disabled') return;
-    await this.tryStart(START_RETRY_MIN_MS);
+    await Promise.race([this.tryStart(START_RETRY_MIN_MS), abortableSleep(FIRST_START_WAIT_MS)]);
   }
 
   /** Runs `callback` once the queue is up (now, or after a later successful start). */
@@ -268,6 +297,8 @@ export class QueueService implements OnModuleInit, BeforeApplicationShutdown {
     name: QueueName,
     handler: (job: Job<T>) => Promise<unknown>,
   ): Promise<void> {
+    if (this.stopping) return;
+    this.working.add(name);
     await this.started.work<T>(
       name,
       {

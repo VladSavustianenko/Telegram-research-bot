@@ -777,3 +777,18 @@ model ScheduleEvent {
   @@index([taskId, createdAt])
   @@map("schedule_event")
 }
+
+// ---------------------------------------------------------------------------
+// TRB-100: operations.
+
+/// Durable execution hold (docs/OPERATIONS.md, "Restore"): while the single row
+/// exists, application processes start no ingress, scheduling, dispatching,
+/// workers or retention. Set and cleared only by the operator (ops:hold).
+model OperationalHold {
+  id        String   @id
+  reason    String
+  setBy     String   @map("set_by")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@map("operational_hold")
+}

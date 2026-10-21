@@ -6,6 +6,7 @@ import { DatabaseModule } from './database/database.module';
 import { DeliveryModule } from './delivery/delivery.module';
 import { HealthModule } from './health/health.module';
 import { IdentityModule } from './identity/identity.module';
+import { OperationsModule } from './operations/operations.module';
 import { ResearchModule } from './research/research.module';
 import { RetentionModule } from './retention/retention.module';
 import { SchedulingModule } from './scheduling/scheduling.module';
@@ -20,6 +21,7 @@ export class AppModule {
         AppConfigModule.forRoot(config),
         CommonModule,
         DatabaseModule,
+        OperationsModule,
         HealthModule,
         IdentityModule,
         TelegramModule,
