@@ -29,7 +29,7 @@ These are proposals for the owner. The owner's development database was migrated
 | Deleted task name and prompt | `task.name`, `task.prompt` | Content | `deleted_at` | `[deleted]`; edit drafts still copying the task are deleted | Active and paused tasks are never touched: their configuration is needed for future runs |
 | Drafts | `task_draft.data` | Content | `expires_at` (24 h of inactivity) | Deleted | Unexpired drafts |
 | Invitation token hash | `invitation.token_hash` | Secret-derived | Redemption, revocation or expiry | Replaced by `cleared:<id>`; the row stays (audit references it) | Valid invitations |
-| Inbox deduplication | `telegram_update` | Metadata (no text) | `received_at` | Deleted after the metadata period | A user's updates while a recorded destination refusal of that user's chat is pending; it may still be superseded |
+| Inbox records | `telegram_update` | Metadata (no text) + deduplication key | `received_at` | **Never deleted.** Reduced to a tombstone after the metadata period: `update_id`, disposition and receipt time stay; sender, chat type, reason, run link and the verified-private marker are cleared (`metadata_redacted_at`, check `telegram_update_tombstone_minimal`) | A user's records stay complete while a recorded destination refusal of that user's chat is pending; it may still be superseded |
 | Queue bookkeeping | `outbox_event`, `delivery_event` | Metadata | Dispatch or cancellation | Deleted after the metadata period | Events of unfinished runs or deliveries |
 | Schedule history | `schedule_event` | Metadata (codes) | Creation | Deleted after the metadata period | — |
 | pg-boss jobs | `pgboss.job` | Transport (IDs only) | pg-boss retention (7 / 14 days) | pg-boss deletes them | — |
@@ -51,7 +51,13 @@ Deleting accounting history needs an explicit accounting-closure decision; it is
 
 `RetentionService` (`src/retention/`) runs in the application process (no new service), with `BACKGROUND_WORKERS=on` and `RETENTION_CLEANUP=on`. `tick()`/`runPass()` drive it in tests.
 - **Cutoffs** come from the injected clock: now − `REPORT_RETENTION_DAYS`, and now − `METADATA_RETENTION_DAYS`.
-- **Bounded:** each category handles at most a batch per pass; inbox and event deletions at most 10 batches.
+- **Bounded:** each category handles at most a batch per pass; inbox redaction and event deletions at most 10 batches.
+- **No starvation** (review fix). Run candidates are selected in SQL already excluding the protected cases:
+  - a live UNCERTAIN run without provider reconciliation;
+  - a run with a RESERVED or UNRESOLVED reservation;
+  - a run with a delivery being sent.
+
+  Such runs therefore never fill the batch ahead of eligible ones, however old they are. They become candidates again by themselves once reconciled, resolved or sent, since nothing is remembered about them. The filter only selects: `purgeRun` still rechecks every condition under its locks and refuses (`NOT_ELIGIBLE`, `BUSY`) if the state changed after selection.
 - **Per run, one transaction**, in the established lock order:
   1. the owner's identity lock, then the user row;
   2. the run row (`FOR UPDATE`), rechecked: still finished, still unpurged, still older than the cutoff, not an unreconciled live UNCERTAIN run;
@@ -71,7 +77,12 @@ Deleting accounting history needs an explicit accounting-closure decision; it is
 - **Resolution race.** A resolution racing with cleanup is waited for, and the run is purged afterwards.
 
 **Replays stay harmless.**
-- **Inbox.** A Telegram update replayed after its inbox record was deleted cannot create work: research runs keep their unique `source_update_id`, so the second admission fails and the update is treated as a duplicate. Other actions are revision-bound and idempotent. Telegram does not redeliver updates after a day, far below the 7-day minimum metadata period.
+- **Inbox** (review fix). Every processed update ID stays in `telegram_update` forever as a tombstone, whatever the outcome: accepted, denied, ignored or administrative. A replay, at any age, conflicts in the inbox's atomic `INSERT … ON CONFLICT DO NOTHING` and executes nothing.
+  - **Retention never deletes a row,** so there is no window between cleanup and a redelivery in which an already processed update could run again.
+  - **No ordering assumption.** No maximum-ID watermark is used, so out-of-order or non-monotonic update IDs are never refused.
+  - **No new evidence.** A tombstone carries no sender or verified-private marker, and a replay is a duplicate, so neither can become new restoration evidence.
+  - **Cost.** One small row per update (ID, disposition, receipt time).
+  - **Before this fix.** Inbox records were deleted after the metadata period, which removed replay protection for updates that created no run: a denied `/research`, `/admin limit`, suspension, invitations. Cleanup never ran on the owner's development database (`RETENTION_CLEANUP` unset). There, all 7 inbox records are present and every run's source update has one, so no evidence was lost. Records already deleted elsewhere by the earlier code cannot be reconstructed.
 - **Queue.** A redelivered research or delivery job finds a finished run or delivery and does nothing.
 - **Pending block decisions** keep the verified private updates that may supersede them (docs/DELIVERY.md).
 
@@ -95,6 +106,8 @@ Deleting accounting history needs an explicit accounting-closure decision; it is
 - local deletion does not remove messages already in Telegram or data at OpenAI.
 
 ## Rollout
+
+Review-fix migration `20261021180000_trb_090_inbox_tombstones` (additive): `telegram_update.metadata_redacted_at` and the tombstone check. Existing rows are unchanged.
 
 1. Apply the migration (`prisma migrate deploy`). It is additive and removes nothing.
 2. Start with `RETENTION_CLEANUP=off`, the default, and review the matrix above.

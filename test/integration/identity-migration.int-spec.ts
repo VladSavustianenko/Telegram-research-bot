@@ -125,6 +125,7 @@ const NEW_COLUMNS = [
   'revoked_at',
   'revoked_by_user_id',
   'content_purged_at',
+  'metadata_redacted_at',
 ];
 /** TRB-080 columns whose names also exist on other tables (delivery.kind is original). */
 const NEW_PART_COLUMNS = ['kind'];

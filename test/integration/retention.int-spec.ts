@@ -279,35 +279,29 @@ describe('TRB-090 retention cleanup (fake clock, real PostgreSQL)', () => {
     await live.retention.runPass();
     expect((await run(uncertain.id)).contentPurgedAt).toBeNull(); // still UNRESOLVED
 
-    // Resolution racing with cleanup: the cleaner waits for the reservation lock.
+    // The locked recheck refuses it even when called directly (candidates already skip it).
+    const owner = BigInt(ADMIN_ID);
+    const cutoff = new Date(clock.now().getTime() - 30 * DAY);
+    expect(await live.retention.purgeRun(uncertain.id, owner, cutoff)).toBe('NOT_ELIGIBLE');
+
+    // Resolution racing with cleanup: while the resolution is uncommitted the run is
+    // still protected; once it commits, the next pass purges it.
     const blocker = new Client({ connectionString: inject('databaseUrl') });
     await blocker.connect();
     try {
       await blocker.query('BEGIN');
-      await blocker.query('SELECT id FROM budget_reservation WHERE run_id = $1 FOR UPDATE', [
-        uncertain.id,
-      ]);
-      const cleaning = live.retention.runPass();
-      await vi.waitFor(
-        async () => {
-          const rows = await blocker.query<{ n: number }>(
-            `SELECT count(*)::int AS n FROM pg_stat_activity
-              WHERE datname = current_database() AND wait_event_type = 'Lock'`,
-          );
-          expect(rows.rows[0]?.n).toBeGreaterThanOrEqual(1);
-        },
-        { timeout: 10_000 },
-      );
       await blocker.query(
         `UPDATE budget_reservation SET status = 'RESOLVED', confirmed_micros = 0, exposure_micros = 0
           WHERE run_id = $1`,
         [uncertain.id],
       );
+      expect((await live.retention.runPass()).runs).toBe(0);
+      expect((await run(uncertain.id)).contentPurgedAt).toBeNull();
       await blocker.query('COMMIT');
-      expect((await cleaning).runs).toBe(1);
     } finally {
       await blocker.end();
     }
+    expect((await live.retention.runPass()).runs).toBe(1);
     expect((await run(uncertain.id)).contentPurgedAt).toBeInstanceOf(Date);
     const after = await accounting();
     expect(after.ledger).toEqual(before.ledger);
@@ -371,9 +365,25 @@ describe('TRB-090 retention cleanup (fake clock, real PostgreSQL)', () => {
     advance(91 * DAY);
     const pass = await h.retention.runPass();
     expect(pass.updates).toBeGreaterThanOrEqual(1);
+    // Reduced to a tombstone (review fix): the deduplication key stays, nothing else.
     expect(
-      await h.prisma.telegramUpdate.count({ where: { updateId: BigInt(update.update_id) } }),
-    ).toBe(0);
+      await h.prisma.telegramUpdate.findUniqueOrThrow({
+        where: { updateId: BigInt(update.update_id) },
+      }),
+    ).toMatchObject({
+      senderTelegramId: null,
+      chatType: null,
+      reason: null,
+      runId: null,
+      privateChatVerified: false,
+    });
+    expect(
+      (
+        await h.prisma.telegramUpdate.findUniqueOrThrow({
+          where: { updateId: BigInt(update.update_id) },
+        })
+      ).metadataRedactedAt,
+    ).toBeInstanceOf(Date);
     await h.post(update).expect(200); // Telegram redelivers the same update
     await h.prisma.$transaction((tx) =>
       h.queue.publish(tx, { runId: r.id, eventId: randomUUID() }),
@@ -409,6 +419,9 @@ describe('TRB-090 retention cleanup (fake clock, real PostgreSQL)', () => {
     expect(
       await h.prisma.telegramUpdate.count({ where: { senderTelegramId: BigInt(OTHER_ADMIN_ID) } }),
     ).toBe(0);
+    expect(
+      await h.prisma.telegramUpdate.count({ where: { metadataRedactedAt: { not: null } } }),
+    ).toBe(1);
     expect(await h.prisma.delivery.findUniqueOrThrow({ where: { id: delivery.id } })).toMatchObject(
       {
         destinationBlockAppliedAt: null,
@@ -437,6 +450,216 @@ describe('TRB-090 retention cleanup (fake clock, real PostgreSQL)', () => {
     expect(await markerCopies()).toEqual([]);
   });
 
+  describe('review fixes (commit 979352d)', () => {
+    let sourceUpdate = 880_000;
+    /** An old finished run inserted directly (fake unless stated), completed `ageDays` ago. */
+    const oldRun = async (
+      ageDays: number,
+      kind: 'eligible' | 'uncertain' | 'busy',
+    ): Promise<string> => {
+      const owner = await h.prisma.appUser.findUniqueOrThrow({
+        where: { telegramUserId: BigInt(ADMIN_ID) },
+      });
+      const completedAt = new Date(clock.now().getTime() - ageDays * DAY);
+      const created = await h.prisma.researchRun.create({
+        data: {
+          userId: owner.id,
+          requestedByTelegramUserId: BigInt(ADMIN_ID),
+          chatId: BigInt(ADMIN_ID),
+          sourceUpdateId: BigInt((sourceUpdate += 1)),
+          prompt: `${kind} ${MARKER}`,
+          providerKind: kind === 'uncertain' ? 'openai' : 'fake',
+          requestSnapshot: { config: { timeZone: 'Europe/Kyiv' } },
+          state: kind === 'uncertain' ? 'UNCERTAIN' : 'SUCCEEDED',
+          failureCode: kind === 'uncertain' ? 'SUBMISSION_INTERRUPTED' : null,
+          outcome: kind === 'uncertain' ? null : 'FOUND',
+          reportText: `report ${MARKER}`,
+          createdAt: completedAt,
+          completedAt,
+        },
+      });
+      if (kind === 'busy') {
+        await h.prisma.delivery.create({
+          data: {
+            kind: 'REPORT',
+            runId: created.id,
+            chatId: BigInt(ADMIN_ID),
+            state: 'SENDING',
+            leaseOwner: 'live-worker',
+            leaseUntil: new Date(Date.now() + 3_600_000),
+            parts: {
+              create: [{ ordinal: 0, html: `part ${MARKER}`, contentHash: 'x', state: 'SENDING' }],
+            },
+          },
+        });
+      }
+      return created.id;
+    };
+    const purgedIds = async (ids: string[]) =>
+      (
+        await h.prisma.researchRun.findMany({
+          where: { id: { in: ids }, contentPurgedAt: { not: null } },
+          select: { id: true },
+        })
+      ).map((row) => row.id);
+
+    describe('Finding 1: protected or busy runs do not starve cleanup', () => {
+      it('purges newer eligible runs past a full batch of protected and busy ones, in bounded passes', async () => {
+        const small = await start({ RETENTION_BATCH_SIZE: '2' });
+        const protectedIds = [await oldRun(60, 'uncertain'), await oldRun(59, 'uncertain')];
+        const busyIds = [await oldRun(58, 'busy'), await oldRun(57, 'busy')];
+        const eligible = [];
+        for (let i = 0; i < 5; i += 1) eligible.push(await oldRun(40 - i, 'eligible'));
+
+        for (let pass = 0; pass < 3; pass += 1) {
+          const result = await small.retention.runPass();
+          expect(result.runs).toBeLessThanOrEqual(2); // bounded
+        }
+        expect((await purgedIds(eligible)).sort()).toEqual([...eligible].sort());
+        expect(await purgedIds([...protectedIds, ...busyIds])).toEqual([]);
+        for (const id of protectedIds) {
+          expect(await run(id)).toMatchObject({
+            prompt: `uncertain ${MARKER}`,
+            reconciledAt: null,
+          });
+        }
+
+        // Legitimate resolution and completion make them eligible again.
+        await reconcileUncertainRun(h.prisma, {
+          runId: protectedIds[0] ?? '',
+          resolution: 'PROVIDER_REQUEST_ABSENT',
+          operator: 'op',
+          note: 'checked',
+        });
+        await h.prisma.$executeRaw`
+          UPDATE delivery SET state = 'SENT', lease_owner = NULL, lease_until = NULL
+           WHERE run_id = ${busyIds[0]}::uuid`;
+        await h.prisma.$executeRaw`
+          UPDATE delivery_part SET state = 'SENT', telegram_message_id = 55
+           WHERE delivery_id IN (SELECT id FROM delivery WHERE run_id = ${busyIds[0]}::uuid)`;
+        await small.retention.runPass();
+        expect((await purgedIds([...protectedIds, ...busyIds])).sort()).toEqual(
+          [protectedIds[0] ?? '', busyIds[0] ?? ''].sort(),
+        );
+        expect(await run(protectedIds[1] ?? '')).toMatchObject({ contentPurgedAt: null });
+      });
+
+      it('keeps progress and idempotency across two cleaners and a restart', async () => {
+        const a = await start({ RETENTION_BATCH_SIZE: '2' });
+        const b = await start({ RETENTION_BATCH_SIZE: '2' });
+        for (let i = 0; i < 2; i += 1) await oldRun(80 - i, 'uncertain');
+        const eligible = [];
+        for (let i = 0; i < 6; i += 1) eligible.push(await oldRun(50 - i, 'eligible'));
+        let purged = 0;
+        for (let pass = 0; pass < 3; pass += 1) {
+          const [x, y] = await Promise.all([a.retention.runPass(), b.retention.runPass()]);
+          purged += x.runs + y.runs;
+        }
+        expect(purged).toBe(6);
+        expect((await purgedIds(eligible)).length).toBe(6);
+        await close(a);
+        await close(b);
+        const restarted = await start({ RETENTION_BATCH_SIZE: '2' });
+        expect((await restarted.retention.runPass()).runs).toBe(0);
+      });
+    });
+
+    describe('Finding 2: replay protection outlives inbox metadata', () => {
+      const MEMBER = 3003;
+      const addMember = () =>
+        h.prisma.$executeRaw`
+          INSERT INTO app_user (id, telegram_user_id, private_chat_id, role, onboarding_state, time_zone,
+                                invited_at, onboarded_at, updated_at)
+          VALUES (gen_random_uuid(), ${MEMBER}, ${MEMBER}, 'MEMBER', 'COMPLETED', 'Europe/Kyiv', now(), now(), now())`;
+      const work = async () => ({
+        runs: await h.prisma.researchRun.count(),
+        reservations: await h.prisma.budgetReservation.count(),
+        outbox: await h.prisma.outboxEvent.count(),
+        submissions: h.provider.calls.submit,
+      });
+      const expireMetadata = async () => {
+        advance(91 * DAY);
+        await h.retention.runPass();
+      };
+
+      it('never executes a replayed denied /research after its metadata expired', async () => {
+        await addMember();
+        await say(`/admin limit ${MEMBER} daily_runs 0`);
+        const denied = privateMessage('/research denied before', MEMBER);
+        await h.post(denied).expect(200);
+        expect(
+          (
+            await h.prisma.telegramUpdate.findUniqueOrThrow({
+              where: { updateId: BigInt(denied.update_id) },
+            })
+          ).reason,
+        ).toBe('DAILY_RUN_LIMIT');
+        const before = await work();
+        expect(before.runs).toBe(0);
+        await expireMetadata();
+        await say(`/admin limit ${MEMBER} daily_runs default`); // research would be allowed now
+        await h.post(denied).expect(200); // Telegram redelivers the old update
+        await h.research.tick();
+        expect(await work()).toEqual(before);
+        // A genuinely new update still works.
+        await h.post(privateMessage('/research fresh', MEMBER)).expect(200);
+        expect(await h.prisma.researchRun.count()).toBe(1);
+      });
+
+      it('never re-executes old administrator commands after metadata cleanup', async () => {
+        await addMember();
+        const first = privateMessage(`/admin limit ${MEMBER} tasks 5`);
+        await h.post(first).expect(200);
+        await say(`/admin limit ${MEMBER} tasks 7`);
+        const invite = privateMessage('/admin invite');
+        await h.post(invite).expect(200);
+        const suspend = privateMessage(`/admin suspend ${MEMBER}`);
+        await h.post(suspend).expect(200);
+        await say(`/admin reactivate ${MEMBER}`);
+        const audits = await h.prisma.auditEvent.count();
+        await expireMetadata();
+        for (const update of [first, invite, suspend]) await h.post(update).expect(200);
+        await drainDeliveries(h);
+        const member = await h.prisma.appUser.findUniqueOrThrow({
+          where: { telegramUserId: BigInt(MEMBER) },
+        });
+        expect(member).toMatchObject({ limitSavedTasks: 7, status: 'ACTIVE' });
+        expect(await h.prisma.invitation.count()).toBe(1);
+        expect(await h.prisma.auditEvent.count()).toBe(audits);
+      });
+
+      it('stays safe when cleanup and a replay race', async () => {
+        await addMember();
+        await say(`/admin limit ${MEMBER} daily_runs 0`);
+        const denied = privateMessage('/research raced', MEMBER);
+        await h.post(denied).expect(200);
+        await say(`/admin limit ${MEMBER} daily_runs default`);
+        advance(91 * DAY);
+        const blocker = new Client({ connectionString: inject('databaseUrl') });
+        await blocker.connect();
+        try {
+          // The cleaner's statement is held on the inbox row while Telegram redelivers it.
+          await blocker.query('BEGIN');
+          await blocker.query(
+            'SELECT update_id FROM telegram_update WHERE update_id = $1 FOR UPDATE',
+            [denied.update_id],
+          );
+          const cleaning = h.retention.runPass();
+          const replay = h.post(denied).then((response) => response.status);
+          await blocker.query('COMMIT');
+          expect(await replay).toBe(200);
+          await cleaning;
+        } finally {
+          await blocker.end();
+        }
+        await h.post(denied).expect(200);
+        await h.research.tick();
+        expect(await h.prisma.researchRun.count()).toBe(0);
+        expect(h.provider.calls.submit).toBe(0);
+      });
+    });
+  });
+
   describe('races with delivery and resend', () => {
     it('skips a run whose delivery is in flight, keeps the confirmed send, then purges', async () => {
       const r = await researched();
@@ -456,8 +679,15 @@ describe('TRB-090 retention cleanup (fake clock, real PostgreSQL)', () => {
       const sending = h.delivery.handle(report.id);
       await inFlight.promise;
       advance(31 * DAY);
-      const busy = await h.retention.runPass();
-      expect(busy.runsBusy).toBe(1);
+      // Not a candidate while being sent; the locked recheck reports BUSY if called directly.
+      await h.retention.runPass();
+      expect(
+        await h.retention.purgeRun(
+          r.id,
+          BigInt(ADMIN_ID),
+          new Date(clock.now().getTime() - 30 * DAY),
+        ),
+      ).toBe('BUSY');
       expect((await run(r.id)).contentPurgedAt).toBeNull();
       release.open();
       expect(await sending).toBe('sent');

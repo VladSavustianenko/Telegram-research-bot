@@ -963,6 +963,154 @@ The earlier suspension, suppression, Retry-After and Finding 2 tests stay green.
 
 **Remaining limitations** are unchanged from "TRB-080 review fixes". In particular, the window between Telegram's answer and committing the refusal remains.
 
+### TRB-080 acceptance (2026-10-21)
+
+The owner accepted TRB-080 after review of commit `298bed3fd396d9ffb4e6d740b36d10db9b34073a` (implementation, the review fixes for f23221c and the follow-up fix for f3789b8). The evidence and limitations above are left as recorded.
+
+### TRB-090 evidence (2026-10-21, local Windows 11, Node 24.19.0, PostgreSQL 17, pg-boss 12.37.0)
+
+**Mock validation only.**
+- Research: fake and scripted providers with synthetic prices, no network.
+- Telegram: a recording sender; in the Docker smoke, a local Bot API double.
+- No Telegram message, OpenAI request, deployment or commit.
+- Local `.env` keeps `TELEGRAM_MODE=disabled` and `RESEARCH_MODE=disabled`. `RETENTION_CLEANUP` is unset there (default `off`).
+- Destructive cleanup ran only on disposable test databases.
+
+Behaviour: docs/ADMINISTRATION.md and docs/RETENTION.md.
+
+| Check | Command | Result |
+|---|---|---|
+| Static checks | `npm run format:check`, `npm run lint`, `npm run typecheck`, `npm run prisma:validate` | Pass |
+| Unit tests | `npm test` | 218 passed (17 files). New: effective-limit resolution, `sumComponents` (partial UNRESOLVED kept as estimated), administrator callbacks |
+| Integration tests | `npm run test:integration` | 271 passed (18 files: 10 administration, 12 retention, all earlier suites); 0 disposable databases left |
+| Build | `npm run build` | Pass |
+| Migration, dev DB | `migrate deploy`, `migrate status`, `migrate diff --exit-code` | `20261021150000_trb_090_admin_retention` applied without reset; up to date; no difference (exit 0). MD5 identical before and after over runs, deliveries, parts, attempts, reservations, ledger, the 7 inbox records, invitations and audit events. Cleanup was not run there |
+| Docker smoke | Production image; disposable database; `TELEGRAM_MODE=webhook` with a fake token and a local Bot API double; `RESEARCH_MODE=fake`; `RETENTION_CLEANUP=on`, `REPORT_RETENTION_DAYS=1`, `RETENTION_INTERVAL_SECONDS=2` | See below |
+
+**Docker smoke, observed:**
+- Readiness was `queue: up`.
+- A seeded run finished 3 days earlier was purged by the background pass:
+  - its prompt became `[deleted]`, its report text was cleared, and `request` was removed from the snapshot (only `config` kept);
+  - its report part was emptied, keeping Telegram message ID 4242.
+- A 400-day-old active task kept its prompt.
+- `/privacy`, `/admin usage` and `/admin limit 1001 daily_runs 3 smoke` were answered through the delivery queue; the limit change was audited with its before/after values. No sent text contained the seeded marker.
+- `docker stop` ended in 3 s with exit 0; no error lines, token, secret or marker in the logs.
+- Container, image and database were removed.
+
+**Administration scenarios** (`test/integration/administration.int-spec.ts`):
+- **Authorization.**
+  - Members get the unknown-command reply for every admin command.
+  - An administrator removed from `ADMIN_TELEGRAM_IDS` gets the invitation-required reply.
+  - A group `/admin limit` is ignored with no change and no audit event.
+- **Service layer.** Calling `runAdminCommand` and `runAdminCallback` directly with a member actor is refused (`NOT_ADMIN`) with no change.
+- **Buttons.**
+  - A member's admin buttons, malformed callbacks and unknown IDs change nothing.
+  - A stale revision shows the current view.
+  - The same suspension update twice gives one suspension and one audit event; the old button is stale afterwards.
+  - An administrator target is protected.
+- **Privacy.** A marker is planted in a task name and prompt, a `/research` prompt, the report and its source title. The users list, user view (command and button), usage, invites, audit and limit views never contain it, nor the invitation token or its hash.
+- **Effective limits.**
+  - **Admission and quotas.**
+    - With a `daily_runs` override of 1, the second `/research` is refused `DAILY_RUN_LIMIT` ("(1 за добу UTC)").
+    - With `manual_runs = 0`, `/research` is refused while a scheduled occurrence is still `ADMITTED`.
+  - **Display and clearing.** `/usage` shows the effective values. `default` returns to the environment value.
+  - **Audit.** Four `LIMIT_CHANGED` events with override and effective before/after values and the reason. A repeated value and a duplicate update add none; invalid values are refused.
+- **Lowering limits.** With a `tasks` override of 1 and 3 existing tasks: nothing is deleted, `/new` is refused and the list shows "3 з 1". `active_runs = 0` refuses `/research`.
+- **Budget** (live mode, synthetic prices).
+  - **Retry authorization.** Admitted under a $1.00 override; the override lowered to $0.20 before a 429. The retry is refused (`RETRY_REFUSED:USER_BUDGET_EXHAUSTED`, the environment default $10 would allow it), and only one reservation exists.
+  - **Lowering to $0 after a settled run.** Exposure is unchanged, and the next `/research` is refused `USER_BUDGET_EXHAUSTED`.
+- **Serialization.** A second session holds the member's row while changing `limit_daily_runs` to 0. The `/research` admission waits for it, verified via `pg_stat_activity`, then is refused `DAILY_RUN_LIMIT`; no run is created.
+- **Invitations.** A revoked invitation's pending link is `SUPPRESSED / INVITATION_REVOKED`; a second revoke is refused; one `INVITATION_REVOKED` audit event.
+- **Correction after resolution.** `CORRECT` entry +$0.02 (exposure $0.05 → $0.07); earlier ledger entries are identical; the same amount is refused.
+
+**Retention scenarios** (`test/integration/retention.int-spec.ts`, fake clock starting at database time):
+1. **Boundary.** 30 days − 1 min: not purged; + 2 min: purged. With `REPORT_RETENTION_DAYS=7`: purged after 7 days.
+2. **Every copy.** A marker is placed in the prompt, a document-fallback report, its resend, a run card with the prompt preview, a deleted task, a draft and an active 400-day-old task. After the purge:
+   - only the active task still contains it;
+   - the run keeps its state and outcome and its snapshot's `config`;
+   - every part is emptied, with hash, file name, state and message ID unchanged;
+   - a second pass changes nothing.
+   - **Purged lookups.** `/result`, the resend button and the run card answer gracefully: no resend, no button, no empty message or document, no provider call.
+3. **Unresolved accounting.** An unreconciled live UNCERTAIN run with an UNRESOLVED reservation is kept, also after research reconciliation. A queued run is never a candidate.
+   - **Resolution race.** A second session holds the reservation row; the cleaner waits for it, the reservation becomes RESOLVED and commits, and the cleaner then purges.
+   - Ledger and attempts are unchanged.
+4. **Current-period exposure.** `REPORT_RETENTION_DAYS=1`: the purge leaves exposure identical, and a $0.30 override still refuses the next run.
+5. **Drafts and invitations.** Expired drafts are deleted. An expired invitation's hash becomes `cleared:<id>`; a valid one is unchanged. `/new` works afterwards.
+6. **Replays.** After 91 days the inbox record is deleted. Replaying the same `/research` update and a research job for the finished run creates no run and no submission.
+7. **Pending block evidence.** With a recorded refusal pending, the user's old verified update survives the metadata cleanup and another user's does not; `applyRecordedBlock` then reports `superseded`.
+8. **Concurrent cleaners and restart.** Two instances purge 6 runs exactly once in total. A restarted instance does nothing; timestamps are unchanged and no marker is left.
+9. **In-flight delivery.** A report being sent makes its run BUSY (not purged). After the confirmed send the next pass purges it, keeping `SENT` and the message ID.
+10. **Waiting copies.** A queued resend of an expired run becomes `SUPPRESSED / CONTENT_EXPIRED`; a later `/help` to the same chat is delivered and the report is never sent again.
+11. **Resend race.** A session holding the owner's identity lock (an inbox transaction such as `/result`) makes the cleaner wait; after its commit the run is purged, and `/result` answers "більше недоступний".
+12. **Upgrade with retained records.** On a database built with every migration before TRB-090, with records from earlier tasks (`UNKNOWN` report with a document part, a `SENT` resend document with message ID 777, a `SUPPRESSED` status message, an unresolved live run with an UNRESOLVED reservation, a pending destination refusal), the TRB-090 migration changes no record. A cleanup pass then:
+    - purges the finished run and both copies, keeping states and message ID 777;
+    - keeps the unresolved run's content and all reservations;
+    - leaves the refusal pending.
+
+**Earlier tests adapted:** the migration snapshot ignores the TRB-090 columns.
+
+**Not run:**
+- CI;
+- live Telegram or OpenAI calls;
+- deployment;
+- a mutation re-run;
+- cleanup against the development database (not authorized; it holds earlier evidence).
+
+**Remaining limitations and decisions:**
+- **Decision needed: accounting history kept.** Redacted run records, attempts, reservations, ledger, reconciliations and audit events are kept indefinitely: a suggested change to the SPEC §7 90-day proposal, for the owner to decide (docs/RETENTION.md).
+- **Cleanup is off by default.** Enabling it is an owner decision; purged content can only be restored from a backup.
+- **Content in flight.** A run whose delivery is being sent is purged on a later pass. Messages already delivered to Telegram, and anything at OpenAI, are not affected by local deletion.
+- **Audit is content-free but unfiltered.** The audit view shows all events, paged; there is no per-user filter yet.
+- **Defaults are proposals.** Numeric defaults stay configurable beta proposals; live research stays administrator-only.
+
+### TRB-090 review fixes (2026-10-21, reviewed commit 979352d)
+
+Mock validation only: fake and scripted providers, a recording Telegram sender, real PostgreSQL and pg-boss. Cleanup ran only on disposable test databases. No Telegram message, OpenAI request, deployment or commit.
+
+**Finding 1: protected or busy runs could starve retention.**
+- **Root cause.** The candidate query took the oldest finished runs without the exceptions that `purgeRun` checks. A full batch of protected runs (unreconciled live UNCERTAIN, unresolved reservation) or runs with a delivery in flight was selected on every pass, refused every time, and newer eligible runs were never reached.
+- **Fix.** The candidate query now excludes those cases in SQL, so the batch holds only runs that can be purged now. Excluded runs return by themselves when reconciled, resolved or sent; no skip list or cursor is stored. `purgeRun` keeps every check under its locks and still refuses a run whose state changed after selection. Passes stay bounded by `RETENTION_BATCH_SIZE`. Nothing is released, reconciled or deleted to make progress.
+
+**Finding 2: inbox cleanup removed replay protection.**
+- **Root cause.** Retention deleted `telegram_update` rows after the metadata period and relied on `research_run.source_update_id` against replays. That only covers updates that created a run. A replayed denied `/research` could create new paid work, and replayed `/admin limit`, suspension or invitation commands could execute again.
+- **Fix.** Inbox rows are never deleted. After the metadata period they are reduced to a tombstone: `update_id`, disposition and receipt time stay; sender, chat type, reason, run link and the verified-private marker are cleared (`metadata_redacted_at`, check `telegram_update_tombstone_minimal`).
+  - **Deduplication unchanged.** The inbox's atomic `INSERT … ON CONFLICT DO NOTHING` keeps rejecting every processed update at any age, with no deletion window and no ID watermark.
+  - **Pending blocks.** A user's rows stay complete while a recorded refusal of that user's chat is pending.
+- **Migration** `20261021180000_trb_090_inbox_tombstones` (additive).
+- **Existing data.** The development database's 7 inbox records (2026-10-19) are all present, every run's source update has its row, and no tombstone or purged run exists. Cleanup never ran there, so no evidence was lost; the data was not modified apart from the additive column.
+
+| Check | Command | Result |
+|---|---|---|
+| Reproduction before the fixes | the 5 new tests in `retention.int-spec.ts` ("review fixes (commit 979352d)") against the reviewed code | All 5 failed for the reported reasons. No eligible run was purged behind 2 protected and 2 busy runs (batch 2); two cleaners purged 0 of 6. The replayed denied `/research` created a run. The replayed `/admin limit` and suspension executed again. The replay racing with cleanup created a run |
+| Targeted after the fixes | `retention.int-spec.ts` | 17 passed |
+| Static checks | `npm run format:check`, `npm run lint`, `npm run typecheck`, `npm run prisma:validate` | Pass |
+| Unit tests | `npm test` | 218 passed |
+| Integration tests | `npm run test:integration` | 276 passed (18 files); 0 disposable databases left |
+| Build | `npm run build` | Pass |
+| Migration, dev DB | `migrate deploy`, `migrate status`, `migrate diff --exit-code` | Applied without reset; up to date; no difference (exit 0). MD5 over runs, deliveries, parts, attempts, reservations, ledger and inbox rows identical before and after |
+
+**Scenarios** (real PostgreSQL, `RETENTION_BATCH_SIZE=2`):
+1. **Protected and busy runs ahead of eligible ones.** The oldest are 2 unreconciled live UNCERTAIN runs and 2 runs with a delivery being sent; 5 newer runs are eligible.
+   - Three bounded passes (≤ 2 runs each) purge all 5, and the protected and busy runs keep their content.
+   - After one is reconciled and one finishes sending, the next pass purges exactly those two; the other unreconciled run stays.
+2. **Two cleaners and a restart.** Two instances, three passes, 2 protected oldest runs and 6 eligible ones: exactly 6 purged in total. A restarted instance purges 0.
+3. **Earlier race tests, adapted.** Directly called, `purgeRun` refuses an unresolved run (`NOT_ELIGIBLE`) and a run being sent (`BUSY`) under its locks. An uncommitted resolution in another session leaves the run protected; once committed, the next pass purges it.
+4. **Denied `/research` replayed.** A `/research` refused (`DAILY_RUN_LIMIT`, override 0) creates nothing. After its metadata expires and the limit is cleared, a replay of the same update creates no run, reservation, outbox event or submission. A new update then creates one run.
+5. **Administrator commands replayed.** After cleanup, replaying an old `/admin limit … tasks 5` (overwritten later by 7), `/admin invite` and `/admin suspend` (reactivated later) changes nothing: the limit stays 7, one invitation, still active, no new audit event.
+6. **Replay racing with cleanup.** A second session holds the inbox row while a pass runs and Telegram redelivers the update: the replay is a duplicate, and no run or submission follows.
+7. **Accepted-run replay and pending blocks.** The accepted-run replay stays harmless, and its row is now a tombstone with no sender, chat, reason, run or marker. With a refusal pending, the user's verified records stay complete, another user's become tombstones, and the refusal is still superseded.
+
+**Not run:**
+- the Docker smoke: no runtime wiring, dependency or configuration change since the TRB-090 smoke;
+- CI;
+- a mutation re-run;
+- live Telegram or OpenAI calls.
+
+**Remaining limitations:**
+- The inbox grows by one small tombstone per update; deleting tombstones would need a separate decision.
+- Inbox rows deleted by the reviewed code on other databases cannot be restored; there were none on the development database.
+- A run being sent or protected is cleaned only after it finishes or is resolved, as intended.
+
 ## Release checklist
 
 - Exact model/tool compatibility verified in official docs and an authorized sample.

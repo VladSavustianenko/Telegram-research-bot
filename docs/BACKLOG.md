@@ -109,7 +109,9 @@ Implement invitations, suspension/reactivation, limits, aggregate usage/failure 
 
 Acceptance: admin operations are authorized and auditable; user suspension prevents new work and pending delivery; no routine admin view reveals user report content; retention clears content on schedule while unresolved accounting survives; reactivation does not release stale reports in bulk.
 
-Status: READY FOR REVIEW (2026-10-21). Mock validation only: fake and scripted providers (no network), recording Telegram sender, real PostgreSQL and pg-boss; Docker smoke with the fake provider and a local Bot API double; no live request or Telegram message. Behaviour: docs/ADMINISTRATION.md and docs/RETENTION.md. Evidence: docs/VALIDATION.md, "TRB-090 evidence". Migration `20261021150000_trb_090_admin_retention` (additive).
+Status: READY FOR REVIEW (2026-10-21). Mock validation only: fake and scripted providers (no network), recording Telegram sender, real PostgreSQL and pg-boss; Docker smoke with the fake provider and a local Bot API double; no live request or Telegram message. Behaviour: docs/ADMINISTRATION.md and docs/RETENTION.md. Evidence: docs/VALIDATION.md, "TRB-090 evidence". Migration `20261021150000_trb_090_admin_retention` (additive). Review fixes for 979352d (2026-10-21, "TRB-090 review fixes"):
+- protected or busy runs no longer starve retention cleanup;
+- inbox records are kept as deduplication tombstones instead of being deleted (additive migration `20261021180000_trb_090_inbox_tombstones`).
 - **Cleanup is off by default.** `RETENTION_CLEANUP=off`. Enabling it is an owner decision, and it was not enabled on the development data.
 - **Owner decision needed.** Redacted run records and accounting evidence are kept rather than deleted after 90 days (docs/RETENTION.md, a suggested change to SPEC §7).
 - **Defaults unchanged.** Numeric defaults stay configurable beta proposals; live research stays administrator-only.

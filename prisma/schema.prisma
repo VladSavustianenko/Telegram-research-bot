@@ -44,7 +44,11 @@ model TelegramUpdate {
   /// as the sender's interaction. Only such updates prove the private chat works.
   privateChatVerified Boolean                   @default(false) @map("private_chat_verified")
 
-  /// TRB-090 retention: inbox records are deleted by age.
+  /// TRB-090 retention: after the metadata period the row is kept as a deduplication
+  /// tombstone (update ID, disposition, receipt time); everything else is cleared.
+  metadataRedactedAt DateTime? @map("metadata_redacted_at") @db.Timestamptz(3)
+
+  /// TRB-090 retention: inbox records are redacted by age.
   @@index([receivedAt], map: "telegram_update_received_at")
   @@map("telegram_update")
 }

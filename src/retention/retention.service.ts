@@ -48,8 +48,8 @@ export interface RetentionPass {
  * Content (prompts, request text, reports, citations, sources, delivery
  * payloads, documents, resend copies, deleted tasks' names and prompts,
  * expired drafts, invitation hashes) is removed after REPORT_RETENTION_DAYS
- * from its terminal time. Inbox and queue bookkeeping is deleted after
- * METADATA_RETENTION_DAYS. Accounting evidence (runs' metadata, attempts,
+ * from its terminal time. Inbox records are reduced to deduplication
+ * tombstones, and queue bookkeeping is deleted, after METADATA_RETENTION_DAYS. Accounting evidence (runs' metadata, attempts,
  * reservations, ledger, reconciliations, pricing) and audit events are never
  * deleted here, so exposure (and with it every budget check) is unaffected.
  *
@@ -124,7 +124,7 @@ export class RetentionService implements OnApplicationBootstrap, OnModuleDestroy
     pass.tasks = await this.purgeDeletedTasks(contentCutoff);
     pass.drafts = await this.deleteExpiredDrafts(now);
     pass.invitations = await this.clearInvitationHashes(now);
-    pass.updates = await this.deleteOldUpdates(metadataCutoff);
+    pass.updates = await this.redactOldUpdates(metadataCutoff);
     pass.events = await this.deleteOldEvents(metadataCutoff);
     return pass;
   }
@@ -136,6 +136,13 @@ export class RetentionService implements OnApplicationBootstrap, OnModuleDestroy
        WHERE r.content_purged_at IS NULL
          AND r.state IN ('SUCCEEDED', 'FAILED', 'CANCELLED', 'UNCERTAIN')
          AND COALESCE(r.completed_at, r.updated_at) < ${cutoff}
+         -- Protected and busy runs are not candidates, so they never fill the batch and
+         -- starve eligible ones; they return by themselves once resolved or finished.
+         -- purgeRun still rechecks everything under its locks.
+         AND NOT (r.state = 'UNCERTAIN' AND r.provider_kind <> 'fake' AND r.reconciled_at IS NULL)
+         AND NOT EXISTS (SELECT 1 FROM budget_reservation b
+                          WHERE b.run_id = r.id AND b.status IN ('RESERVED', 'UNRESOLVED'))
+         AND NOT EXISTS (SELECT 1 FROM delivery d WHERE d.run_id = r.id AND d.state = 'SENDING')
        ORDER BY COALESCE(r.completed_at, r.updated_at), r.id
        LIMIT ${this.config.RETENTION_BATCH_SIZE}`;
   }
@@ -283,24 +290,32 @@ export class RetentionService implements OnApplicationBootstrap, OnModuleDestroy
   }
 
   /**
-   * Inbox records older than the metadata period, except a user's verified
-   * private updates while a recorded destination refusal of that user's chat is
-   * still pending (they decide whether it is superseded). Replayed research
-   * updates stay harmless after deletion: a run keeps its unique source update.
+   * Inbox records older than the metadata period are reduced to a tombstone:
+   * the update ID (the deduplication key), its coarse disposition and receipt
+   * time. Sender, chat type, reason, run link and the verified-private marker
+   * are cleared. The row is never deleted, so a replayed update of any kind
+   * (accepted, denied, ignored, administrative) still conflicts with it in the
+   * inbox's atomic insert and does nothing, and there is no window in which a
+   * processed update could run again. A tombstone is never restoration evidence.
+   * Exception: a user's records stay complete while a recorded destination
+   * refusal of that user's chat is pending (they decide whether it is superseded).
    */
-  private deleteOldUpdates(cutoff: Date): Promise<number> {
+  private redactOldUpdates(cutoff: Date): Promise<number> {
     return this.prisma.$executeRaw`
-      DELETE FROM telegram_update
+      UPDATE telegram_update
+         SET sender_telegram_id = NULL, chat_type = NULL, reason = NULL, run_id = NULL,
+             private_chat_verified = false, metadata_redacted_at = now()
        WHERE update_id IN (
          SELECT tu.update_id FROM telegram_update tu
-          WHERE tu.received_at < ${cutoff}
+          WHERE tu.received_at < ${cutoff} AND tu.metadata_redacted_at IS NULL
             AND NOT EXISTS (
               SELECT 1 FROM delivery d JOIN app_user u
                 ON d.chat_id = u.private_chat_id OR d.chat_id = u.telegram_user_id
                WHERE u.telegram_user_id = tu.sender_telegram_id
                  AND d.destination_block_reason IS NOT NULL AND d.destination_block_applied_at IS NULL)
           ORDER BY tu.received_at
-          LIMIT ${this.config.RETENTION_BATCH_SIZE * 10})`;
+          LIMIT ${this.config.RETENTION_BATCH_SIZE * 10}
+            FOR UPDATE SKIP LOCKED)`;
   }
 
   /** Published or cancelled queue bookkeeping of finished work, and schedule history. */

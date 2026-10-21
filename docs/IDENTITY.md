@@ -126,6 +126,8 @@ The TRB-020 inbox (`telegram_update`) remains the only deduplication mechanism. 
 
 All actions are idempotent under replay: redemption, invitation creation, time-zone confirmation, suspension, research admission and resend. Callback acknowledgements are sent after commit and are best effort.
 
+TRB-090: inbox rows are never deleted. Retention reduces old ones to tombstones (update ID, disposition, receipt time; docs/RETENTION.md), so step 1 keeps rejecting replays of every processed update at any age.
+
 ## Ownership
 
 - **`research_run.user_id`** is the owner. A trigger requires it to match `requested_by_telegram_user_id` and forbids changing it once set.
