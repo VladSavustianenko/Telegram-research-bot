@@ -11,6 +11,7 @@ import {
 import { errorInfo } from '../common/error-info';
 import { APP_CONFIG } from '../config/config.module';
 import type { Env } from '../config/env.schema';
+import type { Tx } from '../database/prisma-errors';
 import { PrismaService } from '../database/prisma.service';
 import type { DeliveryPart } from '../generated/prisma/client';
 import { runDeliveryDenial } from '../identity/authorization';
@@ -27,14 +28,35 @@ import {
   type TelegramSender,
 } from '../telegram/telegram-sender';
 import { DeliveryDispatcher } from './delivery-dispatcher';
-import { chatBlocked, suppressionCodeFor, wakeDelivery, wakeNextInChat } from './delivery-records';
-import { markDestinationBlocked } from './destination';
+import {
+  cancelDeliveryEvents,
+  chatBlocked,
+  finalizeSuppressed,
+  suppressionCodeFor,
+  wakeDelivery,
+  wakeNextInChat,
+} from './delivery-records';
+import { applyRecordedBlock } from './destination';
 
 export const DELIVERY_LEASE_SECONDS = 60;
 /** Claims of one delivery (each send pass); retryable refusals stop after this many. */
 export const MAX_DELIVERY_ATTEMPTS = 5;
-/** Upper bound of one retry delay, including a Telegram Retry-After. */
-export const MAX_DELIVERY_RETRY_DELAY_SECONDS = 3_600;
+/** Upper bound of one wake-up delay; a later retry time is reached by re-inspection. */
+export const MAX_WAKE_DELAY_SECONDS = 3_600;
+/** Application backoff without a valid Retry-After: 5 s doubling, at most this. */
+export const MAX_BACKOFF_SECONDS = 300;
+/**
+ * Largest Retry-After honoured (30 days). Telegram's value is honoured in full up
+ * to this; a larger one ends the delivery PERMANENT_FAILURE rather than send early.
+ */
+export const MAX_RETRY_AFTER_SECONDS = 30 * 24 * 3_600;
+
+/** A usable Retry-After: a positive whole number of seconds within the bound. */
+export function validRetryAfter(value: number | undefined): value is number {
+  return (
+    value !== undefined && Number.isInteger(value) && value >= 1 && value <= MAX_RETRY_AFTER_SECONDS
+  );
+}
 /** Re-inspection delay of a delivery waiting behind an earlier one to the same chat. */
 const ORDER_WAIT_SECONDS = 5;
 /** Shutdown waits for a Telegram call in flight (the HTTP timeout is 15 s). */
@@ -80,7 +102,8 @@ class StaleDeliveryLease extends Error {}
  *   with a durable retry time (Retry-After, else backoff) and a delayed delivery
  *   event, bounded by MAX_DELIVERY_ATTEMPTS; permanent refusal → part FAILED,
  *   delivery PERMANENT_FAILURE; a confirmed blocked/deactivated chat also
- *   records the destination block (markDestinationBlocked).
+ *   records the refusal on the delivery and applies the destination block
+ *   (applyRecordedBlock; the recovery sweep completes it after a failure).
  * - INVITATION deliveries store a placeholder; the token is derived just before sending.
  *
  * Fencing protects the database writes; it cannot undo a send. A part whose
@@ -155,7 +178,10 @@ export class DeliveryWorker implements OnApplicationBootstrap, OnModuleDestroy {
     if (!sender) return 'idle';
     const claim = await this.claim(deliveryId);
     if (!claim) {
-      await this.rewakeIfWaiting(deliveryId);
+      // A waiting delivery stranded with a suppression decision is made final.
+      if (!(await finalizeSuppressed(this.prisma, deliveryId))) {
+        await this.rewakeIfWaiting(deliveryId);
+      }
       return 'idle';
     }
     try {
@@ -214,7 +240,7 @@ export class DeliveryWorker implements OnApplicationBootstrap, OnModuleDestroy {
         this.prisma,
         deliveryId,
         'WAITING',
-        Math.min(seconds, MAX_DELIVERY_RETRY_DELAY_SECONDS),
+        Math.min(seconds, MAX_WAKE_DELAY_SECONDS),
       );
     }
   }
@@ -334,58 +360,143 @@ export class DeliveryWorker implements OnApplicationBootstrap, OnModuleDestroy {
       await this.fencedPart(claim, ordinal, { state: 'UNKNOWN', errorCode: failure.code });
       return this.finish(claim, 'UNKNOWN', failure.code);
     }
+    if (failure.destinationUnavailable) {
+      return this.recordDestinationRefusal(claim, ordinal, failure, failure.destinationUnavailable);
+    }
     if (failure.permanent || claim.attempts >= MAX_DELIVERY_ATTEMPTS) {
       await this.fencedPart(claim, ordinal, {
         state: failure.permanent ? 'FAILED' : 'PENDING',
         errorCode: failure.code,
       });
-      await this.finish(claim, 'PERMANENT_FAILURE', failure.code);
-      if (failure.destinationUnavailable) {
-        const blocked = await markDestinationBlocked(
-          this.prisma,
-          claim.chatId,
-          failure.destinationUnavailable,
-        );
-        this.logger.warn({
-          message: 'Telegram destination unavailable; automatic research paused',
-          deliveryId: claim.id,
-          reason: failure.destinationUnavailable,
-          ...blocked,
-        });
-      }
-      return;
+      return this.finish(claim, 'PERMANENT_FAILURE', failure.code);
     }
-    const delaySeconds = Math.min(
-      MAX_DELIVERY_RETRY_DELAY_SECONDS,
-      failure.retryAfterSeconds ?? Math.min(300, 5 * 2 ** (claim.attempts - 1)),
-    );
-    await this.prisma.$transaction(async (tx) => {
-      const updated = await tx.$executeRaw`
-        UPDATE delivery
-           SET state = 'RETRYABLE_FAILURE', last_error_code = ${failure.code},
-               next_attempt_at = now() + ${delaySeconds} * interval '1 second',
-               lease_owner = NULL, lease_until = NULL, updated_at = now()
-         WHERE id = ${claim.id}::uuid AND fencing_token = ${claim.fencingToken} AND state = 'SENDING'`;
-      if (updated !== 1) throw new StaleDeliveryLease();
+    const retryAfter = failure.retryAfterSeconds;
+    if (
+      retryAfter !== undefined &&
+      Number.isInteger(retryAfter) &&
+      retryAfter > MAX_RETRY_AFTER_SECONDS
+    ) {
+      // Never send earlier than Telegram allows, and never wait without bound.
+      await this.fencedPart(claim, ordinal, { state: 'PENDING', errorCode: failure.code });
+      return this.finish(claim, 'PERMANENT_FAILURE', 'TELEGRAM_RETRY_AFTER_TOO_LONG');
+    }
+    const delaySeconds = validRetryAfter(retryAfter)
+      ? retryAfter
+      : Math.min(MAX_BACKOFF_SECONDS, 5 * 2 ** (claim.attempts - 1));
+    await this.release(claim, 'RETRYABLE_FAILURE', failure.code, delaySeconds, async (tx) => {
       await tx.deliveryPart.update({
         where: { deliveryId_ordinal: { deliveryId: claim.id, ordinal } },
         data: { state: 'PENDING', errorCode: failure.code },
       });
-      // Durable retry time: the job is published only when it is due (no busy loop).
-      await wakeDelivery(tx, claim.id, 'RETRY_AFTER_REFUSAL', delaySeconds);
+    });
+  }
+
+  /**
+   * A confirmed blocked/deactivated chat. The refusal is committed first, with
+   * the delivery's terminal state (fenced; only the delivery row is written, so
+   * no lock is taken out of order). Its effects are then applied in their own
+   * transaction in the inbox lock order (applyRecordedBlock); if that fails, the
+   * recorded refusal stays pending and the recovery sweep applies it. Nothing is
+   * sent again in either case.
+   */
+  private async recordDestinationRefusal(
+    claim: Claim,
+    ordinal: number,
+    failure: TelegramSendError,
+    reason: 'BOT_BLOCKED' | 'USER_DEACTIVATED',
+  ): Promise<void> {
+    try {
+      await this.prisma.$transaction(async (tx) => {
+        const updated = await tx.$executeRaw`
+          UPDATE delivery
+             SET state = 'PERMANENT_FAILURE', last_error_code = ${failure.code},
+                 destination_block_reason = ${reason}, destination_refused_at = now(),
+                 lease_owner = NULL, lease_until = NULL, updated_at = now()
+           WHERE id = ${claim.id}::uuid AND fencing_token = ${claim.fencingToken} AND state = 'SENDING'`;
+        if (updated !== 1) throw new StaleDeliveryLease();
+        await tx.deliveryPart.update({
+          where: { deliveryId_ordinal: { deliveryId: claim.id, ordinal } },
+          data: { state: 'FAILED', errorCode: failure.code },
+        });
+      });
+    } catch (error) {
+      if (!(error instanceof StaleDeliveryLease)) throw error;
+      // The lease was lost (lease recovery makes the part UNKNOWN), but the answer is
+      // still a confirmed fact about the chat: record it on the delivery as evidence.
+      await this.prisma.$executeRaw`
+        UPDATE delivery SET destination_block_reason = ${reason}, destination_refused_at = now()
+         WHERE id = ${claim.id}::uuid AND destination_block_reason IS NULL`;
+      await applyRecordedBlock(this.prisma, claim.id);
+      throw error;
+    }
+    await wakeNextInChat(this.prisma, claim.chatId);
+    const blocked = await applyRecordedBlock(this.prisma, claim.id);
+    this.logger.warn({
+      message: 'Telegram destination unavailable; automatic research paused',
+      deliveryId: claim.id,
+      reason,
+      ...blocked,
     });
   }
 
   /** Shutdown between parts: release the lease and wake the delivery, in one transaction. */
   private async handOver(claim: Claim): Promise<void> {
-    await this.prisma.$transaction(async (tx) => {
-      const released = await tx.$executeRaw`
-        UPDATE delivery SET state = 'PENDING', lease_owner = NULL, lease_until = NULL,
-               fencing_token = fencing_token + 1, updated_at = now()
-         WHERE id = ${claim.id}::uuid AND fencing_token = ${claim.fencingToken} AND state = 'SENDING'`;
-      if (released === 1) await wakeDelivery(tx, claim.id, 'SHUTDOWN_HANDOVER');
-    });
+    await this.release(claim, 'PENDING', null, 0);
     this.logger.log({ message: 'Delivery handed over on shutdown', deliveryId: claim.id });
+  }
+
+  /**
+   * Leaves SENDING for a waiting state (after a confirmed retryable refusal, or a
+   * shutdown hand-over), in one transaction. The same statement that takes the
+   * delivery row lock reads the durable suppression decision: a decision
+   * recorded while this worker was sending (suspension, deletion, chat block)
+   * makes the delivery final, SUPPRESSED, instead of waiting. No send outcome is
+   * ambiguous here (the last answer was a confirmed refusal, or no part is in
+   * flight); confirmed parts keep their message IDs. A suppressed delivery's
+   * pending wake-ups are cancelled and the next delivery to the chat is woken; a
+   * waiting one gets its own wake-up at its retry time.
+   */
+  private async release(
+    claim: Claim,
+    waiting: 'RETRYABLE_FAILURE' | 'PENDING',
+    code: string | null,
+    delaySeconds: number,
+    alsoInTx?: (tx: Tx) => Promise<void>,
+  ): Promise<void> {
+    const suppressed = await this.prisma.$transaction(async (tx) => {
+      const rows = await tx.$queryRaw<{ suppressed: boolean }[]>`
+        UPDATE delivery
+           SET state = (CASE WHEN suppressed_at IS NULL THEN ${waiting} ELSE 'SUPPRESSED' END)::"DeliveryState",
+               last_error_code = CASE WHEN suppressed_at IS NULL THEN ${code} ELSE last_error_code END,
+               next_attempt_at = CASE WHEN suppressed_at IS NULL
+                                      THEN now() + ${delaySeconds} * interval '1 second'
+                                      ELSE next_attempt_at END,
+               lease_owner = NULL, lease_until = NULL, fencing_token = fencing_token + 1,
+               updated_at = now()
+         WHERE id = ${claim.id}::uuid AND fencing_token = ${claim.fencingToken} AND state = 'SENDING'
+        RETURNING suppressed_at IS NOT NULL AS suppressed`;
+      const row = rows[0];
+      if (!row) throw new StaleDeliveryLease();
+      await alsoInTx?.(tx);
+      if (row.suppressed) {
+        await tx.delivery.update({
+          where: { id: claim.id },
+          data: { lastErrorCode: await suppressionCodeFor(tx, claim.id) },
+        });
+        await cancelDeliveryEvents(tx, claim.id);
+        await wakeNextInChat(tx, claim.chatId);
+      } else {
+        // Durable retry time: the job is published only when it is due (no busy loop).
+        await wakeDelivery(
+          tx,
+          claim.id,
+          waiting === 'PENDING' ? 'SHUTDOWN_HANDOVER' : 'RETRY_AFTER_REFUSAL',
+          delaySeconds,
+        );
+      }
+      return row.suppressed;
+    });
+    if (suppressed) this.logger.log({ message: 'Delivery suppressed', deliveryId: claim.id });
   }
 
   private async finish(

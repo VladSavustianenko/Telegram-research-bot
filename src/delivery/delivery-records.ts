@@ -134,20 +134,26 @@ export async function chatBlocked(tx: Tx | PrismaService, chatId: bigint): Promi
   return rows[0]?.blocked ?? false;
 }
 
+const SUPPRESSION_CODES = new Set(['RECIPIENT_SUSPENDED', 'TASK_DELETED', 'CHAT_BLOCKED']);
+
 /**
  * Code for a delivery stopped by a durable decision recorded while it was being
- * sent: the run's suppression reason, else a confirmed chat block, else
+ * sent: the code the decision wrote on the delivery, else the run's suppression reason, else a confirmed chat block, else
  * suspension (the only earlier source of such decisions).
  */
 export async function suppressionCodeFor(
   tx: Tx | PrismaService,
   deliveryId: string,
 ): Promise<string> {
-  const rows = await tx.$queryRaw<{ reason: string | null; chatId: bigint }[]>`
-    SELECT r.delivery_suppression_reason AS reason, d.chat_id AS "chatId"
+  const rows = await tx.$queryRaw<
+    { recorded: string | null; reason: string | null; chatId: bigint }[]
+  >`
+    SELECT d.last_error_code AS recorded, r.delivery_suppression_reason AS reason, d.chat_id AS "chatId"
       FROM delivery d LEFT JOIN research_run r ON r.id = d.run_id
      WHERE d.id = ${deliveryId}::uuid`;
   const row = rows[0];
+  // The code the suppression wrote on the delivery itself (also while it was SENDING).
+  if (row?.recorded && SUPPRESSION_CODES.has(row.recorded)) return row.recorded;
   if (row?.reason) return suppressionCode(row.reason);
   if (row && (await chatBlocked(tx, row.chatId))) return 'CHAT_BLOCKED';
   return 'RECIPIENT_SUSPENDED';
@@ -168,4 +174,44 @@ export async function wakeNextInChat(tx: Tx | PrismaService, chatId: bigint): Pr
      LIMIT 1
     ON CONFLICT (delivery_id) WHERE dispatched_at IS NULL AND cancelled_at IS NULL
     DO UPDATE SET available_at = LEAST(delivery_event.available_at, EXCLUDED.available_at)`;
+}
+
+/** Cancels the pending wake-ups of a delivery that can no longer be sent automatically. */
+export async function cancelDeliveryEvents(
+  tx: Tx | PrismaService,
+  deliveryId: string,
+): Promise<void> {
+  await tx.$executeRaw`
+    UPDATE delivery_event SET cancelled_at = now()
+     WHERE delivery_id = ${deliveryId}::uuid AND dispatched_at IS NULL AND cancelled_at IS NULL`;
+}
+
+/**
+ * Makes a waiting delivery (PENDING or RETRYABLE_FAILURE) that carries a durable
+ * suppression decision final: SUPPRESSED with its reason, wake-ups cancelled and
+ * the next delivery to the chat woken. Repairs rows stranded by the pre-review
+ * code (a decision recorded while SENDING, then a retry or hand-over). Nothing is
+ * sent and confirmed parts are untouched. Returns whether it changed the row.
+ */
+export async function finalizeSuppressed(
+  client: PrismaService,
+  deliveryId: string,
+): Promise<boolean> {
+  return client.$transaction(async (tx) => {
+    const rows = await tx.$queryRaw<{ chatId: bigint }[]>`
+      UPDATE delivery SET state = 'SUPPRESSED', lease_owner = NULL, lease_until = NULL,
+             updated_at = now()
+       WHERE id = ${deliveryId}::uuid AND state IN ('PENDING', 'RETRYABLE_FAILURE')
+         AND suppressed_at IS NOT NULL
+      RETURNING chat_id AS "chatId"`;
+    const row = rows[0];
+    if (!row) return false;
+    await tx.delivery.update({
+      where: { id: deliveryId },
+      data: { lastErrorCode: await suppressionCodeFor(tx, deliveryId) },
+    });
+    await cancelDeliveryEvents(tx, deliveryId);
+    await wakeNextInChat(tx, row.chatId);
+    return true;
+  });
 }

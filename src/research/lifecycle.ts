@@ -122,7 +122,8 @@ export async function suppressRunDeliveries(
     UPDATE delivery
        SET suppressed_at = COALESCE(suppressed_at, now()),
            state = CASE WHEN state = 'SENDING' THEN state ELSE 'SUPPRESSED' END,
-           last_error_code = CASE WHEN state = 'SENDING' THEN last_error_code ELSE ${code} END,
+           -- Also while SENDING: the reason the worker reports when it stops (TRB-080 fix).
+           last_error_code = ${code},
            updated_at = now()
      WHERE state IN ('PENDING', 'RETRYABLE_FAILURE', 'SENDING')
        AND run_id IN (SELECT id FROM research_run WHERE ${scopeSql(scope)})`;

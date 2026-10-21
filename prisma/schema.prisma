@@ -211,6 +211,13 @@ model Delivery {
   /// Durable suppression decision: once set the delivery never sends another part
   /// (a part already handed to Telegram may still complete). Never cleared.
   suppressedAt  DateTime?      @map("suppressed_at") @db.Timestamptz(3)
+  /// TRB-080 review fix: Telegram confirmed this chat unavailable when sending this
+  /// delivery (BOT_BLOCKED, USER_DEACTIVATED) at destination_refused_at. Durable
+  /// evidence of the decision; destination_block_applied_at is set once its
+  /// effects (or its supersession by a later message from the user) are committed.
+  destinationBlockReason    String?   @map("destination_block_reason")
+  destinationRefusedAt      DateTime? @map("destination_refused_at") @db.Timestamptz(3)
+  destinationBlockAppliedAt DateTime? @map("destination_block_applied_at") @db.Timestamptz(3)
   /// Set only for kind INVITATION.
   invitationId  String?        @map("invitation_id") @db.Uuid
   invitation    Invitation?    @relation(fields: [invitationId], references: [id], onDelete: Restrict)

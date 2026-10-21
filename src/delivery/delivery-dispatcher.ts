@@ -6,13 +6,20 @@ import {
   OnModuleDestroy,
   Optional,
 } from '@nestjs/common';
+import { errorInfo } from '../common/error-info';
 import { WorkerLoop } from '../common/worker-loop';
 import { APP_CONFIG } from '../config/config.module';
 import type { Env } from '../config/env.schema';
 import { PrismaService } from '../database/prisma.service';
 import { DELIVERY_QUEUE, QueueService } from '../queue/queue.service';
 import { TELEGRAM_SENDER, type TelegramSender } from '../telegram/telegram-sender';
-import { suppressionCodeFor, wakeDelivery, wakeNextInChat } from './delivery-records';
+import {
+  finalizeSuppressed,
+  suppressionCodeFor,
+  wakeDelivery,
+  wakeNextInChat,
+} from './delivery-records';
+import { applyRecordedBlock, pendingRecordedBlocks } from './destination';
 
 /** Events published per dispatcher transaction. */
 const DISPATCH_BATCH = 20;
@@ -114,6 +121,8 @@ export class DeliveryDispatcher implements OnApplicationBootstrap, OnModuleDestr
   /** Recovery sweep; see the class comment. Safe to run concurrently and repeatedly. */
   async sweep(): Promise<void> {
     await this.recoverExpired();
+    await this.finalizeStranded();
+    await this.applyRecordedBlocks();
     const woken = await this.prisma.$executeRaw`
       INSERT INTO delivery_event (id, delivery_id, reason, available_at)
       SELECT gen_random_uuid(), d.id, 'JOB_LOST', now()
@@ -127,6 +136,38 @@ export class DeliveryDispatcher implements OnApplicationBootstrap, OnModuleDestr
                             AND r.dispatched_at > now() - ${DELIVERY_LOST_JOB_SECONDS} * interval '1 second')
       ON CONFLICT (delivery_id) WHERE dispatched_at IS NULL AND cancelled_at IS NULL DO NOTHING`;
     if (woken > 0) this.logger.warn({ message: 'Delivery sweep woke deliveries', count: woken });
+  }
+
+  /** Waiting deliveries with a suppression decision are made final (they would block their chat). */
+  private async finalizeStranded(): Promise<void> {
+    const stranded = await this.prisma.delivery.findMany({
+      where: { state: { in: ['PENDING', 'RETRYABLE_FAILURE'] }, suppressedAt: { not: null } },
+      select: { id: true },
+      take: 50,
+    });
+    let count = 0;
+    for (const { id } of stranded) if (await finalizeSuppressed(this.prisma, id)) count += 1;
+    if (count > 0) this.logger.warn({ message: 'Finalized suppressed waiting deliveries', count });
+  }
+
+  /** Confirmed destination refusals whose effects were not applied (failure after recording). */
+  private async applyRecordedBlocks(): Promise<void> {
+    for (const id of await pendingRecordedBlocks(this.prisma)) {
+      try {
+        const result = await applyRecordedBlock(this.prisma, id);
+        this.logger.warn({
+          message: 'Applied recorded destination refusal',
+          deliveryId: id,
+          ...result,
+        });
+      } catch (error) {
+        this.logger.error({
+          message: 'Recorded destination refusal not applied',
+          deliveryId: id,
+          ...errorInfo(error),
+        });
+      }
+    }
   }
 
   /** A worker died or froze while SENDING: an in-flight part has an unknown outcome. */

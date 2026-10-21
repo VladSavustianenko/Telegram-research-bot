@@ -398,7 +398,15 @@ describe('TRB-080 delivery and history (recording sender, real pg-boss and Postg
 
     it('gives up after the bounded number of attempts', async () => {
       await say('/help');
-      for (let i = 0; i < 5; i += 1) h.sender.failNext(telegramRateLimited());
+      // retry_after = 0 is not a usable value: bounded backoff, made due here.
+      for (let i = 0; i < 5; i += 1) {
+        h.sender.failNext(telegramRateLimited());
+        await drainDeliveries(h);
+        await h.prisma
+          .$executeRaw`UPDATE delivery SET next_attempt_at = now() WHERE state = 'RETRYABLE_FAILURE'`;
+        await h.prisma
+          .$executeRaw`UPDATE delivery_event SET available_at = now() WHERE dispatched_at IS NULL AND cancelled_at IS NULL`;
+      }
       await drainDeliveries(h);
       expect(await h.prisma.delivery.findFirstOrThrow()).toMatchObject({
         state: 'PERMANENT_FAILURE',
@@ -1018,6 +1026,372 @@ describe('TRB-080 delivery and history (recording sender, real pg-boss and Postg
       expect(h.sender.sent.at(-1)?.html).toContain(REPORT_TITLE);
       expect(await reportOf(run.id)).toMatchObject({ state: 'SUPPRESSED' });
       expect(h.provider.calls.submit).toBe(1);
+    });
+  });
+
+  describe('review fixes (commit f23221c)', () => {
+    const MEMBER = 3003;
+    const addMember = () =>
+      h.prisma.$executeRaw`
+        INSERT INTO app_user (id, telegram_user_id, private_chat_id, role, onboarding_state, time_zone,
+                              invited_at, onboarded_at, updated_at)
+        VALUES (gen_random_uuid(), ${MEMBER}, ${MEMBER}, 'MEMBER', 'COMPLETED', 'Europe/Kyiv', now(), now(), now())`;
+    const toChat = (chat: number) => h.sender.sent.filter((m) => m.chatId === BigInt(chat));
+    const rateLimited = (seconds?: number) =>
+      new TelegramSendError('TELEGRAM_429', 'not_sent', false, seconds);
+    /** Holds the first send in flight until `release`, then fails it with `failure`. */
+    const holdFirstSend = (failure: TelegramSendError) => {
+      const inFlight = gate();
+      const release = gate();
+      let first = true;
+      h.sender.beforeSend = async () => {
+        if (!first) return;
+        first = false;
+        inFlight.open();
+        await release.promise;
+        throw failure;
+      };
+      return { inFlight, release };
+    };
+    const makeDue = async () => {
+      await h.prisma
+        .$executeRaw`UPDATE delivery SET next_attempt_at = now() WHERE state = 'RETRYABLE_FAILURE'`;
+      await h.prisma
+        .$executeRaw`UPDATE delivery_event SET available_at = now() WHERE dispatched_at IS NULL AND cancelled_at IS NULL`;
+    };
+    const secondsUntil = (instant: Date) => (instant.getTime() - Date.now()) / 1000;
+
+    describe('Finding 1: suppression during a send never strands the chat', () => {
+      it('finalizes a delivery suspended in flight and refused with 429; later messages flow after reactivation', async () => {
+        await addMember();
+        const run = await researched(h, 'member topic', MEMBER);
+        const report = await reportOf(run.id);
+        const { inFlight, release } = holdFirstSend(rateLimited(1));
+        const sending = h.delivery.handle(report.id);
+        await inFlight.promise;
+        await say(`/admin suspend ${MEMBER}`);
+        release.open();
+        await sending;
+
+        expect(await reportOf(run.id)).toMatchObject({
+          state: 'SUPPRESSED',
+          lastErrorCode: 'RECIPIENT_SUSPENDED',
+        });
+        expect((await reportOf(run.id)).parts[0]).toMatchObject({
+          state: 'PENDING',
+          errorCode: 'TELEGRAM_429',
+        });
+        expect(await pendingEvents(report.id)).toHaveLength(0);
+
+        await say(`/admin reactivate ${MEMBER}`);
+        await makeDue();
+        await drainDeliveries(h);
+        await say('/help', MEMBER);
+        await drainDeliveries(h);
+        expect(toChat(MEMBER).map((m) => visible(m.html))).toEqual([
+          expect.stringContaining('/history'),
+        ]);
+        expect((await reportOf(run.id)).suppressedAt).toBeInstanceOf(Date);
+        expect(h.sender.attempts.filter((a) => a.html.includes(REPORT_TITLE))).toHaveLength(1);
+      });
+
+      it('finalizes a delivery whose task is deleted in flight and refused with 5xx', async () => {
+        const task = await h.prisma.task.create({
+          data: {
+            userId: await adminId(),
+            name: 'Task',
+            prompt: 'p',
+            scheduleKind: 'MANUAL',
+            timeZone: 'Europe/Kyiv',
+          },
+        });
+        await press(taskCallbackData(task.id, 1, 'r'));
+        expect(await h.research.tick()).toBe(true);
+        const run = await h.prisma.researchRun.findFirstOrThrow();
+        const ack = await h.prisma.delivery.findFirstOrThrow({
+          where: { runId: run.id, kind: 'STATUS' },
+        });
+        expect(await h.delivery.handle(ack.id)).toBe('sent');
+        const report = await reportOf(run.id);
+        const { inFlight, release } = holdFirstSend(telegramServerError());
+        const sending = h.delivery.handle(report.id);
+        await inFlight.promise;
+        await press(taskCallbackData(task.id, 1, 'dy'));
+        release.open();
+        await sending;
+
+        expect(await reportOf(run.id)).toMatchObject({
+          state: 'SUPPRESSED',
+          lastErrorCode: 'TASK_DELETED',
+        });
+        await makeDue();
+        h.sender.sent.length = 0;
+        await drainDeliveries(h);
+        await say('/help');
+        await drainDeliveries(h);
+        const texts = h.sender.sent.map((m) => visible(m.html));
+        expect(texts.some((t) => t.includes('видалено'))).toBe(true); // the deletion reply
+        expect(texts.at(-1)).toContain('/history');
+        expect(texts.some((t) => t.includes(REPORT_TITLE))).toBe(false);
+      });
+
+      it('finalizes a delivery suppressed before a shutdown hand-over, keeping the confirmed part', async () => {
+        await addMember();
+        completeWith(h, unicodeReport(40));
+        const run = await researched(h, 'member long', MEMBER);
+        const report = await reportOf(run.id);
+        const stop = new AbortController();
+        h.sender.beforeSend = async () => {
+          await say(`/admin suspend ${MEMBER}`);
+          stop.abort();
+        };
+        expect(await h.delivery.handle(report.id, stop.signal)).toBe('stopped');
+        h.sender.beforeSend = () => Promise.resolve();
+
+        const current = await reportOf(run.id);
+        expect(current).toMatchObject({
+          state: 'SUPPRESSED',
+          lastErrorCode: 'RECIPIENT_SUSPENDED',
+        });
+        expect(current.parts[0]).toMatchObject({ state: 'SENT' });
+        expect(current.parts[0]?.telegramMessageId).toBe(BigInt(toChat(MEMBER)[0]?.messageId ?? 0));
+        expect(current.parts.slice(1).every((p) => p.state === 'PENDING')).toBe(true);
+        expect(await pendingEvents(report.id)).toHaveLength(0);
+
+        await say(`/admin reactivate ${MEMBER}`);
+        await say('/help', MEMBER);
+        await drainDeliveries(h);
+        expect(toChat(MEMBER)).toHaveLength(2);
+        expect(visible(toChat(MEMBER)[1]?.html ?? '')).toContain('/history');
+      });
+
+      it('repairs waiting deliveries already stranded with a suppression decision', async () => {
+        const stranded = [];
+        for (const state of ['RETRYABLE_FAILURE', 'PENDING'] as const) {
+          stranded.push(
+            await h.prisma.delivery.create({
+              data: {
+                kind: 'STATUS',
+                chatId: BigInt(ADMIN_ID),
+                state,
+                suppressedAt: new Date(),
+                nextAttemptAt: new Date(Date.now() + 3_600_000),
+                parts: { create: [{ ordinal: 0, html: `stranded ${state}`, contentHash: 'x' }] },
+              },
+            }),
+          );
+        }
+        await say('/help');
+        await drainDeliveries(h);
+        expect(h.sender.sent.map((m) => visible(m.html))).toEqual([
+          expect.stringContaining('/history'),
+        ]);
+        for (const delivery of stranded) {
+          expect(
+            await h.prisma.delivery.findUniqueOrThrow({ where: { id: delivery.id } }),
+          ).toMatchObject({
+            state: 'SUPPRESSED',
+            lastErrorCode: 'RECIPIENT_SUSPENDED',
+          });
+        }
+      });
+
+      it('keeps an ambiguous in-flight send UNKNOWN even when suppressed meanwhile', async () => {
+        await addMember();
+        const run = await researched(h, 'member topic', MEMBER);
+        const report = await reportOf(run.id);
+        const { inFlight, release } = holdFirstSend(telegramTimeout());
+        const sending = h.delivery.handle(report.id);
+        await inFlight.promise;
+        await say(`/admin suspend ${MEMBER}`);
+        release.open();
+        await sending;
+        expect(await reportOf(run.id)).toMatchObject({
+          state: 'UNKNOWN',
+          lastErrorCode: 'TELEGRAM_NETWORK',
+        });
+        await h.deliveryDispatcher.sweep();
+        await drainDeliveries(h);
+        expect(h.sender.attempts.filter((a) => a.html.includes(REPORT_TITLE))).toHaveLength(1);
+      });
+    });
+
+    describe('Finding 2: a confirmed block survives a failure after the refusal is recorded', () => {
+      const failBlockStep = () =>
+        h.prisma.$executeRawUnsafe(`
+          CREATE OR REPLACE FUNCTION test_fail_block() RETURNS trigger AS $$
+          BEGIN
+            IF NEW.chat_blocked_at IS NOT NULL AND OLD.chat_blocked_at IS NULL THEN
+              RAISE EXCEPTION 'injected failure applying the destination block';
+            END IF;
+            RETURN NEW;
+          END $$ LANGUAGE plpgsql;
+          CREATE TRIGGER test_fail_block BEFORE UPDATE ON app_user
+            FOR EACH ROW EXECUTE FUNCTION test_fail_block();`);
+      const healBlockStep = async () => {
+        await h.prisma.$executeRawUnsafe('DROP TRIGGER test_fail_block ON app_user');
+        await h.prisma.$executeRawUnsafe('DROP FUNCTION test_fail_block()');
+      };
+      /** Live mode: an active daily task with a queued scheduled run, and a waiting reply. */
+      const setUp = async () => {
+        const live = await start({}, true);
+        h = live;
+        const task = await h.prisma.task.create({
+          data: {
+            userId: await adminId(),
+            name: 'Daily',
+            prompt: 'p',
+            scheduleKind: 'DAILY',
+            localTime: '09:00',
+            timeZone: 'Europe/Kyiv',
+            nextRunAt: new Date('2026-10-19T06:00:00Z'),
+          },
+        });
+        clock.set('2026-10-19T06:00:10Z');
+        await live.scheduler.tick();
+        const queued = await h.prisma.researchRun.findFirstOrThrow({
+          where: { trigger: 'SCHEDULED' },
+        });
+        await say('/usage', ADMIN_ID, live);
+        await failBlockStep();
+        live.sender.failNext(telegramBlocked());
+        await expect(drainDeliveries(live)).rejects.toThrow();
+        const failed = await h.prisma.delivery.findFirstOrThrow({ where: { kind: 'STATUS' } });
+        expect(failed).toMatchObject({ state: 'PERMANENT_FAILURE', lastErrorCode: 'TELEGRAM_403' });
+        await healBlockStep();
+        return { live, task, queued, failed };
+      };
+      const ledgerKinds = async (runId: string) =>
+        (
+          await h.prisma.usageLedger.findMany({ where: { runId }, orderBy: { createdAt: 'asc' } })
+        ).map((entry) => entry.kind);
+
+      it('applies the recorded block after a restart, once, without resending', async () => {
+        const { live, task, queued } = await setUp();
+        expect(
+          (await h.prisma.appUser.findUniqueOrThrow({ where: { id: await adminId() } }))
+            .chatBlockedAt,
+        ).toBeNull();
+        await close(live);
+        h = await start({}, true);
+        await h.deliveryDispatcher.sweep();
+        await h.deliveryDispatcher.sweep(); // replay
+        await drainDeliveries(h);
+
+        const user = await h.prisma.appUser.findUniqueOrThrow({ where: { id: await adminId() } });
+        expect(user).toMatchObject({ chatBlockReason: 'BOT_BLOCKED' });
+        expect(await h.prisma.task.findUniqueOrThrow({ where: { id: task.id } })).toMatchObject({
+          state: 'PAUSED',
+          nextRunAt: null,
+        });
+        expect(
+          await h.prisma.researchRun.findUniqueOrThrow({ where: { id: queued.id } }),
+        ).toMatchObject({
+          state: 'CANCELLED',
+          failureCode: 'CHAT_BLOCKED',
+        });
+        expect(await ledgerKinds(queued.id)).toEqual(['RESERVE', 'RELEASE']);
+        expect(await h.prisma.auditEvent.count({ where: { kind: 'DESTINATION_BLOCKED' } })).toBe(1);
+        expect(h.sender.attempts).toHaveLength(0);
+        expect(h.provider.calls.submit).toBe(0);
+
+        // Nothing resumes automatically.
+        clock.set('2026-10-21T06:00:10Z');
+        await h.scheduler.tick();
+        expect(await h.prisma.researchRun.count()).toBe(1);
+      });
+
+      it('does not re-block a chat the user restored before the recorded block was applied', async () => {
+        const { live, task } = await setUp();
+        await say('/help', ADMIN_ID, live); // the user writes again: the chat works
+        await drainDeliveries(live);
+        await live.deliveryDispatcher.sweep();
+        await drainDeliveries(live);
+
+        expect(
+          (await h.prisma.appUser.findUniqueOrThrow({ where: { id: await adminId() } }))
+            .chatBlockedAt,
+        ).toBeNull();
+        expect(await h.prisma.task.findUniqueOrThrow({ where: { id: task.id } })).toMatchObject({
+          state: 'ACTIVE',
+        });
+        expect(await h.prisma.auditEvent.count({ where: { kind: 'DESTINATION_BLOCKED' } })).toBe(0);
+        expect(
+          await h.prisma.delivery.count({
+            where: { destinationBlockAppliedAt: null, destinationBlockReason: { not: null } },
+          }),
+        ).toBe(0);
+        expect(live.sender.sent.map((m) => visible(m.html)).at(-1)).toContain('/history');
+      });
+    });
+
+    describe('Finding 3: Retry-After is honoured in full', () => {
+      it('keeps a 7200 s Retry-After across early wake-ups, duplicate jobs and a restart', async () => {
+        await say('/help');
+        h.sender.failNext(rateLimited(7200));
+        expect(await h.delivery.tick()).toBe(true);
+        const delivery = await h.prisma.delivery.findFirstOrThrow();
+        expect(delivery.state).toBe('RETRYABLE_FAILURE');
+        expect(secondsUntil(delivery.nextAttemptAt)).toBeGreaterThan(7190);
+        expect(secondsUntil(delivery.nextAttemptAt)).toBeLessThanOrEqual(7200);
+
+        // Early and duplicate wake-ups only re-inspect.
+        await h.prisma
+          .$executeRaw`UPDATE delivery_event SET available_at = now() WHERE dispatched_at IS NULL`;
+        await h.prisma.$transaction((tx) =>
+          h.queue.publishDelivery(tx, { deliveryId: delivery.id, eventId: randomUUID() }),
+        );
+        await drainDeliveries(h);
+        await close(h);
+        h = await start();
+        await h.prisma
+          .$executeRaw`UPDATE delivery_event SET available_at = now() WHERE dispatched_at IS NULL`;
+        await drainDeliveries(h);
+        expect(h.sender.attempts).toHaveLength(0);
+        const waiting = await h.prisma.delivery.findFirstOrThrow();
+        expect(waiting.nextAttemptAt).toEqual(delivery.nextAttemptAt);
+        expect(await pendingEvents(delivery.id)).toHaveLength(1);
+
+        // Eligible only once the full interval has passed.
+        await makeDue();
+        await drainDeliveries(h);
+        expect(await h.prisma.delivery.findFirstOrThrow()).toMatchObject({
+          state: 'SENT',
+          attempts: 2,
+        });
+      });
+
+      it('honours a short Retry-After, and falls back to bounded backoff for missing or invalid values', async () => {
+        const cases: [number | undefined, number, number][] = [
+          [2, 1, 2], // provider value
+          [undefined, 4, 5], // missing: backoff 5 s
+          [0, 4, 5], // invalid: backoff, never an immediate retry
+          [-3, 4, 5],
+          [Number.NaN, 4, 5],
+          [1.5, 4, 5],
+        ];
+        for (const [retryAfter, min, max] of cases) {
+          await h.prisma.$executeRawUnsafe(
+            'TRUNCATE delivery_event, delivery_part, delivery CASCADE',
+          );
+          await say('/help');
+          h.sender.failNext(rateLimited(retryAfter));
+          await h.delivery.tick();
+          const delivery = await h.prisma.delivery.findFirstOrThrow();
+          expect(delivery.state, String(retryAfter)).toBe('RETRYABLE_FAILURE');
+          const wait = secondsUntil(delivery.nextAttemptAt);
+          expect(wait, String(retryAfter)).toBeGreaterThan(min - 0.5);
+          expect(wait, String(retryAfter)).toBeLessThanOrEqual(max);
+        }
+        // Application backoff grows and stays bounded.
+        await h.prisma.$executeRaw`UPDATE delivery SET attempts = 3`;
+        await makeDue();
+        h.sender.failNext(rateLimited(undefined));
+        await h.delivery.tick();
+        const later = await h.prisma.delivery.findFirstOrThrow();
+        expect(secondsUntil(later.nextAttemptAt)).toBeGreaterThan(35);
+        expect(secondsUntil(later.nextAttemptAt)).toBeLessThanOrEqual(40);
+      });
     });
   });
 });

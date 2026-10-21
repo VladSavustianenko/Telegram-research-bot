@@ -40,6 +40,8 @@ The TRB-020 delivery loop, which polled the `delivery` table directly, has been 
 | Worker dies after claiming, before the next part's send intent | Lease expires (60 s); the sweep returns the delivery to `PENDING` and wakes it. Parts already `SENT` are skipped |
 | Worker dies after a part's send intent (`SENDING`), before recording the answer | The sweep marks the part and the delivery `UNKNOWN` (`INTERRUPTED_WHILE_SENDING`); later parts stay unsent |
 | Worker frozen beyond its lease while a request is in flight | The same: the part becomes `UNKNOWN`. When the frozen request returns, its fenced write fails and the message ID is only logged |
+| Confirmed block answer received, process dies before the refusal commits | Unavoidable window: the answer exists only in memory. The part stays `SENDING`, then becomes `UNKNOWN` by lease recovery; the block is detected again by the next delivery to that chat |
+| Refusal committed, failure before its effects commit | The refusal stays recorded on the delivery (`destination_block_reason`, `destination_refused_at`, no `destination_block_applied_at`); the recovery sweep applies it. Nothing is sent again |
 
 ## Claim, ordering and leases
 
@@ -55,13 +57,19 @@ The TRB-020 delivery loop, which polled the `delivery` table directly, has been 
 | Part | `PENDING` → `SENDING` (send intent, `send_started_at`) → `SENT` (`telegram_message_id`, `sent_at`) / `UNKNOWN` / `FAILED`; a retryable refusal returns it to `PENDING` with `error_code` |
 
 **Per part, in order:**
-1. Shutdown requested → hand-over: the lease is released (`PENDING`) and a wake-up written, in one transaction.
+1. Shutdown requested → hand-over: the lease is released (`PENDING`) and a wake-up written, in one transaction. If a suppression decision was recorded meanwhile, the delivery becomes `SUPPRESSED` instead (below).
 2. Recheck: for run-related deliveries the owner's current account access (`RECIPIENT_SUSPENDED`, `ACCESS_REVOKED`, `OWNER_UNRESOLVED`); for every delivery a confirmed chat block (`CHAT_BLOCKED`). A denial ends the delivery `SUPPRESSED` with a durable decision.
 3. Send intent: in one transaction the lease is renewed, `delivery.suppressed_at` is read, and the part is marked `SENDING`. A decision committed earlier stops the delivery here (`SUPPRESSED`); one committed later lets only this part go (the documented one-part race, docs/IDENTITY.md).
 4. Telegram call (`sendMessage` with HTML, or `sendDocument`).
 5. The outcome is recorded under the fencing token.
 
 `UNKNOWN` and `SUPPRESSED` are final for automatic delivery. Earlier `SENT` parts keep their message IDs.
+
+**Suppression decided while a part was in flight** (review fix). A suspension, task deletion or chat block marks a `SENDING` delivery with `suppressed_at` and its reason code, and leaves it to the worker.
+- **Hand-over or confirmed retryable refusal.** The worker leaves `SENDING` with one statement that takes the delivery row lock and reads the decision. With a decision, the delivery becomes `SUPPRESSED` with its reason (`RECIPIENT_SUSPENDED`, `TASK_DELETED`, `CHAT_BLOCKED`) instead of `RETRYABLE_FAILURE` or `PENDING`. Its pending wake-ups are cancelled and the next delivery to the chat is woken.
+- **Ambiguous outcome.** It still makes the delivery `UNKNOWN`; a confirmed answer still makes the part `SENT` with its message ID.
+- **Order of commits.** Whichever commits first, the other sees it: a suppression committed after the worker's update finds the waiting delivery and suppresses it.
+- **Rows stranded before this fix.** A waiting delivery with a decision is made final by the next job for it or by the recovery sweep. Nothing is sent and decisions are never cleared, so reactivation releases nothing.
 
 ## Retry classification
 
@@ -70,7 +78,7 @@ The Bot API contract: every response carries `ok`; an unsuccessful request has `
 | Outcome | Established? | Delivery | Retried |
 |---|---|---|---|
 | `ok: true` with a message | Accepted | Part `SENT` | — |
-| 429 (flood control) | Not accepted | `RETRYABLE_FAILURE`; `next_attempt_at` = now + `retry_after` (at most 1 h) | Yes, when due |
+| 429 (flood control) | Not accepted | `RETRYABLE_FAILURE`; `next_attempt_at` = now + the full `retry_after` | Yes, when due |
 | 5xx answered with `ok: false` | Not accepted (the API reported failure) | `RETRYABLE_FAILURE`; backoff 5 s, 10 s, 20 s, … ≤ 300 s | Yes |
 | Connection never established (`ECONNREFUSED`, `ENOTFOUND`, `EAI_AGAIN`) | Not sent: no request bytes left the process | `RETRYABLE_FAILURE`, backoff | Yes |
 | 403 "bot was blocked by the user" / "user is deactivated" | Not accepted; the destination is confirmed unavailable | `PERMANENT_FAILURE`; destination block (below) | No |
@@ -78,6 +86,12 @@ The Bot API contract: every response carries `ok`; an unsuccessful request has `
 | Timeout, connection reset, abort, unreadable or non-API answer (e.g. a gateway HTML page), unexpected error | **Ambiguous** | Part and delivery `UNKNOWN`; continuation of a multipart delivery stops | Never automatically |
 
 **Bounds.** At most 5 claims per delivery (`MAX_DELIVERY_ATTEMPTS`); a retryable refusal on the last one ends `PERMANENT_FAILURE` with its code. Retry timing is durable (`next_attempt_at` and the event's `available_at`): no sleep, no busy loop, and a job that arrives early only re-schedules.
+
+**Retry-After policy** (review fix):
+- **Valid value.** A whole number of seconds from 1 to 30 days. It is honoured in full: `next_attempt_at` = now + `retry_after`, never shortened. The claim requires `next_attempt_at <= now()`, so no early, duplicate or post-restart job can send before it.
+- **Long waits.** A single wake-up is delayed at most 1 h; a later retry time is reached by re-inspection, which only re-schedules.
+- **Missing or malformed value** (absent, 0, negative, fractional, not a number). Application backoff: 5 s doubling with the claim count, at most 300 s. Never an immediate retry.
+- **Beyond 30 days.** `PERMANENT_FAILURE / TELEGRAM_RETRY_AFTER_TOO_LONG`, rather than sending early or waiting without bound.
 
 Change from TRB-020: a 5xx answer is still retried, because the API reported `ok: false`. Non-JSON answers were already ambiguous. Connection-refused errors used to be ambiguous and are now retried.
 
@@ -182,7 +196,14 @@ A malformed callback, or an ID that does not decode to exactly 16 canonical byte
 
 **Detection.** Only Telegram's confirmed answer counts: HTTP 403 with "bot was blocked by the user" or "user is deactivated". Rate limits, 5xx answers, timeouts, other 403s and other errors never mark a chat blocked (integration test).
 
-**Effect** (`markDestinationBlocked`, one transaction). Lock order: identity advisory lock, user row, then task, run and delivery rows, the order of the inbox, scheduler, admission and suspension. The delivery worker holds no other lock at that point.
+**Durable decision** (review fix). The refusal is recorded first, in the fenced transaction that ends the delivery `PERMANENT_FAILURE`: `destination_block_reason` and `destination_refused_at` on that delivery. Only the delivery row is written, so no lock is taken out of order. If the lease was lost meanwhile (recovery made the part `UNKNOWN`), the refusal is still recorded on the row as evidence.
+
+**Effects** (`applyRecordedBlock`, one transaction, then `destination_block_applied_at`). Lock order: identity advisory lock, user row, then task, run and delivery rows, the order of the inbox, scheduler, admission and suspension.
+- **Retry after a failure.** If applying fails or the process dies, the record stays pending; the recovery sweep and later jobs apply it without sending anything again.
+- **Applied once.** Appliers are serialized by the identity lock and recheck `destination_block_applied_at` under it, so replays change nothing: no second release, no second audit event.
+- **Later restoration wins.** If the user wrote to the bot after the refusal (an inbound update received after `destination_refused_at`), the chat demonstrably works: the record is marked applied as superseded and nothing is blocked or paused.
+
+The effects:
 - **User.** `app_user.chat_blocked_at` and `chat_block_reason` are set.
 - **Tasks.** Every `ACTIVE` task becomes `PAUSED` with no next run (revision + 1), so no automatic research starts and nothing resumes by itself.
 - **Queued automatic runs.** Queued `SCHEDULED` runs are cancelled (`CHAT_BLOCKED`) through the existing lifecycle: their reservation is released once and their outbox event is cancelled.
@@ -222,6 +243,10 @@ Additive:
 
 **Rollback.** Stop the new version first. The old code ignores the new columns and the events table, but it would send document parts as text messages containing only the caption, and it would ignore chat blocks. Roll back only when no `PENDING` delivery has a `DOCUMENT` part, or suppress such deliveries first.
 
+### Review-fix migration (`20261021090000_trb_080_review_fixes`)
+
+Additive: `delivery.destination_block_reason`, `destination_refused_at`, `destination_block_applied_at`, a check tying them together, and an index of refusals still to apply. Existing rows get nulls; no refusal is invented for earlier `PERMANENT_FAILURE / TELEGRAM_403` deliveries. No rollout step beyond `prisma migrate deploy` before starting the new version.
+
 ## Defaults and decisions for the owner
 
 All values are proposals.
@@ -230,7 +255,7 @@ All values are proposals.
 |---|---|---|
 | Delivery lease | 60 s | Constant; the Telegram HTTP timeout is 15 s |
 | Claims per delivery | 5 | Then `PERMANENT_FAILURE` |
-| Backoff without Retry-After | 5 s doubling, ≤ 300 s | Retry-After is honoured up to 1 h |
+| Backoff without a valid Retry-After | 5 s doubling, ≤ 300 s | A valid Retry-After (1 s – 30 days) is honoured in full; one wake-up waits at most 1 h |
 | Sweep / lost-job threshold | 30 s / 10 min | Constants |
 | Report messages before the document fallback | 6 | SPEC §5 proposal |
 | History page | 5 runs | Constant |
@@ -239,7 +264,7 @@ All values are proposals.
 **Limitations:**
 - **Not exactly-once.** Exactly-once delivery is not claimed. An `UNKNOWN` part may or may not have arrived; only an explicit resend repeats it, and it may duplicate.
 - **One-part race.** A suspension, deletion or block committed while a part is in flight cannot stop that part.
-- **Head-of-line waiting.** Per-chat order means a delivery waiting for a retry holds back later messages to the same chat, at most until its retry ends (Retry-After ≤ 1 h, or 5 claims).
+- **Head-of-line waiting.** Per-chat order means a delivery waiting for a retry holds back later messages to the same chat, at most until its retry ends: the full Retry-After (up to 30 days), or 5 claims.
 - **Auto-linking.** Telegram clients may auto-link bare URLs written by the model; they are not presented as sources.
 - **No retention.** Deleted-task content is hidden, not purged; retention is TRB-090.
 - **Mock validation only.** Telegram behaviour was validated with a recording sender and scripted errors. No real Telegram message was sent, so the classification relies on the documented contract and grammY's error types.

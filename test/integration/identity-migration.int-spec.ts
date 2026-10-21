@@ -110,6 +110,10 @@ const NEW_COLUMNS = [
   'send_started_at',
   'error_code',
   'seq',
+  // TRB-080 review fixes
+  'destination_block_reason',
+  'destination_refused_at',
+  'destination_block_applied_at',
 ];
 /** TRB-080 columns whose names also exist on other tables (delivery.kind is original). */
 const NEW_PART_COLUMNS = ['kind'];

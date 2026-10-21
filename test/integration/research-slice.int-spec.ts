@@ -319,6 +319,11 @@ describe('research-to-Telegram slice (fake provider and Telegram, real PostgreSQ
       });
       const total = report?.parts.length ?? 0;
       expect(total).toBeGreaterThan(2);
+      // retry_after = 0 is not usable (TRB-080 review fix): bounded backoff, made due here.
+      await h.prisma
+        .$executeRaw`UPDATE delivery SET next_attempt_at = now() WHERE state = 'RETRYABLE_FAILURE'`;
+      await h.prisma
+        .$executeRaw`UPDATE delivery_event SET available_at = now() WHERE dispatched_at IS NULL AND cancelled_at IS NULL`;
 
       await drainDeliveries(h);
       [, report] = await deliveries();

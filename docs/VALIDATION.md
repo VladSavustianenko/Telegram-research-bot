@@ -864,6 +864,67 @@ All other suites (identity, invitations, onboarding, status messages, suspension
 - Telegram clients may auto-link bare model-written URLs, which are not presented as sources;
 - deleted-task content is hidden, not purged (TRB-090).
 
+### TRB-080 review fixes (2026-10-21, reviewed commit f23221c)
+
+Mock validation only: a scripted Telegram sender, a fake provider and scripted providers with synthetic prices, real PostgreSQL and pg-boss. No Telegram message, OpenAI request, deployment or commit. Behaviour: docs/DELIVERY.md.
+
+**Finding 1: suppressed deliveries could block their chat.**
+- **Root cause.** Suspension, deletion and chat blocking mark a `SENDING` delivery only with `suppressed_at`. The worker's later transition after a confirmed retryable refusal (`RETRYABLE_FAILURE`) or a shutdown hand-over (`PENDING`) ignored it. The claim never takes suppressed rows and recovery never finished them, so per-chat ordering held every later message to that chat back, also after reactivation. The reason code was also lost when the run was already finished (task deletion after completion).
+- **Fix.** Both transitions are one statement that takes the row lock and reads the decision. With a decision the delivery becomes `SUPPRESSED` with its reason; its wake-ups are cancelled and the next delivery to the chat is woken. Confirmed parts keep their message IDs; an ambiguous outcome is still `UNKNOWN`. Suppression now writes its reason code on `SENDING` deliveries too. Rows already stranded are finalized by the next job for them and by the recovery sweep. Decisions are never cleared.
+
+**Finding 2: a confirmed block could be lost after a crash.**
+- **Root cause.** `PERMANENT_FAILURE` was committed, then the block was applied in a separate transaction. A failure between the two left a terminal delivery and no record of the decision, and nothing repaired it.
+- **Fix.** The refusal is committed with the terminal state on the delivery (`destination_block_reason`, `destination_refused_at`), fenced, writing only the delivery row. Its effects are applied in the inbox lock order (identity, user, tasks, runs, deliveries) and marked `destination_block_applied_at` in the same transaction. A failure leaves the record pending for the sweep.
+  - **Idempotent.** Appliers are serialized by the identity lock and recheck the mark.
+  - **Superseded.** A refusal older than a later inbound update from the user applies nothing.
+  - **Remaining window.** Between receiving Telegram's answer and committing the refusal, the answer exists only in memory (documented).
+
+**Finding 3: Retry-After was shortened.**
+- **Root cause.** The provider value was capped at the 1 h wake-up bound, so 7200 s became about 3600 s.
+- **Fix.** A valid `retry_after` (whole seconds, 1 s to 30 days) is persisted in full in `next_attempt_at`; the claim never sends earlier. A single wake-up is still capped at 1 h and only re-schedules. Missing or invalid values (absent, 0, negative, fractional, NaN) use the bounded application backoff (5 s doubling, at most 300 s), never an immediate retry. Over 30 days ends `PERMANENT_FAILURE / TELEGRAM_RETRY_AFTER_TOO_LONG`. The attempt limit is unchanged.
+
+**Migration** `20261021090000_trb_080_review_fixes` (additive): the three delivery columns, a check and a pending-refusal index.
+
+| Check | Command | Result |
+|---|---|---|
+| Reproduction before the fixes | the 9 new tests in `delivery.int-spec.ts` ("review fixes (commit f23221c)") against the reviewed code | 8 failed for the reported reasons. Deliveries stayed `RETRYABLE_FAILURE`/`PENDING` with a decision, and later messages to the chat were not delivered; the recorded block was never applied after the injected failure; `next_attempt_at` was 3 600 s instead of 7 200 s; `retry_after = 0` retried immediately. 1 passed (an ambiguous send under suppression was already `UNKNOWN`) |
+| Targeted after the fixes | `delivery.int-spec.ts` | 30 passed |
+| Static checks | `npm run format:check`, `npm run lint`, `npm run typecheck`, `npm run prisma:validate` | Pass |
+| Unit tests | `npm test` | 213 passed (16 files) |
+| Integration tests | `npm run test:integration` | 246 passed (16 files); 0 disposable databases left |
+| Build | `npm run build` | Pass |
+| Migration, dev DB | `migrate deploy`, `migrate status`, `migrate diff --exit-code` | Applied without reset; up to date; no difference (exit 0). MD5 over runs, deliveries, parts, attempts, reservations and ledger identical before and after |
+
+**Regression scenarios.** Concurrency uses deterministic gates in the scripted sender, while the suspension or deletion is committed through the inbox; restarts use new application instances.
+1. **Suspension in flight, then 429.** The report is `SUPPRESSED / RECIPIENT_SUSPENDED`, its part `PENDING / TELEGRAM_429`, with no pending event. After reactivation and the retry time, nothing of it is sent, and a later `/help` to the same chat is delivered.
+2. **Task deletion in flight, then 5xx.** `SUPPRESSED / TASK_DELETED`; later messages are delivered; the report is never sent.
+3. **Suppression, then shutdown hand-over between parts.** `SUPPRESSED`; part 1 stays `SENT` with its message ID and the rest `PENDING`; no event. After reactivation a later message is delivered.
+4. **Stranded rows.** Pre-existing `RETRYABLE_FAILURE` and `PENDING` deliveries with a decision become `SUPPRESSED`; a later message is delivered and the stranded content never.
+5. **Ambiguous in flight.** A timeout under a concurrent suspension stays `UNKNOWN` and is not retried after a sweep.
+6. **Injected failure after the recorded refusal** (live mode, a trigger failing the user update). The delivery is `PERMANENT_FAILURE` with the refusal recorded and the user not yet blocked. After a restart, two sweeps and a drain:
+   - the user is `BOT_BLOCKED` and the task `PAUSED` with no next run;
+   - the queued scheduled run is `CANCELLED / CHAT_BLOCKED` with ledger RESERVE + RELEASE exactly once;
+   - one `DESTINATION_BLOCKED` audit event, no Telegram attempt, no submission;
+   - the scheduler two days later starts nothing.
+7. **Restoration before the deferred application.** The user writes after the recorded refusal: the sweep marks it applied as superseded; the user is not blocked, the task stays `ACTIVE`, there is no audit event, and the reply was delivered.
+8. **Retry-After 7200 s.** `next_attempt_at` is about 7 200 s ahead. Early event times, a duplicate job and a restart send nothing and keep the same retry time and one pending event. Once due it is sent (2 attempts).
+9. **Short and fallback values.** Retry-After 2 s gives about 2 s. Missing, 0, -3, NaN and 1.5 give the 5 s backoff; the 4th claim's backoff is 40 s.
+
+**Earlier tests adapted:**
+- The migration snapshot ignores the new columns.
+- Two tests that scripted `retry_after = 0` (now invalid, hence backoff) make the retry due explicitly instead of relying on an immediate retry.
+
+**Not run:**
+- the Docker smoke: no dependency, runtime wiring or configuration change since the TRB-080 smoke;
+- CI;
+- a mutation re-run;
+- any live Telegram or OpenAI call.
+
+**Remaining limitations:**
+- The window between Telegram's answer and committing the refusal is unavoidable: a crash there makes the part `UNKNOWN`, and the block is detected again by the next delivery to the chat.
+- A Retry-After of up to 30 days holds later messages to the same chat back for that long (per-chat order).
+- The other TRB-080 limitations are unchanged.
+
 ## Release checklist
 
 - Exact model/tool compatibility verified in official docs and an authorized sample.
