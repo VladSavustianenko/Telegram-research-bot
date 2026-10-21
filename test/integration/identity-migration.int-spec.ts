@@ -114,6 +114,7 @@ const NEW_COLUMNS = [
   'destination_block_reason',
   'destination_refused_at',
   'destination_block_applied_at',
+  'private_chat_verified',
 ];
 /** TRB-080 columns whose names also exist on other tables (delivery.kind is original). */
 const NEW_PART_COLUMNS = ['kind'];

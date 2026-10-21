@@ -154,6 +154,11 @@ export class TelegramIngressService {
     if (rejection || update.kind === 'ignored') {
       return { disposition: 'IGNORED', reason: rejection ?? 'IGNORED' };
     }
+    // Transport checks passed: a supported update from a non-bot sender in their own
+    // private chat. Durable evidence that the chat works (TRB-080), whatever the
+    // business answer (onboarding, denial, unknown command) turns out to be.
+    await tx.$executeRaw`
+      UPDATE telegram_update SET private_chat_verified = true WHERE update_id = ${update.updateId}`;
     // One sender at a time; then load (and row-lock) the sender's record.
     await lockTelegramIdentity(tx, update.senderId);
     let user = await resolveSender(tx, this.config, update.senderId, update.chatId);

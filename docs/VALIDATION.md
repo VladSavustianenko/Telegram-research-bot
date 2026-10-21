@@ -925,6 +925,44 @@ Mock validation only: a scripted Telegram sender, a fake provider and scripted p
 - A Retry-After of up to 30 days holds later messages to the same chat back for that long (per-chat order).
 - The other TRB-080 limitations are unchanged.
 
+### TRB-080 follow-up fix (2026-10-21, reviewed commit f3789b8)
+
+Mock validation only: scripted Telegram responses through the real webhook ingress, scripted providers with synthetic prices, real PostgreSQL and pg-boss. No Telegram message, OpenAI request, deployment or commit.
+
+**Finding: an ignored group update could supersede a private-chat block.**
+- **Root cause.** `applyRecordedBlock` treated any `telegram_update` from the user received after the refusal as proof that the private chat works. Ingress records every update before checking chat eligibility, so a group message (`IGNORED / NOT_PRIVATE_CHAT`) superseded the pending block: no block was applied and no task paused.
+- **Fix.** Ingress now stores an explicit marker, `telegram_update.private_chat_verified`. It is set in the deduplicating ingress transaction only after the existing transport checks pass (`chatRejection`: private chat, chat ID equal to the sender ID, non-bot sender, supported update), before any business routing. Supersession counts only marked updates. The business answer is irrelevant: a denial or "unknown command" reply is still valid evidence. Ignored and duplicate updates leave the decision pending.
+- **Migration** `20261021120000_trb_080_verified_private_updates` (additive): the column, default false, and a partial index. Existing rows are not marked.
+
+| Check | Command | Result |
+|---|---|---|
+| Reproduction before the fix | the 3 new tests in `delivery.int-spec.ts` ("follow-up: only a verified private interaction supersedes a recorded block") | The group-message test and the rejected-private-update test failed: `chat_block_reason` stayed null, i.e. the refusal was consumed as superseded. The legitimate private interaction test passed: that behaviour already held |
+| Targeted after the fix | `delivery.int-spec.ts` | 33 passed |
+| Static checks | `npm run format:check`, `npm run lint`, `npm run typecheck`, `npm run prisma:validate` | Pass |
+| Unit tests | `npm test` | 213 passed (16 files) |
+| Integration tests | `npm run test:integration` | 249 passed (16 files); 0 disposable databases left |
+| Build | `npm run build` | Pass |
+| Migration, dev DB | `migrate deploy`, `migrate status`, `migrate diff --exit-code` | Applied without reset; up to date; no difference (exit 0). MD5 over runs, deliveries, parts, attempts, reservations, ledger and the 7 `telegram_update` rows (previous columns) identical before and after; no row marked |
+
+Scenarios (live accounting mode; the refusal is persisted and applying its effects fails through an injected trigger, then the trigger is removed):
+1. **Group message.** A later supergroup message from the same user is recorded `IGNORED / NOT_PRIVATE_CHAT`, and a duplicate of an earlier private update is ignored. Two sweeps and a drain then:
+   - block the chat (`BOT_BLOCKED`) and pause the task (no next run);
+   - cancel the queued scheduled run `CHAT_BLOCKED`, with ledger RESERVE + RELEASE exactly once;
+   - record one `DESTINATION_BLOCKED` audit event and leave no pending refusal;
+   - make no new Telegram attempt and no submission.
+2. **Rejected private updates.** Private updates whose chat is not the sender's (`CHAT_SENDER_MISMATCH`) or whose sender is a bot (`BOT_SENDER`) do not supersede; the same effects follow, once.
+3. **Legitimate private interaction.** An unknown command in the user's own private chat after the refusal supersedes it, though it gets a refusal reply: no block, the task stays active, no audit event.
+
+The earlier suspension, suppression, Retry-After and Finding 2 tests stay green. The migration snapshot test ignores the new column.
+
+**Not run:**
+- the Docker smoke: no dependency, runtime wiring or configuration change;
+- CI;
+- a mutation re-run;
+- live Telegram or OpenAI calls.
+
+**Remaining limitations** are unchanged from "TRB-080 review fixes". In particular, the window between Telegram's answer and committing the refusal remains.
+
 ## Release checklist
 
 - Exact model/tool compatibility verified in official docs and an authorized sample.

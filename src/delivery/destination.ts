@@ -47,8 +47,10 @@ const NOTHING: BlockResult = {
  *   its cost is already committed and its report stays available;
  * - an audit event records the counts when something changed.
  * Idempotent: appliers are serialized by the identity lock and the record is
- * applied once. A refusal older than a later message from the user is
- * superseded (the chat demonstrably works again) and applies nothing.
+ * applied once. A refusal older than a later verified interaction of the user in
+ * their own private chat (telegram_update.private_chat_verified) is superseded
+ * (the chat demonstrably works again) and applies nothing. Ignored updates
+ * (groups, a chat that is not the sender's, bot senders) never supersede it.
  */
 export async function applyRecordedBlock(
   prisma: PrismaService,
@@ -88,7 +90,13 @@ export async function applyRecordedBlock(
     if (current.destinationBlockAppliedAt) return NOTHING;
     if (user) {
       const later = await tx.telegramUpdate.count({
-        where: { senderTelegramId: user.telegramUserId, receivedAt: { gt: refusedAt } },
+        // Only an update that passed the ingress transport checks (the user's own
+        // private chat) proves the chat works; ignored group or forged updates do not.
+        where: {
+          senderTelegramId: user.telegramUserId,
+          privateChatVerified: true,
+          receivedAt: { gt: refusedAt },
+        },
       });
       result =
         later > 0

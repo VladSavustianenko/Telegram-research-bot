@@ -201,7 +201,10 @@ A malformed callback, or an ID that does not decode to exactly 16 canonical byte
 **Effects** (`applyRecordedBlock`, one transaction, then `destination_block_applied_at`). Lock order: identity advisory lock, user row, then task, run and delivery rows, the order of the inbox, scheduler, admission and suspension.
 - **Retry after a failure.** If applying fails or the process dies, the record stays pending; the recovery sweep and later jobs apply it without sending anything again.
 - **Applied once.** Appliers are serialized by the identity lock and recheck `destination_block_applied_at` under it, so replays change nothing: no second release, no second audit event.
-- **Later restoration wins.** If the user wrote to the bot after the refusal (an inbound update received after `destination_refused_at`), the chat demonstrably works: the record is marked applied as superseded and nothing is blocked or paused.
+- **Later restoration wins.** If the user interacted with the bot in their own private chat after the refusal, the chat demonstrably works: the record is marked applied as superseded and nothing is blocked or paused.
+  - **What counts.** Only updates with `telegram_update.private_chat_verified` received after `destination_refused_at`. Ingress sets that marker in the deduplicating transaction, right after the transport checks pass: the sender's own private chat (chat ID equal to the sender ID), a non-bot sender, a supported message or button.
+  - **Business answer does not matter.** An onboarding prompt, an access refusal or "unknown command" is still proof that the chat works.
+  - **What never counts.** Ignored updates: group or supergroup messages, a chat that is not the sender's, bot senders, unsupported update types. Duplicates of an already recorded `update_id` create no new row and no evidence. Such updates leave the decision pending, and recovery applies it.
 
 The effects:
 - **User.** `app_user.chat_blocked_at` and `chat_block_reason` are set.
@@ -246,6 +249,10 @@ Additive:
 ### Review-fix migration (`20261021090000_trb_080_review_fixes`)
 
 Additive: `delivery.destination_block_reason`, `destination_refused_at`, `destination_block_applied_at`, a check tying them together, and an index of refusals still to apply. Existing rows get nulls; no refusal is invented for earlier `PERMANENT_FAILURE / TELEGRAM_403` deliveries. No rollout step beyond `prisma migrate deploy` before starting the new version.
+
+### Follow-up migration (`20261021120000_trb_080_verified_private_updates`)
+
+Additive: `telegram_update.private_chat_verified` (default false) and an index of verified updates per sender. Existing rows stay unmarked; no historical recovery evidence is invented.
 
 ## Defaults and decisions for the owner
 

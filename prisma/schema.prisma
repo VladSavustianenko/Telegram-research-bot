@@ -39,6 +39,10 @@ model TelegramUpdate {
   reason           String?
   runId            String?                   @map("run_id") @db.Uuid
   receivedAt       DateTime                  @default(now()) @map("received_at") @db.Timestamptz(3)
+  /// TRB-080 follow-up: the update passed the transport checks (the sender's own
+  /// private chat, a non-bot sender, a supported message or button) and was routed
+  /// as the sender's interaction. Only such updates prove the private chat works.
+  privateChatVerified Boolean                @default(false) @map("private_chat_verified")
 
   @@map("telegram_update")
 }

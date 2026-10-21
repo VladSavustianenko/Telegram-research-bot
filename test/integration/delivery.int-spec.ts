@@ -31,6 +31,7 @@ import {
   OTHER_ADMIN_ID,
   callbackQuery,
   drainDeliveries,
+  groupMessage,
   privateMessage,
   resetDatabase,
   startHarness,
@@ -1252,14 +1253,15 @@ describe('TRB-080 delivery and history (recording sender, real pg-boss and Postg
         const queued = await h.prisma.researchRun.findFirstOrThrow({
           where: { trigger: 'SCHEDULED' },
         });
-        await say('/usage', ADMIN_ID, live);
+        const usage = privateMessage('/usage', ADMIN_ID);
+        await live.post(usage).expect(200);
         await failBlockStep();
         live.sender.failNext(telegramBlocked());
         await expect(drainDeliveries(live)).rejects.toThrow();
         const failed = await h.prisma.delivery.findFirstOrThrow({ where: { kind: 'STATUS' } });
         expect(failed).toMatchObject({ state: 'PERMANENT_FAILURE', lastErrorCode: 'TELEGRAM_403' });
         await healBlockStep();
-        return { live, task, queued, failed };
+        return { live, task, queued, failed, usage };
       };
       const ledgerKinds = async (runId: string) =>
         (
@@ -1322,6 +1324,89 @@ describe('TRB-080 delivery and history (recording sender, real pg-boss and Postg
           }),
         ).toBe(0);
         expect(live.sender.sent.map((m) => visible(m.html)).at(-1)).toContain('/history');
+      });
+
+      describe('follow-up: only a verified private interaction supersedes a recorded block', () => {
+        /** The recorded block is applied, once, with all its effects, and nothing is resent. */
+        const expectBlockApplied = async (
+          harness: Harness,
+          task: { id: string },
+          queued: { id: string },
+          attemptsBefore: number,
+        ) => {
+          await harness.deliveryDispatcher.sweep();
+          await harness.deliveryDispatcher.sweep(); // replay
+          await drainDeliveries(harness);
+          const user = await h.prisma.appUser.findUniqueOrThrow({ where: { id: await adminId() } });
+          expect(user.chatBlockReason).toBe('BOT_BLOCKED');
+          expect(await h.prisma.task.findUniqueOrThrow({ where: { id: task.id } })).toMatchObject({
+            state: 'PAUSED',
+            nextRunAt: null,
+          });
+          expect(
+            await h.prisma.researchRun.findUniqueOrThrow({ where: { id: queued.id } }),
+          ).toMatchObject({
+            state: 'CANCELLED',
+            failureCode: 'CHAT_BLOCKED',
+          });
+          expect(await ledgerKinds(queued.id)).toEqual(['RESERVE', 'RELEASE']);
+          expect(await h.prisma.auditEvent.count({ where: { kind: 'DESTINATION_BLOCKED' } })).toBe(
+            1,
+          );
+          expect(
+            await h.prisma.delivery.count({
+              where: { destinationBlockReason: { not: null }, destinationBlockAppliedAt: null },
+            }),
+          ).toBe(0);
+          expect(harness.sender.attempts).toHaveLength(attemptsBefore);
+          expect(harness.provider.calls.submit).toBe(0);
+        };
+
+        it('ignores a later group message from the same user and still applies the block', async () => {
+          const { live, task, queued, usage } = await setUp();
+          const attempts = live.sender.attempts.length;
+          await live.post(groupMessage('/help', ADMIN_ID)).expect(200);
+          await live.post(usage).expect(200); // a duplicate update creates no evidence
+          expect(
+            await h.prisma.telegramUpdate.findFirstOrThrow({ where: { chatType: 'supergroup' } }),
+          ).toMatchObject({ disposition: 'IGNORED', reason: 'NOT_PRIVATE_CHAT' });
+          await expectBlockApplied(live, task, queued, attempts);
+        });
+
+        it('ignores private updates that fail the transport and identity checks', async () => {
+          const { live, task, queued } = await setUp();
+          const attempts = live.sender.attempts.length;
+          const foreignChat = privateMessage('/help', ADMIN_ID);
+          foreignChat.message.chat.id = OTHER_ADMIN_ID; // chat is not the sender's own
+          const fromBot = privateMessage('/help', ADMIN_ID);
+          fromBot.message.from.is_bot = true;
+          await live.post(foreignChat).expect(200);
+          await live.post(fromBot).expect(200);
+          expect(
+            (await h.prisma.telegramUpdate.findMany({ where: { disposition: 'IGNORED' } })).map(
+              (row) => row.reason,
+            ),
+          ).toEqual(['CHAT_SENDER_MISMATCH', 'BOT_SENDER']);
+          await expectBlockApplied(live, task, queued, attempts);
+        });
+
+        it('lets a verified private interaction supersede it, even one that gets a refusal reply', async () => {
+          const { live, task } = await setUp();
+          await live.post(privateMessage('/nosuchcommand', ADMIN_ID)).expect(200);
+          await live.deliveryDispatcher.sweep();
+          await drainDeliveries(live);
+          expect(
+            (await h.prisma.appUser.findUniqueOrThrow({ where: { id: await adminId() } }))
+              .chatBlockedAt,
+          ).toBeNull();
+          expect(await h.prisma.task.findUniqueOrThrow({ where: { id: task.id } })).toMatchObject({
+            state: 'ACTIVE',
+          });
+          expect(await h.prisma.auditEvent.count({ where: { kind: 'DESTINATION_BLOCKED' } })).toBe(
+            0,
+          );
+          expect(visible(live.sender.sent.at(-1)?.html ?? '')).toContain('Невідома команда');
+        });
       });
     });
 
