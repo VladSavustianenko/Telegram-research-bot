@@ -46,7 +46,7 @@ Checked in Railway's documentation on 2026-10-21.
 **Assumptions (not stated in the documentation; verify when deploying):**
 - Railway builds the root `Dockerfile` automatically and uses its `CMD`.
 - The pre-deploy command runs while the previous deployment is still active. The procedures below are written so that this does not matter.
-- `railway ssh` sessions get the service's variables and start in the image's working directory `/app` (otherwise `cd /app` first).
+- `railway ssh` sessions get the service's variables and start in the image's working directory `/app` (otherwise `cd /app` first). They run in the deployed container, where `/proc/1/environ` (the node process) is readable; otherwise the start log line is the evidence of the effective mode.
 - Restarting a deployment sends SIGTERM and honours the draining time.
 - The template's internal `DATABASE_URL` needs no `sslmode` (private network).
 
@@ -337,7 +337,7 @@ Never restore over the production or development database.
 4. **Establish that nothing executes.** A hold stops only processes that **start** after it; a process that was already running on this database keeps executing.
    - Stop or restart every application process that uses the new database (Railway: restart or redeploy the service) and check that `/health/ready` answers `"status": "held"` on each.
    - `$OPS/status.js --quiesced` must exit 0 (no live research lease, no delivery being sent, no active queue job). A lease copied from a very recent backup can still look live: wait 60 s, then check again.
-   - Keep the webhook unregistered for this database, and keep `RESEARCH_MODE` as it was or `disabled`.
+   - Keep the webhook unregistered for this database. Research is disabled before the hold is cleared (step 10).
    - The quarantine command below refuses to change anything without the hold or while a lease is live.
 5. **Verify the copy** (`$OPS/status.js` and SQL):
    - **schema:** no pending or failed migrations, pg-boss version 45;
@@ -386,11 +386,34 @@ Never restore over the production or development database.
    - `$OPS/status.js` shows the expected warnings (`ACCOUNTING_UNRESOLVED` while amounts are open);
    - `$OPS/accounting.js --list` shows the open reservations;
    - SQL check of the audit: `SELECT kind, details FROM audit_event WHERE kind::text LIKE 'RESTORE_%'`.
-10. **Open, explicitly:**
-    1. Point the service's `DATABASE_URL` at the new database (deploy; it starts held).
-    2. `$OPS/hold.js --clear --operator <name> --confirm`. Held processes open within 30 s.
-    3. `node dist/ops/webhook.js --set --confirm`.
-    4. **Scheduled tasks.** An occurrence due between the backup and now gets the usual catch-up (at most one per task, if not older than 24 h), even if it already ran after the backup. To avoid that, open first with `RESEARCH_MODE=disabled`: the scheduler then does not run, and Telegram commands work, so tasks can be paused. Switch research back on afterwards.
+10. **Restart every process with research disabled, while the hold stays set.**
+    A restored task can still point at an occurrence that already ran after the backup. That run is absent from the copy, so there is nothing to quarantine, and the scheduler would admit it again as a catch-up (at most one per task, if not older than 24 h; tested). The scheduler and the research worker do not start while `RESEARCH_MODE=disabled`.
+    - **Railway:**
+      - In the service's Variables, set `RESEARCH_MODE=disabled`. Keep `DATABASE_URL` = the new database, `TELEGRAM_MODE=webhook` and `BACKGROUND_WORKERS=on`.
+      - Deploy. With one replica this replaces the only process.
+      - Stop any other process that uses this database (a second service, a local run), or give it the same setting and restart it.
+    - **Verify the running processes, not the variables:**
+      - **Start log.** In the logs of the new deployment, the `"message":"Application started"` line must be newer than the variable change and show `"researchMode":"disabled"`. No newer deployment may exist.
+      - **Process environment.** `railway ssh -- sh -c 'tr "\0" "\n" < /proc/1/environ | grep -E "^(RESEARCH_MODE|TELEGRAM_MODE|BACKGROUND_WORKERS)="'` reads the environment of PID 1 (the node process, exec `CMD`). An operator command reading its own environment proves nothing about the service.
+      - **Readiness.** `curl -s https://<domain>/health/ready` answers `"status":"held"`.
+      - **Quiescence.** `$OPS/status.js --quiesced` exits 0.
+11. **Clear the hold, research still disabled:** `$OPS/hold.js --clear --operator <name> --confirm`. Within 30 s readiness turns `"status":"ok"`.
+    - Delivery and Telegram commands work, and deliveries you did not quarantine are sent.
+    - `/research` and "Запустити зараз" are refused, and no scheduled occurrence is admitted.
+12. **Enable Telegram ingress:** `railway ssh -- node dist/ops/webhook.js --set --confirm`, then `--info`. Updates pending at Telegram arrive now.
+13. **Pause the restored scheduled tasks whose overdue occurrences must not run.**
+    - **Find them.** `$OPS/restore-quarantine.js --list`, `scheduledTasks`: every task with `nextRunAt` before now is overdue.
+    - **Pause.** The task's owner opens `/tasks` → the task card → **Пауза** (the normal task path, tested).
+    - **Tasks you cannot pause** (another user's): administrators cannot pause them in the UI, and administrators cannot be suspended. Either ask the owner to pause them, or keep research disabled until 24 h after the restore time. From then on, an occurrence from before the restore is older than the catch-up window and is recorded as missed instead of run. This alternative is not covered by the regression test.
+    - **Verify.** Each selected task is `PAUSED` with no next occurrence: it disappears from `scheduledTasks` in `--list`, and `SELECT id, state, next_run_at FROM task WHERE id IN ('<task-id>', …)` shows `PAUSED` and `NULL`.
+14. **Re-enable research while those tasks stay paused.**
+    - Set `RESEARCH_MODE` back to its previous value (for `live` with its required settings, section 4) and deploy.
+    - Verify as in step 10: start log `"researchMode":"live"` (or `fake`), `/proc/1/environ`, readiness `"status":"ok"`.
+    - Paused tasks have no next occurrence, so nothing restored is admitted.
+15. **Resume selected tasks explicitly.**
+    - The owner presses **Відновити** on the task card.
+    - The next occurrence is computed from the resume time and is strictly after it, so the restored overdue occurrence is never caught up (tested). Check the task card's next execution, or `next_run_at` in SQL.
+    - At that occurrence the scheduler admits exactly one run as usual.
 
 **What stays unknown after restoring an older backup:**
 - **Work absent from the backup entirely.** Runs admitted after the backup, their submissions and costs, and messages and invitations sent after it have no record in the copy. They cannot be quarantined, reconciled or deduplicated from the database; only the OpenAI and Telegram records show them. Record their costs outside the application, or as an operator note, until a supported correction exists.

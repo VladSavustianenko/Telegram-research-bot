@@ -1301,6 +1301,46 @@ Local validation only: scripted providers and recording senders in tests; in the
 - Work entirely absent from the backup cannot be reconciled from the database; its costs must be taken from OpenAI billing.
 - A hold set while a process is running takes effect only after a restart; the command refuses only while a lease is live.
 
+### TRB-100 review fix 2 (2026-10-21, reviewed commit 062d2b2)
+
+Local validation only: real PostgreSQL and pg-boss, a controlled clock, a scripted provider in the live configuration and a recording sender. No deployment, Telegram, OpenAI or commit. No runtime code, migration or development-database change.
+
+**Finding.** In docs/OPERATIONS.md §11.3, step 10 cleared the hold before saying that `RESEARCH_MODE` must be disabled. A restored task can point at an overdue occurrence that already ran after the backup; its run is absent from the copy, so quarantining run IDs cannot stop the scheduler from admitting it again.
+
+**Corrected order** (§11.3, steps 10–15):
+1. Restart every process with `RESEARCH_MODE=disabled` under the hold. Verify the running process: the deployment's `Application started` log line with `researchMode: disabled`, PID 1's environment via `railway ssh`, readiness `held`, and `status.js --quiesced`.
+2. Clear the hold with research disabled.
+3. Register the webhook.
+4. Pause the overdue restored tasks via `/tasks` → **Пауза**, and verify `PAUSED` with `next_run_at` null.
+5. Re-enable research and verify it the same way.
+6. Resume the tasks with **Відновити**; the next occurrence is strictly after the resume time.
+
+| Check | Command | Result |
+|---|---|---|
+| Regression | `restore-schedule.int-spec.ts` | 2 passed |
+| Related restore and scheduling suites | `restore-quarantine.int-spec.ts`, `scheduling.int-spec.ts`, `TRB_PG_TOOLS_CONTAINER=… backup-restore.int-spec.ts` | 4 files, 38 passed (with the regression) |
+| Static checks and build | `npm run format:check`, `lint`, `typecheck`, `build` | Pass |
+
+**Fixture.** An administrator's active daily task (09:00 Kyiv) with `next_run_at` = 2026-10-19 06:00 UTC, the clock at 10:00 UTC: 4 h overdue, inside the 24 h window. No run, reservation or outbox event exists for it. There is no UNCERTAIN run or prior usage, and the live configuration is complete, so the absence of execution is not caused by a denial.
+
+**Unsafe order (reproduction):**
+- A process with research enabled started under the hold: held, no scheduler loop.
+- After the hold was cleared, the scheduler admitted the restored occurrence. The run SUCCEEDED with 1 provider submission and 1 schedule event: the occurrence that already ran after the backup was submitted, and billed, again.
+
+**Documented order:**
+1. **Research disabled under the hold.** The process was held (readiness `held`) and had no scheduler loop, also after the hold was cleared.
+2. **Pause.** Via the webhook callback (normal ingress and task path): `PAUSED`, `next_run_at` null.
+3. **Research enabled, task still paused.** A new process started its scheduler loop. After an awaited full scheduler pass: no run, reservation, outbox or schedule event, and 0 submissions.
+4. **Resume.** Via the webhook callback: `ACTIVE`, `next_run_at` = 2026-10-20 06:00 UTC, strictly after the clock. Another pass created nothing.
+5. **At that occurrence.** One run was admitted and SUCCEEDED: 1 submission, 1 reservation. The restored occurrence never got a run or an event.
+
+Synchronization uses awaited scheduler passes and condition waits, with no fixed sleeps.
+
+**Not tested:**
+- Railway;
+- the `railway ssh` / `/proc/1/environ` check and the deployment log check (documented operator actions, from section 2 assumptions);
+- tasks of other users: the alternative of keeping research disabled for 24 h, and pausing by the owner, which uses the same path as the tested administrator case.
+
 ## Release checklist
 
 - Exact model/tool compatibility verified in official docs and an authorized sample.

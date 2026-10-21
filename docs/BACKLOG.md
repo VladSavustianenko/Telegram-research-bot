@@ -132,6 +132,7 @@ Status: READY FOR REVIEW (2026-10-21). Deployment preparation and local validati
 - **Railway behaviour** is taken from the documentation (checked 2026-10-21), not observed; assumptions and open questions are in docs/OPERATIONS.md, section 2.
 - **No Railway config file.** Railway's config as code is deprecated (until 2026-12-01) and its replacement applies resources, so the service settings are a documented checklist.
 - **Review fix for 9dedc75** (2026-10-21, VALIDATION "TRB-100 review fix"). The restore procedure could not be completed under the hold, so it now has an operator command: `ops:restore-quarantine`, with audit kinds `RESTORE_RUN_QUARANTINED` and `RESTORE_DELIVERY_SUPPRESSED` (additive migration `20261022120000_trb_100_restore_quarantine`). docs/OPERATIONS.md §11.3 is rewritten as executable steps.
+- **Review fix for 062d2b2** (2026-10-21, VALIDATION "TRB-100 review fix 2"). The restore procedure disabled research too late. §11.3 now keeps research disabled, verified on the running process, before the hold is cleared; restored scheduled tasks are paused before research is re-enabled and resumed afterwards. Regression `restore-schedule.int-spec.ts`; documentation and test changes only.
 
 ## TRB-110 — Beta acceptance
 
