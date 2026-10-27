@@ -1341,6 +1341,51 @@ Synchronization uses awaited scheduler passes and condition waits, with no fixed
 - the `railway ssh` / `/proc/1/environ` check and the deployment log check (documented operator actions, from section 2 assumptions);
 - tasks of other users: the alternative of keeping research disabled for 24 h, and pausing by the owner, which uses the same path as the tested administrator case.
 
+### Outcome policy review: run 549ee8c8 (2026-10-27)
+
+**What happened.** A shopping run asked for up to 3 sneakers with product-page links, verified price ≤ UAH 4000 and EU 43 in stock. It returned only catalogue candidates, said verification was impossible, and was shown as "нічого не знайдено" (`NO_MATCHES`).
+- **Run data.** It is in the production database only, which was not accessed. Its request snapshot, telemetry and accounting are to be read by the owner with read-only queries.
+- **What the code shows:**
+  - `NO_MATCHES` can only appear when the model declared it, web search ran and at least one valid citation exists (`extractReport`). So the model chose `NO_MATCHES`.
+  - A response that did not complete (`incomplete`, e.g. the output limit) never becomes a report: the run ends FAILED with `INCOMPLETE:<reason>`. A delivered report therefore means the provider finished normally.
+  - Tool telemetry keeps only item type, status and action type (search, open_page, find_in_page). Opened URLs and error details are not kept, so an access failure cannot be told from insufficient exploration beyond those statuses.
+
+**Defect.** Policy rule 7 defined `NO_MATCHES` as "searched and found nothing matching" and `INCONCLUSIVE` as "cannot tell". It did not cover candidates whose required conditions could not be verified, so the model's choice was permitted.
+
+**Fix.** `RESEARCH_POLICY_VERSION` is now `research-policy-2026-10-27.1`.
+- **`NO_MATCHES`** (owner wording): no verified matches within the checked scope, and the relevant candidates were checked and ruled out against the required criteria. Not when potentially matching candidates remain unverified because of missing information, access problems or tool limits.
+- **`INCONCLUSIVE`** when required criteria could not be verified. It briefly states what could not be verified, and lists unverified candidates only if the user's requested format permits it.
+- **`FOUND` / `PARTIAL`** depend on verified findings.
+
+No keyword heuristic was added, and the classification code is unchanged. Earlier runs keep their own policy version (immutable snapshots).
+
+| Check | Command | Result |
+|---|---|---|
+| Unit | `npm test` | 225 passed (1 new policy test) |
+| Related integration | `research-slice.int-spec.ts`, `research-tool-telemetry.int-spec.ts` | 25 passed |
+| Static checks | `typecheck`, `lint` | Pass |
+
+**Production evidence** (owner-run read-only queries and `ops:tool-telemetry`, 2026-10-27):
+- **Snapshot.** `gpt-5.5` (returned `gpt-5.5-2026-04-23`), reasoning `low`, `maxToolCalls` 3, `maxOutputTokens` 4000, deadline 300 s, policy `research-policy-2026-10-20.1`.
+- **Outcome.** SUCCEEDED, provider status `completed`, `NO_MATCHES` with no warnings: the outcome was declared by the model. 2 citations; 13 search sources (intertop.ua 10, megasport.ua 3).
+- **Limits.** 20 s from submission to completion, so not the deadline. 805 output tokens (342 reasoning), so not the output limit. 20 951 input tokens (2 560 cached).
+- **Tool items.** 4 `web_search_call` items:
+  - search completed 1;
+  - `open_page` completed 2;
+  - `open_page` still `searching` in the final snapshot 1.
+
+  No item reported a failure. The model did attempt page opens; which pages (product or catalogue) is unknown, because URLs are not retained.
+- **Accounting.** SETTLED: reservation 700 000, estimate 157 385, held search allowance 40 000, exposure 197 385 micro-USD.
+
+**Interpretation (supported, not proven):**
+- The 3 completed actions equal `max_tool_calls`; the fourth (an `open_page`) never completed. This is consistent with the tool-call bound stopping exploration.
+- Verifying 3 products needs at least 1 search plus 3 product-page opens.
+- No evidence of an access failure was recorded. The 4 items are not a verified billing count.
+
+**Not verified:**
+- whether the model follows the new rule (needs a separately authorized live run);
+- which pages were opened and why the fourth action did not complete.
+
 ## Release checklist
 
 - Exact model/tool compatibility verified in official docs and an authorized sample.

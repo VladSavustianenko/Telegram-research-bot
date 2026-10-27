@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { parseEnv } from '../config/env.schema';
 import {
+  RESEARCH_INSTRUCTIONS,
   RESEARCH_POLICY_VERSION,
   buildResearchContext,
   buildResearchRequest,
@@ -122,5 +123,24 @@ describe('snapshotRunConfig', () => {
       deadlineSeconds: 240,
       timeZone: 'Europe/Kyiv',
     });
+  });
+});
+
+describe('outcome policy (review of run 549ee8c8)', () => {
+  it('keeps unverified candidates out of NO_MATCHES and under a new policy version', () => {
+    expect(RESEARCH_POLICY_VERSION).toBe('research-policy-2026-10-27.1');
+    const outcomeRules = RESEARCH_INSTRUCTIONS.slice(
+      RESEARCH_INSTRUCTIONS.indexOf('OUTCOME: FOUND'),
+    );
+    expect(outcomeRules).toContain(
+      'relevant candidates were checked and ruled out against the required criteria',
+    );
+    expect(outcomeRules).toContain(
+      'Do not use this outcome when potentially matching candidates remain unverified',
+    );
+    expect(outcomeRules).toContain('Briefly state what could not be verified');
+    expect(outcomeRules).toContain(
+      "List unverified candidates only if the user's requested format permits it",
+    );
   });
 });

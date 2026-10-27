@@ -3,7 +3,7 @@ import type { Env } from '../config/env.schema';
 import type { ProviderKind, ReasoningEffort, ResearchRequest } from './provider/provider.types';
 
 /** 2026-10-20.1 (TRB-070): planned occurrence, delay and calendar boundaries in the context. */
-export const RESEARCH_POLICY_VERSION = 'research-policy-2026-10-20.1';
+export const RESEARCH_POLICY_VERSION = 'research-policy-2026-10-27.1';
 
 /** Model label stored for simulated runs; never sent to OpenAI. */
 export const FAKE_MODEL = 'simulated';
@@ -129,7 +129,11 @@ OUTCOME: FOUND
 OUTCOME: PARTIAL
 OUTCOME: NO_MATCHES
 OUTCOME: INCONCLUSIVE
-Use FOUND when the task is answered with sourced findings, PARTIAL when only some of it is, NO_MATCHES when you searched and found nothing matching, INCONCLUSIVE when you cannot tell.
+Choose it by what your cited sources verify, not by what you found:
+- FOUND: at least one finding meets every condition the task requires, each verified in a cited source.
+- PARTIAL: some requested findings are verified, but others the task asks for could not be verified or found.
+- NO_MATCHES: the search found no verified matches within the checked scope, and the relevant candidates were checked and ruled out against the required criteria. Do not use this outcome when potentially matching candidates remain unverified because of missing information, access problems or tool limits.
+- INCONCLUSIVE: required criteria could not be verified (missing information, access problems, tool limits), or the evidence is insufficient to decide. Briefly state what could not be verified. List unverified candidates only if the user's requested format permits it.
 8. After the outcome line give the findings, then a short "Limitations" paragraph. Plain text; no tables.`;
 
 export function buildResearchRequest(

@@ -187,7 +187,7 @@ describe('research-to-Telegram slice (fake provider and Telegram, real PostgreSQ
       });
       expect(run?.usage).toMatchObject({ inputTokens: 1200, outputTokens: 300 });
       expect(run?.requestSnapshot).toMatchObject({
-        config: { policyVersion: 'research-policy-2026-10-20.1', maxToolCalls: 3 },
+        config: { policyVersion: 'research-policy-2026-10-27.1', maxToolCalls: 3 },
         request: { maxOutputTokens: 2000, maxToolCalls: 3 },
         context: { timeZone: 'Europe/Kyiv', utcNow: '2026-10-18T12:00:00Z' },
       });
